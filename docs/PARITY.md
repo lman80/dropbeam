@@ -117,6 +117,12 @@ Source of truth: the code on branch `ios` as of v0.52.2 (Rust engine `src-tauri/
 | New folder / rename / trash | ✅ | ✅ | ✅ | ✅ | |
 | Sort (name/size/date) | ✅ | ✅ | ✅ | ❌ | iOS lists by name only |
 | Synced-to-a-location folders | ✅ | ✅ | ✅ | ❌ | iOS: undesirable (no background) |
+| Open in place (stream, seek, no copy first) | ✅ | ✅ | ✅ | ✅ | `stream.rs` block cache + 127.0.0.1 range server; host `locations.read` (v2). Desktop preview: image/video/audio/PDF/text; iOS: AVPlayer (video/audio), Quick Look (rest, fetched to cache). Needs a v2 host |
+| Path badge + live speed while streaming | ✅ | ✅ | ✅ | ✅ | `stream_status` |
+| Thumbnails for pictures | ✅ | ✅ | ✅ | ✅ | Host-made JPEG (`locations.thumb`); images only, no video posters |
+| Open with default app | ✅ | ✅ | ✅ | N/A | Through the drive when mounted, else a cached copy |
+| Locations as a drive | ✅ | ⚠️ | ⚠️ | ❌ | macOS: NFSv3 at `~/DropBeam Drives`, verified end to end. Linux: WebDAV + `gio mount` (compiled/tested in CI, not live-mounted). Windows: WebDAV + `net use`, WebClient/50 MB fix (compiled in CI, not live-mapped). iOS needs a File Provider extension (follow-up) |
+| Settings → Drives (on/off, start with app, cache size) | ✅ | ✅ | ✅ | ❌ | |
 
 ### History & recovery
 | Feature | macOS | Windows | Linux | iOS | Notes |

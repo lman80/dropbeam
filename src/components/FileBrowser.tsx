@@ -1,8 +1,10 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { dateTime } from '../lib/dates'
 import { errorText } from '../lib/errors'
-import { ArrowDownToLine, ArrowUpFromLine, ChevronDown, ChevronLeft, ChevronRight, File, Folder, FolderPlus, Pencil, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react'
-import { MOBILE_UI } from '../lib/platform'
+import { ArrowDownToLine, ArrowUpFromLine, ChevronDown, ChevronLeft, ChevronRight, Eye, File, Folder, FolderOpen, FolderPlus, Pencil, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react'
+import { IS_MAC, IS_WINDOWS, MOBILE_UI } from '../lib/platform'
+import { FilePreview, Thumb } from './FilePreview'
+import { driveApi } from '../lib/streamApi'
 import { api, locationsApi, onLocationsChanged, onTransferUpdate, type LocationEntry, type LocationPage, type SharedLocation } from '../lib/api'
 import { formatBytes } from '../lib/format'
 import { rememberLocationUpload, useStore } from '../store'
@@ -13,6 +15,8 @@ import { outgoingForLocation, trackOutgoingLocationUpload } from '../lib/locatio
 
 type Action = 'mkdir' | 'rename' | 'trash'
 const join = (parent: string, name: string) => parent ? `${parent}/${name}` : name
+const IMAGE = /\.(jpe?g|png|gif|webp|bmp)$/i
+const OPEN_DRIVE_LABEL = IS_MAC ? 'Open in Finder' : IS_WINDOWS ? 'Open in File Explorer' : 'Open in Files'
 /** Browse a friend's Location. `host` is the friend's display name, `online` their presence in words. */
 export function FileBrowser({ friendId, location, online, host, onBack }: { friendId: string; location: SharedLocation; online: string; host?: string; onBack?: () => void }) {
   const toast = useStore(s => s.toast)
@@ -33,6 +37,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
   const [trashResults, setTrashResults] = useState<{ name: string; error?: string; trashPath?: string }[]>([])
   const [busy, setBusy] = useState(false)
   const [hover, setHover] = useState(false)
+  const [preview, setPreview] = useState<LocationEntry | null>(null)
   const generation = useRef(0)
   const actionBusy = useRef(false)
   const request = useCallback(<T,>(kind: string, args: Record<string, unknown> = {}) =>
@@ -113,11 +118,13 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
     try { const paths = folder ? [await api.pickDirectory()].filter((p): p is string => !!p) : await api.pickFiles(); await upload(paths) }
     catch(e) { toast('error', String(e)) }
   }
-  const download = async () => {
+  const showOnDrive = async () => { try { await driveApi.open(friendId, location.id, path) } catch(e) { toast('error', errorText(e)) } }
+  const download = async (only?: string[]) => {
+    const names = only ?? selected
     if (actionBusy.current) return
     actionBusy.current = true; setBusy(true)
     try {
-      const result = await request<{ transferId: string | null; skipped?: string[] }>('download', { paths: selected.map(n => join(path, n)) })
+      const result = await request<{ transferId: string | null; skipped?: string[] }>('download', { paths: names.map(n => join(path, n)) })
       if (result.skipped?.length) toast('info', `Skipped ${result.skipped.length === 1 ? '1 item' : `${result.skipped.length} items`} that can’t be downloaded: ${result.skipped.slice(0, 3).map(p => p.split('/').pop()).join(', ')}${result.skipped.length > 3 ? '…' : ''}`)
       if (result.transferId) toast('success', 'Downloading · follow it in Send & Receive')
       else toast('info', 'Nothing in the selection can be downloaded')
@@ -132,6 +139,8 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
   const trashCount = selectedEntries.length
   const trashTitle = trashCount === 1 ? `Move “${selectedEntries[0].name}” to Trash?` : `Move ${trashCount} items to Trash?`
   const failures = trashResults.filter(r => r.error)
+  const previewSheet = preview && <FilePreview friendId={friendId} locationId={location.id} relPath={join(path, preview.name)} name={preview.name}
+    toast={toast} onClose={() => setPreview(null)} onDownload={() => { const name = preview.name; setPreview(null); void download([name]) }} />
   const actionSheet = dialog && <Dialog width={400} busy={busy} onClose={() => setDialog(null)} className="location-dialog"
     title={dialog === 'trash' ? (trashCount ? trashTitle : 'Move to Trash') : dialog === 'rename' ? 'Rename' : 'New Folder'}
     footer={<>
@@ -166,12 +175,13 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
     <div className="mobile-inset"><input className="mobile-search" aria-label="Search folder" placeholder="Search folder" value={query} onChange={e => { cursors.current = [undefined]; setPage(0); setQuery(e.target.value) }} /></div>
     {error && <div className="mobile-inset ios-footnote" role="alert">{error}<button className="ios-button" onClick={restart}>Try again</button></div>}
     {busy && <p className="mobile-inset ios-footnote" role="status">Preparing…</p>}
-    <div className="ios-list" aria-busy={loading}>{entries.map(entry => <div className="ios-row" key={entry.name}><button className="mobile-entry" disabled={busy || loading} onClick={() => selecting || !entry.isDir ? (setSelecting(true), toggle(entry)) : navigate(join(path, entry.name))}><span className="mobile-tinted-icon">{entry.isDir ? <Folder /> : <File />}</span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{entry.name}</span><span className="ios-footnote">{entry.isDir ? 'Folder' : formatBytes(entry.size)} · {entry.modified ? new Date(entry.modified).toLocaleDateString() : '—'}</span></span></button>{selecting ? <input type="checkbox" aria-label={`Select ${entry.name}`} disabled={busy || loading} checked={selected.includes(entry.name)} onChange={() => toggle(entry)} /> : entry.isDir && <ChevronRight size={18} />}</div>)}</div>
+    <div className="ios-list" aria-busy={loading}>{entries.map(entry => <div className="ios-row" key={entry.name}><button className="mobile-entry" disabled={busy || loading} onClick={() => selecting ? toggle(entry) : entry.isDir ? navigate(join(path, entry.name)) : setPreview(entry)}><span className="mobile-tinted-icon">{entry.isDir ? <Folder /> : <File />}</span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{entry.name}</span><span className="ios-footnote">{entry.isDir ? 'Folder' : formatBytes(entry.size)} · {entry.modified ? new Date(entry.modified).toLocaleDateString() : '—'}</span></span></button>{selecting ? <input type="checkbox" aria-label={`Select ${entry.name}`} disabled={busy || loading} checked={selected.includes(entry.name)} onChange={() => toggle(entry)} /> : entry.isDir && <ChevronRight size={18} />}</div>)}</div>
     {loading && <p className="mobile-inset ios-footnote" role="status">Loading folder…</p>}
     {!loading && !error && !entries.length && <div className="mobile-empty"><Folder /><h2 className="ios-title2">{query ? 'No matching items' : 'This folder is empty'}</h2><p className="ios-footnote">{query ? 'Try another file name.' : 'Files shared here appear in this folder.'}</p><button className="ios-button ios-primary" onClick={() => query ? setQuery('') : setActionsOpen(true)}>{query ? 'Clear search' : 'Folder actions'}</button></div>}
     <footer className="mobile-inset mobile-browser-footer"><p className="ios-footnote">{online} · {data.total ?? entries.length} items · Page {page + 1}</p><div className="ios-row"><button className="ios-button" disabled={!page || loading || busy} onClick={() => { setPage(p => p - 1); setSelected([]) }}>Previous</button><button className="ios-button" disabled={!data.hasMore || loading || busy} onClick={() => { setPage(p => p + 1); setSelected([]) }}>Next</button></div></footer>
     {(selected.length > 0 || actionsOpen) && <div className="mobile-browser-actions"><button className="ios-button" disabled={!selected.length || busy || loading || !!error} onClick={() => void download()}><ArrowDownToLine size={18} />Download</button>{location.rights.upload && <><button className="ios-button" disabled={busy || loading || !!error} onClick={() => void pick(false)}>Upload files</button><button className="ios-button" disabled={busy || loading || !!error} onClick={() => void pick(true)}>Upload folder</button></>}{location.rights.manage && <><button className="ios-button" disabled={busy || loading || !!error} onClick={() => openDialog('mkdir')}>New folder</button><button className="ios-button" disabled={selected.length !== 1 || busy || loading} onClick={() => openDialog('rename')}>Rename</button><button className="ios-button ios-destructive" disabled={!selected.length || busy || loading} onClick={() => openDialog('trash')}>Trash</button></>}<button className="ios-button" disabled={busy} onClick={() => { setActionsOpen(false); setSelected([]); setSelecting(false) }}>Done</button></div>}
     {actionSheet}
+    {previewSheet}
   </section>
   const canAct = !busy && !loading && !error
   const pageable = page > 0 || data.hasMore
@@ -196,6 +206,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
         </nav>
       </div>
       <div className="page-actions">
+        <IconButton label={OPEN_DRIVE_LABEL} onClick={() => void showOnDrive()}><FolderOpen /></IconButton>
         <IconButton label="Refresh" disabled={loading || busy} onClick={restart}><RefreshCw /></IconButton>
         {location.rights.manage && <IconButton label="New Folder" disabled={!canAct} onClick={() => openDialog('mkdir')}><FolderPlus /></IconButton>}
         {location.rights.upload && <UploadButton disabled={!canAct} onPick={folder => void pick(folder)} />}
@@ -214,6 +225,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
       </select>
       <div className="location-selection" aria-live="polite">{selected.length > 0 && <>
         <span className="muted tnum truncate-1">{selected.length} selected</span>
+        {selectedEntries.length === 1 && !selectedEntries[0].isDir && <button type="button" className="btn btn-secondary btn-sm" onClick={() => setPreview(selectedEntries[0])}><Eye />Open</button>}
         <button type="button" className="btn btn-secondary btn-sm" disabled={!canAct} onClick={() => { void download() }}><ArrowDownToLine />Download</button>
         {location.rights.manage && <>
           <IconButton size="sm" label="Rename" disabled={selected.length !== 1 || busy || loading} onClick={() => openDialog('rename')}><Pencil /></IconButton>
@@ -237,13 +249,17 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
           const on = selected.includes(entry.name)
           return <tr key={entry.name} className={on ? 'selected' : ''} aria-selected={on}
             onClick={e => { if ((e.target as HTMLElement).closest('input,button')) return; toggle(entry) }}
-            onDoubleClick={() => entry.isDir && navigate(join(path, entry.name))}>
+            onDoubleClick={() => entry.isDir ? navigate(join(path, entry.name)) : setPreview(entry)}>
             <td className="location-col-check"><input type="checkbox" aria-label={`Select ${entry.name}`} disabled={busy || loading} checked={on} onChange={() => toggle(entry)} /></td>
             <td className="location-col-name">
               {entry.isDir
                 ? <button type="button" className="location-filename" disabled={busy || loading} onClick={() => navigate(join(path, entry.name))}>
                   <Folder className="location-icon-folder" aria-hidden /><span className="truncate-1" title={entry.name}>{entry.name}</span></button>
-                : <span className="location-filename"><File className="location-icon-file" aria-hidden /><span className="truncate-1" title={entry.name}>{entry.name}</span></span>}
+                : <button type="button" className="location-filename" title={`Open ${entry.name}`} onClick={() => setPreview(entry)}>
+                  {IMAGE.test(entry.name)
+                    ? <Thumb friendId={friendId} locationId={location.id} relPath={join(path, entry.name)} size={entry.size} modified={entry.modified ?? 0} fallback={<File className="location-icon-file" aria-hidden />} />
+                    : <File className="location-icon-file" aria-hidden />}
+                  <span className="truncate-1">{entry.name}</span></button>}
             </td>
             <td className="location-col-size tnum">{entry.isDir ? '—' : formatBytes(entry.size)}</td>
             <td className="location-col-date tnum">{entry.modified ? dateTime(entry.modified) : '—'}</td>
@@ -273,6 +289,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
       </div>}
     </footer>
     {actionSheet}
+    {previewSheet}
   </section>
 }
 

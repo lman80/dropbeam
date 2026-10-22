@@ -92,6 +92,14 @@ anyhow = "1"
 # Diagnostics digest upload (telemetry.rs). rustls reuses iroh's TLS stack; no
 # OpenSSL. Only used to POST a small JSON to the operator-configured endpoint.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Open in place (stream.rs): the 127.0.0.1-only range server that previews,
+# players and the drive read through. All already in the tree via reqwest/iroh.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+futures-util = "0.3"
+async-trait = "0.1"
 
 # ---------------------------------------------------------------------------
 # DESKTOP ONLY (macOS / Windows / Linux). None of these build or make sense on
@@ -111,6 +119,9 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 # `dropbeam:` links on macOS/Windows/Linux (scheme from plugins.deep-link in tauri.conf.json).
 tauri-plugin-deep-link = "2"
 trash = "5"
+# "Show Locations as a drive" on Linux (gio/gvfs) and Windows (WebClient): a
+# localhost WebDAV server over the stream engine (drive.rs). No local filesystem.
+dav-server = { version = "0.11", default-features = false }
 
 # Windows only: iroh's `wmi` dep (via netwatch) declares windows + windows-core
 # with a wide range and the resolver split it into windows 0.62 / windows-core
@@ -157,6 +168,9 @@ objc2-foundation = { version = "0.3", features = ["block2"] }
 objc2-ui-kit = { version = "0.3", default-features = false, features = ["UIDevice", "UIGeometry", "objc2-core-foundation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# "Show Locations as a drive" on macOS: an in-process NFSv3 server on localhost,
+# mounted without admin rights by mount_nfs (drive.rs). BSD-3-Clause.
+nfsserve = "0.11"
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"

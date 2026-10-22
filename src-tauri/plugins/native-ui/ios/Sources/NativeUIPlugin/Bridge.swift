@@ -142,7 +142,7 @@ final class Bridge: ObservableObject {
             }
             pending[id] = Pending(continuation: continuation, name: name, timeout: timeout)
             // Picker calls include the time the user spends browsing Photos/Files; never cut them short.
-            let seconds: Double = ["pickFiles", "sendChatFiles"].contains(name) ? 1800 : ["setAvatar", "browserUpload", "acceptFolderInvite"].contains(name) ? 1800 : name == "eraseAllData" ? 60 : name.hasPrefix("browser") || ["locationsList", "locationsRefresh"].contains(name) ? 180 : 30
+            let seconds: Double = ["pickFiles", "sendChatFiles"].contains(name) ? 1800 : ["setAvatar", "browserUpload", "browserFetch", "acceptFolderInvite"].contains(name) ? 1800 : name == "eraseAllData" ? 60 : name.hasPrefix("browser") || ["locationsList", "locationsRefresh"].contains(name) ? 180 : 30
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: timeout)
             webview.evaluateJavaScript("window.__dbBridge.call(...\(json)); void 0") { [weak self] _, error in
                 if let error { self?.finish(id, .failure(error)) }

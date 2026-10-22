@@ -15,6 +15,7 @@ import { useStore, type View } from '../store'
 import { IS_MAC, IS_WINDOWS, MOBILE_UI, TRAY_NAME } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { LocationSettings } from '../components/LocationSettings'
+import { DriveSettings } from '../components/DriveSettings'
 import { TransferServerPane } from '../components/TransferServerSettings'
 import { InstallUpdateButton } from '../components/UpdateInstall'
 import { SafeSpeedDialog } from '../components/SafeSpeed'
@@ -27,7 +28,7 @@ import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbac
 // location" on Locations opens the Locations pane, the GIF setup link in Chat
 // opens General, "Settings" under History's recoverable files opens Transfers —
 // otherwise it's the pane you last had open.
-type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'server' | 'privacy' | 'advanced'
+type Tab = 'general' | 'devices' | 'locations' | 'drives' | 'transfers' | 'server' | 'privacy' | 'advanced'
 const DEV_KEY = 'dropbeam.developer'
 // Everyday tabs first; the optional/advanced features after Privacy.
 const TABS: { value: Tab; label: string }[] = [
@@ -36,6 +37,7 @@ const TABS: { value: Tab; label: string }[] = [
   { value: 'devices', label: 'Devices' },
   { value: 'privacy', label: 'Privacy' },
   { value: 'locations', label: 'Locations' },
+  { value: 'drives', label: 'Drives' },
   { value: 'server', label: 'Transfer Server' },
   { value: 'advanced', label: 'Advanced' },
 ]
@@ -788,7 +790,7 @@ export function SettingsView() {
     </>
   )
 
-  const visibleTabs = TABS.filter((t) => (t.value !== 'locations' && t.value !== 'server') || !MOBILE_UI)
+  const visibleTabs = TABS.filter((t) => (t.value !== 'locations' && t.value !== 'drives' && t.value !== 'server') || !MOBILE_UI)
 
   return (
     <div className="page settings-page" ref={rootRef}>
@@ -803,6 +805,7 @@ export function SettingsView() {
         {tab === 'general' && general}
         {tab === 'devices' && <DevicesPanel />}
         {tab === 'locations' && <LocationSettings />}
+        {tab === 'drives' && <DriveSettings />}
         {tab === 'transfers' && transfers}
         {tab === 'server' && <TransferServerPane />}
         {tab === 'privacy' && privacy}

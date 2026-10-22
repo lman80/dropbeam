@@ -9,6 +9,10 @@ use serde_json::{json, Value};
 use std::{fs, path::{Component, Path, PathBuf}, sync::{Arc, Mutex, LazyLock}, collections::HashMap, time::{Duration, Instant}};
 
 pub const VERSION: u64 = 1;
+/// Open in place (docs/locations-v2.md): `locations.stat` for one path,
+/// `locations.read` and `locations.thumb`. v1 requests keep `locations_v: 1`
+/// and are still served; the capability is advertised as `locations_max`.
+pub const STREAM_VERSION: u64 = 2;
 pub const PAGE_SIZE: usize = 500;
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 // Settings revocation invalidates upload checks immediately, even within the
@@ -28,7 +32,7 @@ fn operation(config: &Path, id: &str) -> Arc<Operation> {
 pub fn default_byte_cap() -> u64 { 500_000_000_000 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocationError { Quota, UnsafeRoot, MirrorOverlap, MountChanged, Permission, Busy, RateLimit }
+pub enum LocationError { Quota, UnsafeRoot, MirrorOverlap, MountChanged, Permission, Busy, RateLimit, Changed }
 impl std::fmt::Display for LocationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -39,6 +43,7 @@ impl std::fmt::Display for LocationError {
             Self::Permission => "Location permission denied",
             Self::Busy => "At most 2 location transfers per friend; retry after a transfer finishes",
             Self::RateLimit => "Location request rate limit (10/s); retry shortly",
+            Self::Changed => "This file changed on the other device; open it again",
         })
     }
 }
@@ -1115,6 +1120,20 @@ mod unix {
     }
 }
 
+impl Root {
+    /// Open one entry for open-in-place (stat / range read) through the same
+    /// pinned walk as everything else: descriptor/handle-relative, no
+    /// symlinks, junctions or reparse points, regular file or folder only,
+    /// same volume as the root. Positioned reads need no shared cursor.
+    #[cfg(any(unix, windows))]
+    pub fn open_entry(&self, raw: &str) -> Result<fs::File> {
+        let rel = relative(raw)?;
+        if rel.as_os_str().is_empty() { return Ok(self.dir.try_clone()?); }
+        self.open_rel(&rel, false).context("Not found in this location")
+    }
+    #[cfg(not(any(unix, windows)))]
+    pub fn open_entry(&self, _: &str) -> Result<fs::File> { bail!("Hosting unavailable") }
+}
 // Fail closed on platforms without descriptor-relative filesystem protection.
 #[cfg(not(any(unix, windows)))]
 impl Root {
@@ -1146,7 +1165,7 @@ impl Root {
 pub fn verify_digests(config: &Path, endpoint: &str, request: &Value,
     cancel: &std::sync::atomic::AtomicBool, hashed: &std::sync::atomic::AtomicU64) -> Result<Vec<Option<String>>> {
     use std::sync::atomic::Ordering;
-    ensure!(request["locations_v"].as_u64() == Some(VERSION), "Unsupported Locations capability");
+    request_version(request)?;
     let (mut l, friend) = authorize(config, endpoint, text(request, "id")?, Access::Read)?;
     limit_request(config, &friend, "ls", Instant::now())?;
     let raw = text(request, "rel_path")?;
@@ -1172,13 +1191,142 @@ pub fn verify_digests(config: &Path, endpoint: &str, request: &Value,
     Ok(digests)
 }
 
+// ── Open in place (v2): stat one path, read a byte range, small thumbnails ───
+// Same gates as a download: the authenticated friend, the location's ACL, the
+// verified mount marker and pinned Root on every request, and a per-friend
+// token bucket. Reads never take the publication lock (like ls).
+
+/// Both protocol versions are served; anything else is refused.
+pub fn request_version(request: &Value) -> Result<u64> {
+    match request["locations_v"].as_u64() {
+        Some(v) if v == VERSION || v == STREAM_VERSION => Ok(v),
+        _ => bail!("Unsupported Locations capability"),
+    }
+}
+/// Largest single `locations.read`; clients split bigger reads.
+pub const MAX_READ: u64 = 16 << 20;
+/// One file's identity for caching: size, mtime (ns) and inode. Any write that
+/// changes the bytes changes at least one of them on every real filesystem.
+pub fn etag_of(meta: &fs::Metadata) -> String {
+    let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
+    #[cfg(unix)] let ino = { use std::os::unix::fs::MetadataExt; meta.ino() };
+    #[cfg(not(unix))] let ino = 0u64; // Windows: size + 100 ns mtime
+    format!("{:x}-{:x}-{:x}", meta.len(), mtime, ino)
+}
+fn modified_ms(meta: &fs::Metadata) -> u64 {
+    meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+/// An open, authorized range read. `len` is already clamped to the file.
+pub struct StreamRead { pub file: fs::File, pub offset: u64, pub len: u64, pub size: u64, pub etag: String }
+/// Positioned read that works on every platform (no shared cursor).
+pub fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)] { use std::os::unix::fs::FileExt; file.read_exact_at(buf, offset) }
+    #[cfg(windows)] {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            match file.seek_read(&mut buf[done..], offset + done as u64)? {
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                n => done += n,
+            }
+        }
+        Ok(())
+    }
+}
+fn stream_gate(config: &Path, endpoint: &str, request: &Value, bucket: &'static str, now: Instant) -> Result<Root> {
+    ensure!(request_version(request)? == STREAM_VERSION, "Unsupported Locations capability");
+    let (mut l, friend) = authorize(config, endpoint, text(request, "id")?, Access::Read)?;
+    limit_request(config, &friend, bucket, now)?;
+    validate_root(config, Path::new(&l.path))?;
+    Root::for_location(&mut l)
+}
+/// `locations.stat {id, rel_path}` → `{isDir,size,modified,etag}`.
+fn stream_stat_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> Result<Value> {
+    let root = stream_gate(config, endpoint, request, "ls", now)?;
+    let meta = root.open_entry(text(request, "rel_path")?)?.metadata()?;
+    Ok(json!({"isDir": meta.is_dir(), "size": if meta.is_file() { meta.len() } else { 0 }, "modified": modified_ms(&meta),
+        "etag": if meta.is_file() { etag_of(&meta) } else { String::new() }}))
+}
+/// `locations.read {id, rel_path, offset, len, etag?}`: the caller streams the
+/// bytes after a header frame (iroh_net::serve_location_read).
+pub fn stream_open(config: &Path, endpoint: &str, request: &Value) -> Result<StreamRead> { stream_open_at(config, endpoint, request, Instant::now()) }
+fn stream_open_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> Result<StreamRead> {
+    let root = stream_gate(config, endpoint, request, "read", now)?;
+    let file = root.open_entry(text(request, "rel_path")?)?;
+    let meta = file.metadata()?;
+    ensure!(meta.is_file(), "Only files can be opened");
+    let etag = etag_of(&meta);
+    if let Some(expected) = request["etag"].as_str().filter(|e| !e.is_empty()) { ensure!(expected == etag, LocationError::Changed); }
+    let size = meta.len();
+    let offset = request["offset"].as_u64().context("Missing offset")?;
+    ensure!(offset <= size, "Read starts past the end of the file");
+    let len = request["len"].as_u64().context("Missing len")?.min(MAX_READ).min(size - offset);
+    Ok(StreamRead { file, offset, len, size, etag })
+}
+/// The reply for a failed open-in-place request; `code:"changed"` lets the
+/// client drop its cached blocks and re-stat instead of showing an error.
+pub fn stream_error(e: &anyhow::Error) -> Value {
+    let changed = e.downcast_ref::<LocationError>() == Some(&LocationError::Changed);
+    json!({"ok": false, "error": crate::telemetry::redact_paths_only(&format!("{e:#}")), "code": if changed { Some("changed") } else { None }})
+}
+const THUMB_SOURCE_LIMIT: u64 = 64 << 20;
+fn thumb_dir(config: &Path) -> PathBuf { config.join("location-thumbs") }
+/// `locations.thumb {id, rel_path, max}` → `{etag, mime, data(base64 JPEG)}`.
+/// Images only (no video decoder in the tree); cached on the host by etag.
+fn thumbnail_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> Result<Value> {
+    use base64::Engine as _;
+    let root = stream_gate(config, endpoint, request, "thumb", now)?;
+    let raw = text(request, "rel_path")?;
+    let max = request["max"].as_u64().unwrap_or(256).clamp(32, 512) as u32;
+    let file = root.open_entry(raw)?;
+    let meta = file.metadata()?;
+    ensure!(meta.is_file(), "No preview for folders");
+    let ext = Path::new(raw).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    ensure!(matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp"), "No preview for this kind of file");
+    ensure!(meta.len() <= THUMB_SOURCE_LIMIT, "Too large to preview");
+    let etag = etag_of(&meta);
+    let key = { use sha2::Digest; hex::encode(sha2::Sha256::digest(format!("{}\0{raw}\0{etag}\0{max}", text(request, "id")?)))[..40].to_string() };
+    let cached = thumb_dir(config).join(format!("{key}.jpg"));
+    let bytes = match fs::read(&cached) {
+        Ok(b) => b,
+        Err(_) => {
+            let mut source = Vec::with_capacity(meta.len() as usize);
+            { use std::io::Read; (&file).take(THUMB_SOURCE_LIMIT).read_to_end(&mut source)?; }
+            let image = image::load_from_memory(&source).context("Couldn’t read this picture")?;
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image.thumbnail(max, max).to_rgb8()).write_to(&mut out, image::ImageFormat::Jpeg)?;
+            let out = out.into_inner();
+            let dir = thumb_dir(config);
+            if fs::create_dir_all(&dir).is_ok() {
+                let tmp = dir.join(format!(".{key}-{}.tmp", uuid::Uuid::new_v4()));
+                if fs::write(&tmp, &out).and_then(|_| fs::rename(&tmp, &cached)).is_err() { let _ = fs::remove_file(&tmp); }
+                prune_thumbs(&dir, 4000);
+            }
+            out
+        }
+    };
+    Ok(json!({"etag": etag, "mime": "image/jpeg", "data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
+}
+/// Keep the host's thumbnail cache bounded: drop the oldest beyond `keep`.
+fn prune_thumbs(dir: &Path, keep: usize) {
+    let Ok(rd) = fs::read_dir(dir) else { return; };
+    let mut files: Vec<_> = rd.flatten().filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path()))).collect();
+    if files.len() <= keep { return; }
+    files.sort();
+    for (_, path) in files.iter().take(files.len() - keep) { let _ = fs::remove_file(path); }
+}
+
 pub fn dispatch(config: &Path, endpoint: &str, request: &Value) -> Result<Value> {
     dispatch_at(config, endpoint, request, Instant::now())
 }
 fn dispatch_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> Result<Value> {
-    ensure!(request["locations_v"].as_u64() == Some(VERSION), "Unsupported Locations capability");
+    let version = request_version(request)?;
     let kind = text(request, "kind")?;
     if kind == "locations.list" { return shared(config, endpoint); }
+    // v2 single-path stat and thumbnails have their own gates (stream_* below).
+    if kind == "locations.stat" && request.get("paths").is_none() { return stream_stat_at(config, endpoint, request, now); }
+    if kind == "locations.thumb" { return thumbnail_at(config, endpoint, request, now); }
+    let _ = version;
     let access = if matches!(kind, "locations.ls" | "locations.stat") { Access::Read } else { Access::Manage };
     let (mut l, friend) = authorize(config, endpoint, text(request, "id")?, access)?;
     limit_request(config, &friend, if matches!(access, Access::Read) { "ls" } else { "manage" }, now)?;
@@ -1397,10 +1545,10 @@ impl Drop for FriendLease { fn drop(&mut self) {
 } }
 struct Listing { config: PathBuf, friend: String, location: String, path: String, created: Instant, entries: Arc<Vec<Entry>>, offset: usize }
 static LISTINGS: LazyLock<Mutex<HashMap<String, Listing>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-struct TokenBucket { updated: Instant, tokens: f64 }
+struct TokenBucket { updated: Instant, tokens: f64, rate: f64 }
 impl TokenBucket {
     fn take(&mut self, now: Instant) -> Result<()> {
-        self.tokens = (self.tokens + now.saturating_duration_since(self.updated).as_secs_f64() * 10.0).min(10.0);
+        self.tokens = (self.tokens + now.saturating_duration_since(self.updated).as_secs_f64() * self.rate).min(self.rate);
         // Concurrent requests can acquire the mutex out of timestamp order.
         self.updated = self.updated.max(now);
         ensure!(self.tokens >= 1.0, LocationError::RateLimit);
@@ -1411,7 +1559,10 @@ static REQUEST_RATE: LazyLock<Mutex<HashMap<(PathBuf, String, &'static str), Tok
 fn limit_request(config: &Path, friend: &str, kind: &'static str, now: Instant) -> Result<()> {
     let mut rate = REQUEST_RATE.lock().unwrap_or_else(|p| p.into_inner());
     rate.retain(|_, b| now.saturating_duration_since(b.updated) < Duration::from_secs(120));
-    rate.entry((config.into(), friend.into(), kind)).or_insert(TokenBucket { updated: now, tokens: 10.0 }).take(now)
+    // Range reads are small and frequent (a video seek is a handful of 1–16 MiB
+    // requests), so they get their own, larger bucket; everything else is 10/s.
+    let per_second = if kind == "read" { 200.0 } else { 10.0 };
+    rate.entry((config.into(), friend.into(), kind)).or_insert(TokenBucket { updated: now, tokens: per_second, rate: per_second }).take(now)
 }
 const MAX_CACHED_ENTRIES: usize = 200_000;
 fn cached_entries(cache: &HashMap<String, Listing>) -> usize {
@@ -1825,7 +1976,7 @@ pub fn download_snapshot(config: &Path, endpoint: &str, request: &Value) -> Resu
     download_snapshot_at(config, endpoint, request, Instant::now())
 }
 fn download_snapshot_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> Result<Snapshot> {
-    ensure!(request["locations_v"].as_u64() == Some(VERSION), "Unsupported Locations capability");
+    request_version(request)?;
     let (mut l, friend) = authorize(config, endpoint, text(request, "id")?, Access::Read)?;
     limit_request(config, &friend, "download", now)?;
     let friend_lease = FriendLease::acquire(config, &friend)?;
@@ -2032,6 +2183,48 @@ mod tests {
         f.location.friend_ids.clear();
         save(&f.config, Some(f.location.clone()), None).unwrap();
         error_message(dispatch(&f.config, "owner-device", &request), "Location access denied");
+    }
+    /// Open in place uses the download gates: authenticated friend + ACL,
+    /// pinned root, no symlinks or reserved names, its own rate bucket, etag.
+    #[test]
+    fn open_in_place_reads_are_gated_clamped_and_detect_changes() {
+        let mut f = Fixture::new();
+        fs::write(f.root.join("movie.mp4"), vec![7u8; 5000]).unwrap();
+        link_file(&f.config.join("friends.json"), &f.root.join("escape"));
+        let v2 = |kind: &str, rel: &str| json!({"kind": format!("locations.{kind}"), "locations_v": STREAM_VERSION, "id": "nas", "rel_path": rel});
+        let now = Instant::now();
+        let stat = dispatch_at(&f.config, "owner-device", &v2("stat", "movie.mp4"), now).unwrap();
+        assert_eq!((stat["isDir"].as_bool(), stat["size"].as_u64()), (Some(false), Some(5000)));
+        let etag = stat["etag"].as_str().unwrap().to_string();
+        assert_eq!(dispatch_at(&f.config, "owner-device", &v2("stat", ""), now).unwrap()["isDir"], true);
+        error_message(dispatch_at(&f.config, "stranger", &v2("stat", "movie.mp4"), now), "Location access denied");
+        let mut read = v2("read", "movie.mp4");
+        read["offset"] = json!(4000); read["len"] = json!(1u64 << 40); read["etag"] = json!(etag);
+        let r = stream_open_at(&f.config, "owner-device", &read, now).unwrap();
+        assert_eq!((r.offset, r.len, r.size), (4000, 1000, 5000));
+        let mut buf = vec![0u8; r.len as usize];
+        read_exact_at(&r.file, &mut buf, r.offset).unwrap();
+        assert!(buf.iter().all(|b| *b == 7));
+        read["offset"] = json!(5001);
+        assert!(stream_open_at(&f.config, "owner-device", &read, now).is_err());
+        read["offset"] = json!(0); read["etag"] = json!("stale");
+        error_kind(stream_open_at(&f.config, "owner-device", &read, now), LocationError::Changed);
+        assert_eq!(stream_error(&LocationError::Changed.into())["code"], "changed");
+        for bad in ["escape", "../config/friends.json", "/etc/passwd", ".dropbeam-trash/x"] {
+            let mut r = v2("read", bad); r["offset"] = json!(0); r["len"] = json!(10);
+            assert!(stream_open_at(&f.config, "owner-device", &r, now).is_err(), "{bad}");
+        }
+        // A v1 request can't reach v2 operations.
+        let mut old = v2("read", "movie.mp4"); old["locations_v"] = json!(VERSION); old["offset"] = json!(0); old["len"] = json!(1);
+        error_message(stream_open_at(&f.config, "owner-device", &old, now), "Unsupported Locations capability");
+        // Reads have their own bucket: a burst of 150 never starves browsing.
+        let later = now + Duration::from_secs(5);
+        read["etag"] = json!(etag);
+        for _ in 0..150 { stream_open_at(&f.config, "owner-device", &read, later).unwrap(); }
+        dispatch_at(&f.config, "owner-device", &f.req("ls", ""), later).unwrap();
+        f.location.friend_ids.clear();
+        save(&f.config, Some(f.location.clone()), None).unwrap();
+        error_message(stream_open(&f.config, "owner-device", &read), "Location access denied");
     }
     #[test]
     fn redragged_upload_adopts_the_abandoned_partial_with_most_coverage() {
@@ -2811,7 +3004,7 @@ mod tests {
 
     #[test]
     fn token_bucket_refills_continuously_with_injected_clock() {
-        let now = Instant::now(); let mut bucket = TokenBucket { updated: now, tokens: 10.0 };
+        let now = Instant::now(); let mut bucket = TokenBucket { updated: now, tokens: 10.0, rate: 10.0 };
         for _ in 0..10 { bucket.take(now).unwrap(); }
         error_kind(bucket.take(now), LocationError::RateLimit);
         error_kind(bucket.take(now + Duration::from_millis(50)), LocationError::RateLimit);

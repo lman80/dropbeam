@@ -1,5 +1,8 @@
 # Locations — Phase 1
 
+> Open in place (`locations.stat`/`read`/`thumb`, protocol v2) and "Locations as
+> a drive" are described in [locations-v2.md](locations-v2.md).
+
 Locations expose explicitly selected folders through authenticated DropBeam friend
 connections. They are independent of Shared Folders: no watching, mirroring, or
 propagated deletion. Existing version fields and ALPN `dropbeam/1` are unchanged.
