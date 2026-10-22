@@ -1458,7 +1458,7 @@ mod tests {
                 via: None,
                 deliveries: vec![],
                 link_preview: None,
-                text_rev: 0, reaction_revs: vec![],
+                text_rev: 0, reaction_revs: vec![], from_agent: None,
             },
         );
     }

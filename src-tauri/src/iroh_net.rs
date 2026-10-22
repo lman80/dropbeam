@@ -1551,7 +1551,7 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
                     via: via.map(String::from),
                     deliveries: vec![],
                     link_preview,
-                    text_rev: 0, reaction_revs: vec![],
+                    text_rev: 0, reaction_revs: vec![], from_agent: req.get("fromAgent").and_then(|a| a["name"].as_str()).and_then(crate::agent_ctl::AgentTag::sanitized),
                 };
                 // D11: acknowledged only once it's on disk (Err → no ack, so the
                 // sender / Transfer Server keeps its copy and retries).
@@ -1669,7 +1669,7 @@ pub(crate) fn land_server_files(
             via: Some(server_name.to_owned()),
             deliveries: vec![],
             link_preview: None,
-            text_rev: 0, reaction_revs: vec![],
+            text_rev: 0, reaction_revs: vec![], from_agent: None,
         };
         if crate::chat::append(config, &msg) {
             changed = Some(msg);
@@ -4021,6 +4021,11 @@ async fn serve_stream_inner(
                     cancels.remove(&id);
                 }
             }
+        }
+        // #86: a command from one of this account's own devices (agent_exec.rs
+        // decides from the authenticated remote id and the local switch).
+        Some("exec") => {
+            crate::agent_exec::serve(state, &conn.remote_id().to_string(), &req, send, recv).await?;
         }
         Some("link-offer") => {
             crate::link::serve(state, &conn.remote_id().to_string(), &req, send).await?;
@@ -7202,6 +7207,10 @@ pub fn chat_payload(m: &crate::chat::ChatMessage, peer_id: &str, my_name: &str) 
     }
     if let Some(rp) = &m.reply_preview {
         o.insert("replyPreview".into(), serde_json::json!(rp));
+    }
+    // Sent through an AI agent: an extra key older builds simply never read.
+    if let Some(a) = &m.from_agent {
+        o.insert("fromAgent".into(), serde_json::json!({ "name": a.name }));
     }
     f
 }

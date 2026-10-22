@@ -56,7 +56,7 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
-tokio = { version = "1", features = ["process", "io-util", "rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
+tokio = { version = "1", features = ["process", "io-util", "rt-multi-thread", "macros", "sync", "time", "fs", "signal", "net"] }
 uuid = { version = "1", features = ["v4"] }
 # Already in the tree transitively — direct dep only for local-time paste filenames.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -136,7 +136,9 @@ windows-core = "0.62"
 # `Win32_System_Power`: SetThreadExecutionState keeps the PC awake while files move.
 # `Wdk_*`, `Win32_Security`, `Win32_System_IO`: handle-relative NtCreateFile /
 # FileRenameInformation for hosting Locations (locations_windows.rs).
-windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_DataExchange", "Win32_System_Power", "Win32_Security", "Win32_System_IO", "Wdk_Foundation", "Wdk_Storage_FileSystem"] }
+# `Win32_System_Console`, `Win32_System_Threading`, `Win32_Security_Authorization`:
+# the `dropbeam` command attaches to its terminal; the agent pipe's owner-only ACL.
+windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_DataExchange", "Win32_System_Power", "Win32_Security", "Win32_System_IO", "Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_Security_Authorization"] }
 # Clickable chat notifications (#67): a WinRT toast with an Activated handler —
 # the same crate notify-rust uses under the plugin.
 tauri-winrt-notification = "0.7"

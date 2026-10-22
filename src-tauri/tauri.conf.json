@@ -146,6 +146,7 @@
     "linux": {
       "deb": {
         "files": {
+          "/usr/bin/dropbeam": "linux/dropbeam",
           "/usr/lib/systemd/system/dropbeam-server@.service": "linux/dropbeam-server@.service",
           "/usr/share/kio/servicemenus/dropbeam-send.desktop": "linux/dropbeam-send.kio.desktop",
           "/usr/share/nemo/actions/dropbeam-send.nemo_action": "linux/dropbeam-send.nemo_action"
@@ -156,6 +157,7 @@
       },
       "rpm": {
         "files": {
+          "/usr/bin/dropbeam": "linux/dropbeam",
           "/usr/lib/systemd/system/dropbeam-server@.service": "linux/dropbeam-server@.service",
           "/usr/share/kio/servicemenus/dropbeam-send.desktop": "linux/dropbeam-send.kio.desktop",
           "/usr/share/nemo/actions/dropbeam-send.nemo_action": "linux/dropbeam-send.nemo_action"

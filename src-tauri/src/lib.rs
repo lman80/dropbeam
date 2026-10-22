@@ -1,4 +1,11 @@
 mod account;
+// AI agents get the same verbs a person has (#82, #70, #86): the op catalog,
+// the local control socket, remote commands on own devices, and the CLI/MCP.
+mod agent_ctl;
+mod agent_exec;
+mod agent_ops;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+mod cli;
 mod device_activity;
 mod device_model;
 mod automation;
@@ -286,6 +293,73 @@ impl AppState {
         AppState { config_dir, settings: Mutex::new(Default::default()), pending_link: Mutex::new(None),
             transfers: Mutex::new(HashMap::new()), offers: Mutex::new(HashMap::new()),
             force_quit: AtomicBool::new(false), main_focused: AtomicBool::new(false), active_chat: Mutex::new(None) }
+    }
+}
+
+/// The words for the command line when this launch is one: `DropBeam cli …`,
+/// or any launch through a file named exactly `dropbeam` (the installed
+/// command; the app itself is `DropBeam`, so window launches never match).
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub fn cli_args(argv: &[String]) -> Option<Vec<String>> {
+    if argv.get(1).is_some_and(|a| a == "cli") {
+        return Some(argv[2..].to_vec());
+    }
+    let name = std::path::Path::new(argv.first()?).file_stem()?.to_str()?;
+    (name == "dropbeam").then(|| argv[1..].to_vec())
+}
+
+/// Run `dropbeam …` and return its exit code (see cli.rs).
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub fn run_cli(args: &[String]) -> i32 {
+    // `dropbeam … | head` ends quietly when the reader goes away, like any tool.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    #[cfg(windows)]
+    attach_parent_console();
+    cli::run(args)
+}
+
+/// A release Windows build is a window program with no console: when the
+/// command is typed in a terminal (through dropbeam.cmd), write to that
+/// terminal. Output piped to a file or another program already works.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use std::os::windows::io::IntoRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    let missing = |h: STD_HANDLE| unsafe { GetStdHandle(h).map_or(true, |h| h.is_invalid() || h.0.is_null()) };
+    if !missing(STD_OUTPUT_HANDLE) && !missing(STD_ERROR_HANDLE) {
+        return;
+    }
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_err() {
+        return;
+    }
+    for (h, name, write) in [(STD_OUTPUT_HANDLE, "CONOUT$", true), (STD_ERROR_HANDLE, "CONOUT$", true), (STD_INPUT_HANDLE, "CONIN$", false)] {
+        if missing(h) {
+            if let Ok(f) = std::fs::OpenOptions::new().read(!write).write(write).open(name) {
+                let _ = unsafe { SetStdHandle(h, HANDLE(f.into_raw_handle())) };
+            }
+        }
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "ios", target_os = "android"))))]
+mod cli_launch_tests {
+    fn v(s: &[&str]) -> Vec<String> { s.iter().map(|x| x.to_string()).collect() }
+    /// Window launches (Finder, Start menu, login item, "Send with DropBeam",
+    /// deep links, --server, --location-upload) never become the command line.
+    #[test]
+    fn only_cli_launches_are_cli() {
+        assert_eq!(super::cli_args(&v(&["/usr/local/bin/dropbeam", "status"])), Some(v(&["status"])));
+        assert_eq!(super::cli_args(&v(&["dropbeam"])), Some(vec![]));
+        assert_eq!(super::cli_args(&v(&["/opt/DropBeam/DropBeam", "cli", "send", "a"])), Some(v(&["send", "a"])));
+        for gui in [vec!["/Applications/DropBeam.app/Contents/MacOS/DropBeam"], vec!["DropBeam", "--minimized"],
+            vec!["DropBeam", "/home/a/status"], vec!["DropBeam", "dropbeam:abc"], vec!["DropBeam", "--server"],
+            vec!["DropBeam", "/tmp/cli"], vec!["DropBeam", "--location-upload", "{}"], vec!["/usr/bin/DropBeam", "status"]] {
+            assert_eq!(super::cli_args(&v(&gui)), None, "{gui:?}");
+        }
     }
 }
 
@@ -775,6 +849,10 @@ pub fn run() {
             std::thread::spawn(move || sync.reconcile());
             log::info!("setup: sync service registered (initial reconcile in background)");
 
+            // Agents: the local control socket (only once every state an op
+            // can touch is managed), bridged events and the activity log.
+            agent_ctl::start(app.handle().clone(), app.state::<Arc<AppState>>().config_dir.clone());
+
             #[cfg(desktop)]
             {
                 build_tray(app.handle())?;
@@ -1086,6 +1164,12 @@ pub fn run() {
             commands::my_invite_code,
             commands::add_friend_by_code,
             commands::macos_install_hint,
+            agent_ctl::agent_settings,
+            agent_ctl::agent_set_access,
+            agent_ctl::agent_set_exec,
+            agent_ctl::agent_log,
+            agent_ctl::agent_clear_log,
+            agent_ctl::agent_install_cli,
             traydrag_debug,
             frontend_log,
             take_launch_file,

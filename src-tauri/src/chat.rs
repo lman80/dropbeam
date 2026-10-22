@@ -193,6 +193,10 @@ pub struct ChatMessage {
     /// concurrent reactions on two devices merge per reaction (D17).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reaction_revs: Vec<ReactionRev>,
+    /// The AI agent the sender sent this through ("via Claude"), shown subtly
+    /// in the bubble. On the wire as `fromAgent`; older builds ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_agent: Option<crate::agent_ctl::AgentTag>,
 }
 
 /// When a reaction was last added or removed on this user's devices.
@@ -1218,7 +1222,7 @@ mod tests {
             via: None,
             deliveries: vec![],
             link_preview: None,
-            text_rev: 0, reaction_revs: vec![],
+            text_rev: 0, reaction_revs: vec![], from_agent: None,
         }
     }
 

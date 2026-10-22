@@ -1736,6 +1736,7 @@ const MessageRow = memo(function MessageRow({
               onClick={() => toast('info', statusExplanation(metaState, first, m.heldOn))}>{metaText}</button>
           : <div className="chat-meta">{metaText}</div>)}
         {!mine && m.via && lastOfRun && !(m.kind === 'file' && !m.path) && <div className="chat-via">via {m.via}</div>}
+        {m.fromAgent?.name && <div className={`chat-via chat-via-agent${mine ? ' mine' : ''}`} title="Sent by an AI agent through DropBeam">via {m.fromAgent.name}</div>}
       </div>
       {tray && <ReactionTray anchor={tray.anchor} trigger={tray.trigger} mine={mine} onPick={doReact} onClose={closeTray} />}
       {menu && (

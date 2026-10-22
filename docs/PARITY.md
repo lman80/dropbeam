@@ -152,6 +152,18 @@ Source of truth: the code on branch `ios` as of v0.52.2 (Rust engine `src-tauri/
 | In-app updates | ✅ | ✅ | ⚠️ | N/A | Linux: designed for AppImage; `.deb` installs likely need a manual reinstall (unverified) |
 | Install-location warning | ✅ | N/A | N/A | N/A | |
 
+
+### AI agents (docs/AGENTS.md)
+| Feature | macOS | Windows | Linux | iOS | Notes |
+|---|---|---|---|---|---|
+| Settings → Agents (access switch, activity log, setup lines) | ✅ | ✅ | ✅ | ❌ | iOS has no local agents (no socket, no CLI) |
+| Local control API | ✅ | ✅ | ✅ | ❌ | Unix socket (0600, peer uid checked) / named pipe (user-SID-only ACL) |
+| `dropbeam` command + MCP server | ✅ | ✅ | ✅ | N/A | macOS: Settings button links `/usr/local/bin/dropbeam`; Windows: `dropbeam.cmd` on user PATH; Linux: `/usr/bin/dropbeam` in `.deb`/`.rpm`, button for AppImage |
+| "via <agent>" on chat messages | ✅ | ✅ | ✅ | ⚠️ | stored and synced on iOS; the native chat bubble doesn't show it yet |
+| Run commands from your other devices (target) | ✅ | ✅ | ✅ | ❌ | off by default; desktop-only switch |
+| Run commands on your other devices (caller) | ✅ | ✅ | ✅ | ❌ | through the CLI/MCP on a desktop |
+| Headless Linux (no desktop session) | N/A | N/A | ⚠️ | N/A | run the app under `xvfb-run`; `--server` mode has no control API |
+
 ---
 
 ## 2. Ranked parity gaps (worth closing)

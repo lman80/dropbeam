@@ -1,0 +1,4 @@
+#!/bin/sh
+# The `dropbeam` command: DropBeam's command line for people and AI agents
+# (`dropbeam help`). Installed by the .deb/.rpm next to the app itself.
+exec /usr/bin/DropBeam cli "$@"

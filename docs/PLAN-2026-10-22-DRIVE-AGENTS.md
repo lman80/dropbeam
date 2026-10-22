@@ -147,3 +147,9 @@ and recorded (an agent that acts without a trace is a bug).
     live-mounted; macOS NFS verified end to end on the dev Mac.
   - Settings → Drives is its own tab; drive settings live in `drive.json`
     (not `settings.json`) to keep the change separate.
+- **Phase 5 (agents, branch `agent-ctl`):** built as planned (docs/AGENTS.md). Deviations:
+  no separate token file — the socket lives in an owner-only folder (0700/0600 plus a peer-uid
+  check) and the Windows pipe's random name is in a user-only file with a user-SID-only ACL;
+  `dropbeam wait-for message` is `dropbeam wait`; sending to a person with several devices
+  follows the window (every device, online ones first) instead of "the online one" — `--device`
+  picks one.

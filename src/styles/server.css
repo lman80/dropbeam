@@ -333,3 +333,5 @@
 .xfer-line.srv-held { display: flex; align-items: flex-start; gap: 4px; white-space: normal; text-align: inherit; }
 .xfer-line.srv-held .srv-glyph { flex: none; margin: 2px 0 0; }
 .att.mine .xfer-line.srv-held { justify-content: flex-end; text-align: right; }
+/* "via Claude": the message was sent through an AI agent. */
+.chat-via-agent.mine { text-align: right; margin: 2px 2px 0 0; }

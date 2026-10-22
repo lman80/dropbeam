@@ -5,6 +5,10 @@ fn main() {
   #[cfg(not(any(target_os = "ios", target_os = "android")))]
   {
     let args: Vec<String> = std::env::args().collect();
+    // `dropbeam …` / `DropBeam cli …`: the command line, before any window code.
+    if let Some(cli) = app_lib::cli_args(&args) {
+      std::process::exit(app_lib::run_cli(&cli));
+    }
     if args.iter().any(|a| a == "--server") {
       app_lib::run_headless(&args);
       return;
