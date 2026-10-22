@@ -250,7 +250,7 @@ impl RelayRecovery {
 impl IrohState {
     /// Check on reuse and presence ticks; the monitor never dials. The expected
     /// id prevents an old dispatcher from rotating a replacement connection.
-    fn cached_friend_conn(&self, endpoint: &str, expected_id: Option<usize>) -> Option<Connection> {
+    pub(crate) fn cached_friend_conn(&self, endpoint: &str, expected_id: Option<usize>) -> Option<Connection> {
         let has_direct_addrs = peer_addrs().lock().ok()
             .and_then(|addrs| addrs.get(endpoint).map(|a| !a.is_empty()))
             .unwrap_or(false);
@@ -2966,7 +2966,7 @@ fn is_blockable_kind(kind: &str) -> bool {
 async fn serve_blocked(kind: &str, req: &serde_json::Value, send: &mut SendStream) -> Result<()> {
     match kind {
         "friend-hello" => {
-            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION })).await?;
+            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_max": crate::locations::STREAM_VERSION })).await?;
         }
         "chat" => write_frame(send, &serde_json::json!({ "kind": "ok", "applied": false })).await?,
         "files" if req.get("location").is_some() => {
@@ -3021,7 +3021,7 @@ async fn serve_stream_inner(
     }
     match req.get("kind").and_then(|k| k.as_str()) {
         Some("ping") => {
-            write_frame(send, &serde_json::json!({ "kind": "pong", "locations_v": crate::locations::VERSION })).await?;
+            write_frame(send, &serde_json::json!({ "kind": "pong", "locations_v": crate::locations::VERSION, "locations_max": crate::locations::STREAM_VERSION })).await?;
             send.finish()?;
         }
         // Transfer Server (store-and-forward): hosting + the server's delivery poke.
@@ -3044,6 +3044,15 @@ async fn serve_stream_inner(
                     let _ = write_frame(send, &serde_json::json!({"ok": false,
                         "error": crate::telemetry::redact_paths_only(&format!("{e:#}"))})).await;
                     let _ = send.finish();
+                }
+                return Ok(());
+            }
+            // Open in place: a header frame, then the raw bytes on this stream.
+            if kind == "locations.read" {
+                let (cfg, peer, request) = (config.clone(), who.clone(), req.clone());
+                match tokio::task::spawn_blocking(move || crate::locations::stream_open(&cfg, &peer, &request)).await? {
+                    Ok(read) => serve_location_read(send, read).await?,
+                    Err(e) => { write_frame(send, &crate::locations::stream_error(&e)).await?; send.finish()?; }
                 }
                 return Ok(());
             }
@@ -4094,7 +4103,7 @@ async fn serve_stream_inner(
                 Some(st) if !blocked => Some(crate::friends::chat_sender(&st.config_dir, &who).is_some()),
                 _ => None,
             };
-            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat })).await?;
+            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_max": crate::locations::STREAM_VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat })).await?;
             send.finish()?;
         }
         Some("folder-hello") => {
@@ -6400,7 +6409,7 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
     tauri::async_runtime::spawn(async move {
         let mut hello = serde_json::json!({
             "kind": "friend-hello", "friend_id": friend_id, "endpoint_id": my_id, "name": my_name,
-            "avatar": avatar, "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_changed": true,
+            "avatar": avatar, "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_max": crate::locations::STREAM_VERSION, "locations_changed": true,
         });
         hello.as_object_mut().unwrap().extend(crate::link::profile(&state, &my_id).as_object().unwrap().clone());
         let config = location_config(&state).ok();
@@ -6450,7 +6459,7 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
     tauri::async_runtime::spawn(async move {
         let mut hello = serde_json::json!({
             "kind": "friend-hello", "friend_id": "", "endpoint_id": my_id, "name": my_name,
-            "avatar": avatar, "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_changed": true,
+            "avatar": avatar, "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_max": crate::locations::STREAM_VERSION, "locations_changed": true,
         });
         hello.as_object_mut().unwrap().extend(crate::link::profile(&state, &my_id).as_object().unwrap().clone());
         let config = location_config(&state).ok();
@@ -11388,6 +11397,100 @@ pub(crate) fn location_config(state: &IrohState) -> Result<PathBuf> {
         .context("Locations are not ready")
 }
 
+/// Host side of `locations.read`: `{ok,size,etag,offset,len}` then exactly
+/// `len` bytes. A blocking reader keeps up to 4 MiB ahead of the network so the
+/// disk and QUIC overlap; a short or failed read resets the stream, so the
+/// client never mistakes a truncated range for a complete one.
+async fn serve_location_read(send: &mut SendStream, read: crate::locations::StreamRead) -> Result<()> {
+    write_frame(send, &serde_json::json!({"ok": true, "locations_v": crate::locations::STREAM_VERSION,
+        "size": read.size, "etag": read.etag, "offset": read.offset, "len": read.len})).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(4);
+    let crate::locations::StreamRead { file, offset, len, .. } = read;
+    tokio::task::spawn_blocking(move || {
+        let mut done = 0u64;
+        while done < len {
+            let mut buf = vec![0u8; (len - done).min(CHUNK as u64) as usize];
+            let result = crate::locations::read_exact_at(&file, &mut buf, offset + done);
+            let failed = result.is_err();
+            if tx.blocking_send(result.map(|_| buf)).is_err() || failed { return; }
+            done += CHUNK as u64;
+        }
+    });
+    while let Some(chunk) = rx.recv().await {
+        match chunk {
+            Ok(chunk) => send.write_all(&chunk).await?,
+            Err(e) => { let _ = send.reset(1u32.into()); return Err(e.into()); }
+        }
+    }
+    send.finish()?;
+    Ok(())
+}
+
+/// The peer's highest Locations protocol: 0 = none, 1 = browse/download/upload,
+/// 2 = also open in place (stat/read/thumb). Old builds omit `locations_max`.
+pub(crate) async fn locations_capability(conn: &Connection) -> Result<u64> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_frame(&mut send, &serde_json::json!({"kind": "ping"})).await?;
+    send.finish()?;
+    let reply = tokio::time::timeout(Duration::from_secs(10), read_frame_cap(&mut recv, 4096)).await??;
+    Ok(match reply["locations_v"].as_u64() {
+        Some(v) if v == crate::locations::VERSION => reply["locations_max"].as_u64().unwrap_or(v).max(v),
+        _ => 0,
+    })
+}
+
+/// A verified connection for open-in-place traffic. Callers cache it and come
+/// back here (with `stale`) only when a request on it failed.
+pub(crate) async fn stream_connection(state: &IrohState, endpoint: &str, stale: Option<usize>) -> Result<(Connection, u64)> {
+    if let Some(id) = stale {
+        let mut conns = state.friend_conns.lock().unwrap();
+        if conns.get(endpoint).is_some_and(|c| c.conn.stable_id() == id) { conns.remove(endpoint); }
+    }
+    let conn = location_conn_with(state.cached_friend_conn(endpoint, None), |stale| async move {
+        if let Some(id) = stale {
+            let mut conns = state.friend_conns.lock().unwrap();
+            if conns.get(endpoint).is_some_and(|c| c.conn.stable_id() == id) { conns.remove(endpoint); }
+        }
+        friend_connection(state, endpoint).await
+    }).await?;
+    let max = locations_capability(&conn).await.unwrap_or(1);
+    Ok((conn, max))
+}
+
+/// One Locations RPC on an already-verified connection (no capability ping).
+pub(crate) async fn location_rpc_on(conn: &Connection, request: &serde_json::Value, timeout: Duration) -> Result<serde_json::Value> {
+    let dropped = |e: &dyn std::fmt::Display| { log::debug!("locations: stream request failed: {e}"); anyhow::anyhow!(LOCATIONS_DROPPED) };
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| dropped(&e))?;
+    write_frame(&mut send, request).await.map_err(|e| dropped(&e))?;
+    send.finish().map_err(|e| dropped(&e))?;
+    let reply = match tokio::time::timeout(timeout, read_frame_cap(&mut recv, 4_000_000)).await {
+        Err(_) => anyhow::bail!(LOCATIONS_SLOW),
+        Ok(Err(e)) => return Err(dropped(&e)),
+        Ok(Ok(reply)) => reply,
+    };
+    if reply["ok"] != true {
+        if reply["code"] == "changed" { return Err(crate::locations::LocationError::Changed.into()); }
+        anyhow::bail!("{}", reply["error"].as_str().unwrap_or("Location request failed"));
+    }
+    Ok(reply["data"].clone())
+}
+
+/// Start one `locations.read`: returns the host's header (`size`, `etag`,
+/// `len`) and the stream positioned at the first byte of the range.
+pub(crate) async fn location_read_on(conn: &Connection, request: &serde_json::Value) -> Result<(serde_json::Value, RecvStream)> {
+    let dropped = |e: &dyn std::fmt::Display| { log::debug!("locations: read stream failed: {e}"); anyhow::anyhow!(LOCATIONS_DROPPED) };
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| dropped(&e))?;
+    write_frame(&mut send, request).await.map_err(|e| dropped(&e))?;
+    send.finish().map_err(|e| dropped(&e))?;
+    let header = tokio::time::timeout(Duration::from_secs(45), read_frame_cap(&mut recv, 64 * 1024)).await
+        .map_err(|_| anyhow::anyhow!(LOCATIONS_SLOW))?.map_err(|e| dropped(&e))?;
+    if header["ok"] != true {
+        if header["code"] == "changed" { return Err(crate::locations::LocationError::Changed.into()); }
+        anyhow::bail!("{}", header["error"].as_str().unwrap_or("Couldn’t read this file"));
+    }
+    Ok((header, recv))
+}
+
 /// Probe an existing, backwards-compatible frame before sending ANY extension.
 /// In particular an old receiver must never silently land a NAS upload in Downloads.
 async fn require_locations(conn: &Connection) -> Result<()> {
@@ -16262,6 +16365,108 @@ mod location_loopback_tests {
 
         fresh.close(0u32.into(), b"done"); muted.abort(); legacy.abort(); listener.abort();
         client.close().await; mute.close().await; old.close().await; host.close().await;
+    }
+
+    /// Open in place end to end over real QUIC: capability, single stat, range
+    /// reads through the client block cache (sha256 of the whole file and of
+    /// random ranges), etag mismatch, thumbnails, v1 requests unchanged, and a
+    /// legacy host that only speaks v1.
+    #[tokio::test]
+    async fn loopback_open_in_place_stat_read_thumb_and_v1_interop() {
+        use iroh::RelayMode;
+        use sha2::Digest;
+        let base = std::env::temp_dir().join(format!("dropbeam-stream-loopback-{}", uuid::Uuid::new_v4()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(base.clone());
+        let config = base.join("config"); let nas = base.join("nas");
+        std::fs::create_dir_all(&config).unwrap(); std::fs::create_dir_all(nas.join("clips")).unwrap();
+        let movie: Vec<u8> = (0..(9 << 20) + 4321).map(|i: usize| (i * 31 + i / 4099) as u8).collect();
+        std::fs::write(nas.join("clips/movie.mp4"), &movie).unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(800, 400).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        std::fs::write(nas.join("photo.png"), png.into_inner()).unwrap();
+        let host = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+            .alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+        let client = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+            .relay_mode(RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+        let friend = crate::friends::upsert_by_endpoint(&config, &client.id().to_string(), "Mac");
+        crate::locations::save(&config, Some(crate::locations::Location { id:"family".into(), name:"Family NAS".into(), path:nas.to_string_lossy().into_owned(), friend_ids:vec![friend.id], rights:crate::locations::Rights::default(), byte_cap:crate::locations::default_byte_cap(), device:None, marker:None, safe_publish:None }), None).unwrap();
+        let state = Arc::new(IrohState::default()); state.location_config.set(config.clone()).unwrap();
+        let listener = tokio::spawn(accept_loop(host.clone(), state));
+        let conn = client.connect(host.addr(), ALPN).await.unwrap();
+        // v1 clients still see exactly what they require; v2 is advertised beside it.
+        require_locations(&conn).await.unwrap();
+        assert_eq!(locations_capability(&conn).await.unwrap(), crate::locations::STREAM_VERSION);
+        let v1 = location_rpc_on(&conn, &serde_json::json!({"kind":"locations.ls","locations_v":1,"id":"family","rel_path":"clips"}), Duration::from_secs(10)).await.unwrap();
+        assert_eq!(v1["entries"][0]["name"], "movie.mp4");
+        let stat = location_rpc_on(&conn, &serde_json::json!({"kind":"locations.stat","locations_v":2,"id":"family","rel_path":"clips/movie.mp4"}), Duration::from_secs(10)).await.unwrap();
+        assert_eq!(stat["size"], movie.len()); assert_eq!(stat["isDir"], false);
+        let etag = stat["etag"].as_str().unwrap().to_string();
+        // A v2 operation sent as v1 is refused rather than misread.
+        assert!(location_rpc_on(&conn, &serde_json::json!({"kind":"locations.stat","locations_v":1,"id":"family","rel_path":"clips/movie.mp4"}), Duration::from_secs(10)).await.is_err());
+        // One raw range straight off the wire.
+        let (header, recv) = location_read_on(&conn, &serde_json::json!({"kind":"locations.read","locations_v":2,"id":"family","rel_path":"clips/movie.mp4","offset":5,"len":100,"etag":etag})).await.unwrap();
+        let mut rx = crate::stream::chunked(&header, recv, 100).unwrap();
+        assert_eq!(rx.recv().await.unwrap().unwrap().as_ref(), &movie[5..105]);
+        let stale = location_read_on(&conn, &serde_json::json!({"kind":"locations.read","locations_v":2,"id":"family","rel_path":"clips/movie.mp4","offset":0,"len":10,"etag":"old"})).await.unwrap_err();
+        assert!(crate::stream::is_changed(&stale));
+        let escape = location_read_on(&conn, &serde_json::json!({"kind":"locations.read","locations_v":2,"id":"family","rel_path":"../config/friends.json","offset":0,"len":10})).await;
+        assert!(escape.is_err());
+        // The client engine over this connection: whole file and random ranges.
+        struct Direct(Connection);
+        #[async_trait::async_trait]
+        impl crate::stream::Remote for Direct {
+            async fn stat(&self, f: &crate::stream::FileRef) -> Result<crate::stream::Stat> {
+                Ok(serde_json::from_value(location_rpc_on(&self.0, &serde_json::json!({"kind":"locations.stat","locations_v":2,"id":f.location_id,"rel_path":f.rel_path}), Duration::from_secs(10)).await?)?)
+            }
+            async fn read(&self, f: &crate::stream::FileRef, offset: u64, len: u64, etag: &str) -> Result<tokio::sync::mpsc::Receiver<Result<bytes::Bytes>>> {
+                let (header, recv) = location_read_on(&self.0, &serde_json::json!({"kind":"locations.read","locations_v":2,"id":f.location_id,"rel_path":f.rel_path,"offset":offset,"len":len,"etag":etag})).await?;
+                crate::stream::chunked(&header, recv, len)
+            }
+            async fn rpc(&self, _: &str, request: serde_json::Value) -> Result<serde_json::Value> { location_rpc_on(&self.0, &request, Duration::from_secs(10)).await }
+            fn devices(&self) -> Vec<(String, String, String)> { vec![] }
+            async fn upload(&self, _: &str, _: &str, _: &str, _: &std::path::Path, _: bool) -> Result<String> { anyhow::bail!("no") }
+            fn path(&self, _: &str) -> Option<(String, Option<u64>)> { Some((conn_detail(&self.0).path, None)) }
+        }
+        let engine = crate::stream::Engine::new(Arc::new(Direct(conn.clone())), base.join("cache"), 1 << 30);
+        let f = crate::stream::FileRef { endpoint: "host".into(), location_id: "family".into(), rel_path: "clips/movie.mp4".into() };
+        let whole = base.join("whole.mp4");
+        engine.fetch_to_file(&f, &whole).await.unwrap();
+        assert_eq!(sha2::Sha256::digest(std::fs::read(&whole).unwrap()), sha2::Sha256::digest(&movie));
+        for (off, len) in [(0u64, 1u64), (3 << 20, 5 << 20), ((9 << 20) + 4000, 10_000), (1_048_575, 2)] {
+            let got = engine.read(&f, off, len).await.unwrap();
+            let end = ((off + len) as usize).min(movie.len());
+            assert_eq!(&got[..], &movie[off as usize..end]);
+        }
+        assert_eq!(engine.list("host", "family", "").await.unwrap().len(), 2);
+        assert!(matches!(engine.status("host").path.as_str(), "local" | "direct"));
+        // The host edits the file: the next read notices and serves new bytes.
+        std::fs::write(nas.join("clips/movie.mp4"), b"edited").unwrap();
+        engine.forget(&f);
+        assert_eq!(&engine.read(&f, 0, 100).await.unwrap()[..], b"edited");
+        let thumb = location_rpc_on(&conn, &serde_json::json!({"kind":"locations.thumb","locations_v":2,"id":"family","rel_path":"photo.png","max":128}), Duration::from_secs(10)).await.unwrap();
+        use base64::Engine as _;
+        let jpeg = base64::engine::general_purpose::STANDARD.decode(thumb["data"].as_str().unwrap()).unwrap();
+        let decoded = image::load_from_memory(&jpeg).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (128, 64));
+        assert!(location_rpc_on(&conn, &serde_json::json!({"kind":"locations.thumb","locations_v":2,"id":"family","rel_path":"clips/movie.mp4"}), Duration::from_secs(10)).await.is_err());
+        // A host on an older build answers the ping with v1 only.
+        let legacy = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+            .alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+        let old = legacy.clone();
+        let responder = tokio::spawn(async move {
+            let c = old.accept().await.unwrap().await.unwrap();
+            while let Ok((mut send, mut recv)) = c.accept_bi().await {
+                let _ = read_frame(&mut recv).await;
+                write_frame(&mut send, &serde_json::json!({"kind":"pong","locations_v":1})).await.unwrap(); send.finish().unwrap();
+            }
+        });
+        let old_conn = client.connect(legacy.addr(), ALPN).await.unwrap();
+        require_locations(&old_conn).await.unwrap();
+        assert_eq!(locations_capability(&old_conn).await.unwrap(), 1);
+        old_conn.close(0u32.into(), b"done"); responder.abort(); legacy.close().await;
+        conn.close(0u32.into(), b"done"); listener.abort(); client.close().await; host.close().await;
     }
 
     #[tokio::test]

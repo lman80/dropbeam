@@ -8,6 +8,7 @@ mod link;
 mod link_preview;
 mod location_sync;
 mod locations;
+mod stream;
 mod mailbox;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod headless;
