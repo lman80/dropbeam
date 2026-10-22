@@ -461,16 +461,30 @@ async fn exec_streaming(app: &AppHandle, id: &Value, input: Value, who: &Caller,
 }
 
 /// Where the CLI finds the running app.
+#[cfg(unix)]
+pub fn socket_dir(config: &Path) -> PathBuf {
+    let dir = config.join("agent");
+    // A socket path must fit in sockaddr_un (104 bytes on macOS): with a very
+    // long home folder, use /tmp/dropbeam-<uid>, tmux-style (owner-checked).
+    if dir.join("agent.sock").as_os_str().len() < 100 { dir } else { PathBuf::from(format!("/tmp/dropbeam-{}", unsafe { libc::geteuid() })) }
+}
+#[cfg(not(unix))]
 pub fn socket_dir(config: &Path) -> PathBuf { config.join("agent") }
 #[cfg(unix)]
 pub fn socket_path(config: &Path) -> PathBuf { socket_dir(config).join("agent.sock") }
 #[cfg(windows)]
 pub fn pipe_name_file(config: &Path) -> PathBuf { socket_dir(config).join("pipe") }
 
+/// The socket's folder: ours alone (0700), and really ours — a folder someone
+/// else made (or a symlink) at that path is refused.
 #[cfg(unix)]
 pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let m = std::fs::symlink_metadata(dir)?;
+    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::other(format!("{} isn't a folder owned by this user", dir.display())));
+    }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
@@ -823,7 +837,11 @@ mod tests {
     #[test]
     fn socket_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let d = tmp();
+        // A long config folder falls back to a short per-user path.
+        assert!(socket_path(&PathBuf::from(format!("/{}", "x".repeat(120)))).starts_with("/tmp/dropbeam-"));
+        let d = PathBuf::from(format!("/tmp/dbt-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]));
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(socket_dir(&d), d.join("agent"));
         let sd = socket_dir(&d);
         std::fs::create_dir_all(&sd).unwrap();
         std::fs::set_permissions(&sd, std::fs::Permissions::from_mode(0o755)).unwrap();

@@ -162,7 +162,8 @@ Turn it on while you set a computer up. A lost device: remove it from your accou
 ## Safety model
 
 - **Who can connect:** only programs running as the same OS user.
-  - macOS / Linux: a Unix socket `<config>/agent/agent.sock`; the folder is `0700`, the
+  - macOS / Linux: a Unix socket `<config>/agent/agent.sock` (or `/tmp/dropbeam-<uid>/agent.sock`
+    when the config path is too long for a socket, owner-checked); the folder is `0700`, the
     socket `0600`, and every connection's peer uid is checked against ours.
   - Windows: a named pipe with a random name, kept in `<config>\agent\pipe` (readable only
     by you); created first-instance-only, refusing remote clients, with a security
