@@ -380,13 +380,18 @@ struct ConversationView: View {
                 .padding(.top, newRun && !newCluster ? 10 : newCluster ? 0 : 2)
                 .padding(.top, message.reactions?.isEmpty == false ? 24 : 0)
                 let via = !message.fromMe && lastInRun && !(message.kind == "file" && message.path == nil) ? message.via : nil
-                if message.edited == true || via != nil || (lastMine && delivery(message) != nil) {
+                let agent = message.fromAgent?.name
+                if message.edited == true || via != nil || agent != nil || (lastMine && delivery(message) != nil) {
                     VStack(alignment: message.fromMe ? .trailing : .leading, spacing: 1) {
                         if message.edited == true {
                             Text("Edited").font(.caption2.weight(.medium)).foregroundStyle(message.fromMe ? ChatPalette.sent : Color.secondary)
                         }
                         if let via {
                             Text("via \(via)").font(.caption2).foregroundStyle(.secondary)
+                        }
+                        if let agent {
+                            Text("\(Image(systemName: "sparkles")) via \(agent)").font(.caption2).foregroundStyle(.secondary)
+                                .accessibilityLabel("Sent by an AI agent, \(agent)")
                         }
                         if lastMine, let status = delivery(message) {
                             Button { statusHelp = explanation(message) } label: {

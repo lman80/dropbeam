@@ -156,6 +156,8 @@ struct ChatMessage: Decodable, Identifiable, Equatable {
     var deliveries: [Delivery]?
     /// A link preview the sender's device fetched (#47); nothing is fetched here.
     var linkPreview: ChatLinkPreview?
+    /// Written by an AI agent through DropBeam's command line / MCP (shown as "via <name>").
+    var fromAgent: ChatAgent?
     var date: Date { Date(timeIntervalSince1970: ts / 1000) }
     var preview: String { deleted == true ? "Message deleted" : text?.isEmpty == false ? (text ?? "") : files?.joined(separator: ", ") ?? "Attachment" }
 }
@@ -173,6 +175,10 @@ struct ChatLinkPreview: Decodable, Equatable {
     var imageW: Double?
     var imageH: Double?
 }
+struct ChatAgent: Decodable, Equatable {
+    let name: String
+}
+
 struct ChatGif: Decodable, Equatable {
     var url: String?
     var w: Double?
