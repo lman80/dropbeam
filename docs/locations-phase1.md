@@ -199,8 +199,8 @@ test exercises actual capability negotiation, listing, Unicode upload, folder an
 empty-directory upload, the normal 16 MiB resumable path, and permission denial.
 It uses loopback-only endpoints with relay and discovery disabled.
 
-Phase 1 hosts are **Linux and macOS**. Windows and phone clients can use a supported
-host; secure Windows hosting is not implemented and fails closed. The UI was built,
+Hosts are **Linux, macOS and (since 2026-10-22) Windows** — see "Windows hosts"
+below. Phones are clients only. The UI was built,
 but native mobile device and actual Ubuntu GVFS/NAS compatibility were not exercised
 in this environment. The forced-reservation test covers the fallback on the local
 filesystem; it does not establish behavior on the actual family NAS.
@@ -211,7 +211,77 @@ local disk space and I/O; large snapshots show “Preparing” in the browser. I
 uploads retain private staging for retries until GC. The existing engine prepares a
 complete manifest, hashes paths and reopens them on retries, so this change retains
 bounded private snapshots rather than streaming a changing NAS tree. No filesystem
-watcher, trash restore UI, streaming snapshots, or Windows host adapter is included.
+watcher, trash restore UI or streaming snapshots is included.
+
+## Windows hosts
+
+`src-tauri/src/locations_windows.rs` gives Windows the same `Root` contract as the
+Unix descriptor walk; the GUI and the headless `--server` use it alike. The owner
+case is a whole data drive (`D:\`, "Storage") or a folder on it (`D:\Ashton`).
+
+- **Pinned, handle-relative traversal.** The root is opened once
+  (`FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`, share
+  read/write/delete). Every component is opened with `NtCreateFile` relative to its
+  parent's handle (`OBJECT_ATTRIBUTES.RootDirectory`, one name per call — names with
+  `\`, `/` or `:` never reach NT, so no multi-component walks or alternate data
+  streams) and `FILE_OPEN_REPARSE_POINT`.
+- **Reparse points are refused** like Unix symlinks, even when they point inside
+  the root: symlinks, junctions, volume mount points, and also non-link reparse
+  points (OneDrive/cloud placeholders, dedup, WOF-compressed files). They are omitted
+  from listings and downloads and cannot be traversed, renamed, trashed or written
+  through. A child whose volume serial differs from its parent's is refused
+  ("Crossing into another mount").
+- **Identity** is volume serial + 128-bit file id (`FileIdInfo`, falling back to
+  `GetFileInformationByHandle`'s 64-bit index). `device` in `locations.json` stores
+  the volume serial; the session recheck compares the root's identity and the
+  marker exactly as on Unix.
+- **No-replace publication is native everywhere**: `FileRenameInformation` with
+  `ReplaceIfExists = FALSE`, issued on the source's own handle with the pinned
+  destination directory as `RootDirectory`. NTFS, ReFS, FAT32, exFAT and SMB all
+  honor it, so Windows has no capability probe and no reservation fallback
+  (Settings shows **Safe publish: native**). The v1 path copies into an exclusive
+  (`FILE_CREATE`) hidden `.dropbeam-upload-<uuid>.part`, verifies SHA-256, flushes,
+  renames that same handle into place and clears its hidden attribute; a failed
+  publish deletes the temp file through the handle, never by name. The v2 path
+  renames the staged file through an identity-checked handle.
+- **Deletes** (failed temp files, stage GC, an empty trash bucket after a failed
+  move) go through a handle (`FileDispositionInfoEx`, POSIX semantics, falling back
+  to classic delete). Removing a link only removes the link.
+- **Control data is hidden**: the mount marker, `.dropbeam-trash`,
+  `.dropbeam-staging` and temp files are created with `FILE_ATTRIBUTE_HIDDEN`.
+  Trash is `.dropbeam-trash/<ms>-<uuid>/<name>`, as on Unix.
+- **Protected OS entries**: items that are both hidden and system (`$RECYCLE.BIN`,
+  `System Volume Information`, `desktop.ini`) are never listed, downloaded or
+  managed — Explorer hides them too.
+- **Names**: relative paths additionally refuse `< > : " | ? *`, control
+  characters, a trailing dot or space, and device names with any extension (`CON`,
+  `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`, `COM¹²³`/`LPT¹²³`, `CONIN$`,
+  `CONOUT$`). Lookups are case-insensitive (`OBJ_CASE_INSENSITIVE`), so an upload of
+  `Report.PDF` beside an existing different `report.pdf` lands as `Report (2).PDF`;
+  download twins keep the existing NFC/lowercase collision rule. Paths on the wire are
+  always `/`-separated.
+- **Root protection** (in addition to the config directory and paired folders):
+  refused when the root is, or contains, the system drive root (`C:\`), `%SystemRoot%`,
+  `%ProgramFiles%`, `%ProgramFiles(x86)%`, `%ProgramData%`, `%USERPROFILE%`, or
+  AppData; refused when the root is inside `%SystemRoot%`, Program Files,
+  ProgramData or AppData (Roaming/Local, which includes `%TEMP%`). Comparisons are
+  case-insensitive. A non-system drive root such as `D:\` is allowed, as is any
+  folder in the profile such as `Documents`.
+- **Paths** are stored without the `\\?\` prefix when that is lossless
+  (`D:\Ashton`); std re-adds it for long paths. Free space uses
+  `GetDiskFreeSpaceExW` (same 64 MiB headroom).
+- **Wizard suggestions** (`mounts.rs`): fixed, removable and network drive letters
+  except the system drive, labelled "Storage (D:)" / "USB Drive (E:)" /
+  "Network Drive (Z:)" with free space.
+
+Known differences from Unix: a file another program holds open without
+`FILE_SHARE_READ` cannot be downloaded or hashed (it is still listed — listings
+come from the directory enumeration, not per-file opens); refusing every reparse
+point also hides OneDrive placeholders and WOF-compressed files; hidden+system
+files are not shareable. The Windows tests (`windows_*` in `locations.rs`, plus the
+shared tests now compiled for `any(unix, windows)`) need permission to create file
+symlinks (CI runs as administrator; locally enable Developer Mode). The iroh
+loopback Locations tests in `iroh_net.rs` remain Unix-only.
 
 ## Verification in this checkout
 
