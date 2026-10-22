@@ -193,7 +193,7 @@ impl Tree {
                 .filter(|n| !taken.iter().any(|t| t.eq_ignore_ascii_case(n))).unwrap_or_else(|| display_name(&name, &taken));
             hosts.push(Host { name, friend_id, endpoint, locations: locs });
         }
-        hosts.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        hosts.sort_by_key(|h| h.name.to_lowercase());
         *lock(&self.hosts) = (Some(Instant::now()), hosts);
         self.refreshing.store(false, Ordering::SeqCst);
     }

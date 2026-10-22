@@ -60,6 +60,8 @@ pub trait Remote: Send + Sync + 'static {
 }
 
 type BlockId = (String, u64);
+/// A block fetch's result, shared with every reader waiting on it.
+type Outcome = Option<Result<(), String>>;
 
 /// Least-recently-used index of the blocks on disk.
 #[derive(Default)]
@@ -126,7 +128,7 @@ pub struct Engine {
     dir: PathBuf,
     max_bytes: AtomicU64,
     lru: Mutex<Lru>,
-    inflight: Mutex<HashMap<BlockId, watch::Receiver<Option<Result<(), String>>>>>,
+    inflight: Mutex<HashMap<BlockId, watch::Receiver<Outcome>>>,
     stats: Mutex<HashMap<FileRef, (Stat, Instant)>>,
     seq: Mutex<HashMap<String, Seq>>,
     limits: Mutex<HashMap<String, Arc<Semaphore>>>,
@@ -268,7 +270,7 @@ impl Engine {
     /// Make blocks `first..=last` present: cached, joined in flight, or fetched.
     async fn ensure(self: &Arc<Self>, f: &FileRef, stat: &Stat, key: &str, first: u64, last: u64) -> Result<()> {
         let mut waits = Vec::new();
-        let mut missing: Vec<(u64, watch::Sender<Option<Result<(), String>>>)> = Vec::new();
+        let mut missing: Vec<(u64, watch::Sender<Outcome>)> = Vec::new();
         {
             let mut lru = lock(&self.lru);
             let mut inflight = lock(&self.inflight);
@@ -282,7 +284,7 @@ impl Engine {
             }
         }
         // Contiguous runs of at most REQUEST_BLOCKS, each its own request.
-        let mut runs: Vec<Vec<(u64, watch::Sender<Option<Result<(), String>>>)>> = Vec::new();
+        let mut runs: Vec<Vec<(u64, watch::Sender<Outcome>)>> = Vec::new();
         for item in missing {
             match runs.last_mut() {
                 Some(run) if run.last().is_some_and(|(i, _)| *i + 1 == item.0) && (run.len() as u64) < REQUEST_BLOCKS => run.push(item),
@@ -307,7 +309,7 @@ impl Engine {
         }
         Ok(())
     }
-    async fn fetch(self: Arc<Self>, f: FileRef, etag: String, key: String, size: u64, run: Vec<(u64, watch::Sender<Option<Result<(), String>>>)>) {
+    async fn fetch(self: Arc<Self>, f: FileRef, etag: String, key: String, size: u64, run: Vec<(u64, watch::Sender<Outcome>)>) {
         let first = run[0].0;
         let offset = first * BLOCK;
         let len = (run.len() as u64 * BLOCK).min(size - offset);
