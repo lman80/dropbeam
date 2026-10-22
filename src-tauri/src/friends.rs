@@ -894,6 +894,30 @@ pub fn accept_request(config_dir: &Path, endpoint_id: &str) -> Result<Friend, St
     Ok(upsert_by_endpoint(config_dir, endpoint_id, &r.name))
 }
 
+/// A friend we greeted answered with the name they chose for themselves (#83):
+/// adopt it unless the user renamed them here. Only an existing friend record
+/// changes (never a request, never one of our own devices — account sync names
+/// those). This is how a friend added from a code made before they picked
+/// their name ("DESKTOP-34RO0CL") gets the real one on the next hello, even
+/// when their own rename broadcast happened before we were their friend.
+pub fn adopt_name_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> bool {
+    let name = sanitize_display_name(name, "");
+    if name.is_empty() || endpoint_id.is_empty() || crate::account::is_own_device(config_dir, endpoint_id) {
+        return false;
+    }
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut friends = read_raw(config_dir);
+    let mut changed = false;
+    for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id) && !f.name_custom && f.name != name) {
+        f.name = name.clone();
+        changed = true;
+    }
+    if changed {
+        let _ = save(config_dir, &friends);
+    }
+    changed
+}
+
 /// Store the friend-at-`endpoint_id`'s profile picture path (received over the
 /// wire and already saved to disk by the caller). Returns true if a record changed.
 pub fn set_avatar_by_endpoint(config_dir: &Path, endpoint_id: &str, path: String) -> bool {
@@ -2251,6 +2275,24 @@ mod awaiting_accept_tests {
         let raw = serde_json::to_string(&load(&d)).unwrap().replace(",\"awaitingAccept\":false", "");
         std::fs::write(d.join("friends.json"), raw).unwrap();
         assert!(!load(&d)[0].awaiting_accept);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_greeted_friend_answering_with_their_chosen_name_replaces_the_code_name() {
+        let d = dir();
+        // Added from a code made before they named themselves (#83).
+        let f = upsert_by_endpoint(&d, "win-eid", "DESKTOP-34RO0CL");
+        assert!(adopt_name_by_endpoint(&d, "win-eid", "  Old Desktop "));
+        assert_eq!(get(&d, &f.id).unwrap().name, "Old Desktop");
+        assert!(!adopt_name_by_endpoint(&d, "win-eid", "Old Desktop"), "no change, no write");
+        assert!(!adopt_name_by_endpoint(&d, "win-eid", "   "), "an empty answer keeps the name");
+        assert!(!adopt_name_by_endpoint(&d, "stranger", "Mallory"), "never adds anyone");
+        assert!(load(&d).iter().all(|f| f.endpoint_id.as_deref() != Some("stranger")));
+        // A name the user gave them here wins over theirs.
+        rename(&d, &f.id, "Basement PC".into()).unwrap();
+        assert!(!adopt_name_by_endpoint(&d, "win-eid", "Old Desktop"));
+        assert_eq!(get(&d, &f.id).unwrap().name, "Basement PC");
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -4094,7 +4094,14 @@ async fn serve_stream_inner(
                 Some(st) if !blocked => Some(crate::friends::chat_sender(&st.config_dir, &who).is_some()),
                 _ => None,
             };
-            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat })).await?;
+            // And our chosen NAME to a friend (#83): one who added us from a code
+            // made before we named ourselves fixes it on their next hello. A
+            // stranger or pending request learns nothing new here.
+            let my_name = match state.app.get().and_then(|app| app.try_state::<Arc<crate::AppState>>()) {
+                Some(st) if accepts_chat == Some(true) => Some(st.settings.lock().unwrap().display_name.clone()),
+                _ => None,
+            };
+            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat, "name": my_name })).await?;
             send.finish()?;
         }
         Some("folder-hello") => {
@@ -6312,6 +6319,18 @@ fn apply_hello_reply_avatar(state: &Arc<IrohState>, who: &str, reply: &serde_jso
     let _ = app.emit("friends://changed", ());
 }
 
+/// A newer peer that has us as a friend answers our hello with the name it
+/// chose (#83): adopt it unless the user renamed them here.
+fn apply_hello_reply_name(state: &Arc<IrohState>, who: &str, reply: &serde_json::Value) {
+    let Some(name) = reply.get("name").and_then(|v| v.as_str()) else { return };
+    let Some(app) = state.app.get() else { return };
+    let Some(st) = app.try_state::<Arc<crate::AppState>>() else { return };
+    if crate::block::is_blocked(&st.config_dir, who) { return; }
+    if crate::friends::adopt_name_by_endpoint(&st.config_dir, who, name) {
+        let _ = app.emit("friends://changed", ());
+    }
+}
+
 /// Cache the encoded avatar thumbnail by (path, mtime) so a profile broadcast to
 /// N friends decodes the image at most once.
 static AVATAR_THUMB_CACHE: std::sync::Mutex<Option<(String, u64, Option<String>)>> =
@@ -6416,6 +6435,7 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
                     apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
+                    apply_hello_reply_name(&state, &conn.remote_id().to_string(), &reply);
                     // Older builds don't say; a null answer changes nothing.
                     if let (Some(accepts), Some(config)) = (reply["accepts_chat"].as_bool(), &config) {
                         if crate::friends::set_awaiting_accept(config, &conn.remote_id().to_string(), !accepts) {
@@ -6466,6 +6486,7 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
                     apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
+                    apply_hello_reply_name(&state, &conn.remote_id().to_string(), &reply);
                     // Older builds don't say; a null answer changes nothing.
                     if let (Some(accepts), Some(config)) = (reply["accepts_chat"].as_bool(), &config) {
                         if crate::friends::set_awaiting_accept(config, &conn.remote_id().to_string(), !accepts) {

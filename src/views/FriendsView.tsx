@@ -248,7 +248,9 @@ function YouSection() {
     return () => {
       alive = false
     }
-  }, [])
+    // The code carries your name: a code fetched before you named yourself
+    // made friends add you as the computer's name (#83). Re-fetch on rename.
+  }, [displayName])
 
   // A friendly message with a tap-to-add link, not a bare code: whoever gets
   // it in a text message knows what to do with it.
@@ -729,7 +731,9 @@ function YouCard() {
     return () => {
       alive = false
     }
-  }, [])
+    // The code carries your name: a code fetched before you named yourself
+    // made friends add you as the computer's name (#83). Re-fetch on rename.
+  }, [displayName])
 
   const saveName = () => {
     const n = name.trim()
