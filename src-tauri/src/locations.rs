@@ -103,7 +103,7 @@ fn sibling_name(name: &std::ffi::OsStr, index: usize) -> std::ffi::OsString {
 /// requested one (reserved prefixes, length, components).
 #[cfg_attr(not(unix), allow(dead_code))]
 fn sibling_rel(rel: &Path, candidate: &std::ffi::OsStr) -> Result<PathBuf> {
-    relative(&rel.with_file_name(candidate).to_string_lossy())
+    relative(&slash(&rel.with_file_name(candidate)))
 }
 #[cfg_attr(not(unix), allow(dead_code))]
 fn already_exists(e: &anyhow::Error) -> bool {
@@ -123,8 +123,8 @@ pub fn hosted(config: &Path) -> Result<Vec<Location>> {
     let mut list = load(config)?;
     for l in &mut list {
         match Root::for_location(l) {
-            #[cfg(unix)] Ok(root) => l.safe_publish = Some(if root.native { "native" } else { "reservation" }.into()),
-            #[cfg(not(unix))] Ok(_) => {},
+            #[cfg(any(unix, windows))] Ok(root) => l.safe_publish = Some(if root.native { "native" } else { "reservation" }.into()),
+            #[cfg(not(any(unix, windows)))] Ok(_) => {},
             Err(e) => l.safe_publish = Some(format!("unavailable ({e})")),
         }
     }
@@ -141,7 +141,7 @@ pub fn save(config: &Path, location: Option<Location>, remove: Option<&str>) -> 
     if let Some(mut l) = location {
         ensure!(!l.name.trim().is_empty() && l.name.len() <= 160, "Enter a name (up to 160 bytes)");
         ensure!(l.friend_ids.len() <= 500, "Too many friends");
-        let canonical = fs::canonicalize(&l.path)?;
+        let canonical = canonical(Path::new(&l.path))?;
         validate_root(config, &canonical)?;
         ensure!(l.byte_cap > 0, "Byte cap must be positive");
         let root = if let Some(old) = list.iter_mut().find(|old| old.id == l.id && Path::new(&old.path) == canonical && old.marker.is_some()) {
@@ -154,6 +154,12 @@ pub fn save(config: &Path, location: Option<Location>, remove: Option<&str>) -> 
             l.device = Some(root.dir.metadata()?.dev());
             if l.marker.is_none() { l.marker = Some(root.create_marker()?); }
             l.safe_publish = Some(if root.native { "native" } else { "reservation" }.into());
+        }
+        // Windows: volume serial stands in for st_dev; publication is always native.
+        #[cfg(windows)] {
+            l.device = Some(win::id(&root.dir)?.volume);
+            if l.marker.is_none() { l.marker = Some(root.create_marker()?); }
+            l.safe_publish = Some("native".into());
         }
         l.path = root.path.to_string_lossy().into_owned();
         l.name = l.name.trim().into();
@@ -178,7 +184,7 @@ pub fn save(config: &Path, location: Option<Location>, remove: Option<&str>) -> 
     lock.revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // Stop sharing must still work when the mount is offline. If present, move
     // the verified marker to recoverable trash; never unlink it from the NAS.
-    #[cfg(unix)] if let Some(l) = stopped {
+    #[cfg(any(unix, windows))] if let Some(l) = stopped {
         if let Err(e) = Root::retire_marker(&l) { log::warn!("Stopped location {} but could not retire mount marker: {e:#}", l.id); }
     }
     Ok(list)
@@ -187,18 +193,24 @@ pub fn save(config: &Path, location: Option<Location>, remove: Option<&str>) -> 
 // Paired folders can be temporarily absent; resolve their existing ancestor so
 // aliases such as /var vs /private/var cannot bypass overlap protection.
 fn canonical_missing(path: &Path) -> Result<PathBuf> {
-    if let Ok(path) = fs::canonicalize(path) { return Ok(path); }
+    if let Ok(path) = canonical(path) { return Ok(path); }
     let parent = path.parent().context("Cannot resolve paired mirror folder")?;
     let name = path.file_name().context("Cannot resolve paired mirror folder")?;
     Ok(canonical_missing(parent)?.join(name))
 }
+/// `fs::canonicalize`, except that Windows drops the `\\?\` prefix where that is
+/// lossless (`win::simplify`), so stored paths, Explorer and comparisons agree.
+pub(crate) fn canonical(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(windows)] { fs::canonicalize(path).map(win::simplify) }
+    #[cfg(not(windows))] { fs::canonicalize(path) }
+}
 pub(crate) fn validate_root(config: &Path, root: &Path) -> Result<()> {
-    let canonical_root = fs::canonicalize(root)?;
+    let canonical_root = canonical(root)?;
     let root = canonical_root.as_path();
-    let config = fs::canonicalize(config)?;
+    let config = canonical(config)?;
     let mut protected = vec![config.clone(), PathBuf::from("/")];
     if let Some(home) = std::env::var_os("HOME") {
-        let home = fs::canonicalize(home)?;
+        let home = canonical(Path::new(&home))?;
         #[cfg(target_vendor = "apple")] {
             let library = canonical_missing(&home.join("Library"))?;
             ensure!(!root.starts_with(&library), LocationError::UnsafeRoot);
@@ -207,6 +219,13 @@ pub(crate) fn validate_root(config: &Path, root: &Path) -> Result<()> {
         protected.push(home);
     }
     ensure!(!protected.iter().any(|p| p.starts_with(root)) && !root.starts_with(&config), LocationError::UnsafeRoot);
+    // Windows: the system drive, Windows, Program Files, ProgramData, the
+    // profile itself and AppData. A whole data drive (`D:\`) stays allowed.
+    #[cfg(windows)] {
+        let (ancestors, inside) = win::protected();
+        ensure!(!ancestors.iter().any(|p| win::starts_with(p, root)) && !inside.iter().any(|p| win::starts_with(root, p))
+            && !win::starts_with(root, &config), LocationError::UnsafeRoot);
+    }
     for pair in crate::pairing::load(&config) {
         // All paired folders are excluded, including ones whose mirror option may change.
         let folder = canonical_missing(Path::new(&pair.folder))?;
@@ -275,17 +294,23 @@ pub fn relative(raw: &str) -> Result<PathBuf> {
         if part.is_empty() || part == "." { continue; }
         ensure!(!part.to_ascii_lowercase().starts_with(".dropbeam-"), "Reserved location path");
         ensure!(part.len() <= 255, "File name too long");
+        #[cfg(windows)] win::valid_name(part)?;
         out.push(part);
     }
     ensure!(out.components().all(|c| matches!(c, Component::Normal(_))), "Invalid relative path");
     Ok(out)
 }
+/// A validated relative path back in wire form: `/`-separated on every OS
+/// (Windows' PathBuf joins with `\\`, which `relative` refuses there).
+pub(crate) fn slash(rel: &Path) -> String {
+    rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
+}
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> { v[key].as_str().context(format!("Missing {key}")) }
 
 pub struct Root {
     path: PathBuf,
-    #[cfg(unix)] dir: fs::File,
-    #[cfg(unix)] native: bool,
+    #[cfg(any(unix, windows))] dir: fs::File,
+    #[cfg(any(unix, windows))] native: bool,
 }
 impl Root {
     pub fn for_location(l: &mut Location) -> Result<Self> {
@@ -297,13 +322,18 @@ impl Root {
             // identity; device numbers pin only this open session.
             l.device = Some(dir.metadata()?.dev());
             let native = unix::cached_probe(&dir)?;
-            return Ok(Self { path: fs::canonicalize(&l.path)?, dir, native });
+            return Ok(Self { path: canonical(Path::new(&l.path))?, dir, native });
         }
-        #[cfg(not(unix))] Self::open(Path::new(&l.path))
+        #[cfg(windows)] {
+            let dir = Self::verified_dir(l)?;
+            l.device = Some(win::id(&dir)?.volume);
+            Ok(Self { path: canonical(Path::new(&l.path))?, dir, native: true })
+        }
+        #[cfg(not(any(unix, windows)))] Self::open(Path::new(&l.path))
     }
     pub fn open(path: &Path) -> Result<Self> {
         ensure!(!cfg!(target_os = "ios"), "Sharing a Location requires the desktop app");
-        let path = fs::canonicalize(path).context("Location unavailable. Check that the NAS is mounted")?;
+        let path = canonical(path).context("Location unavailable. Check that the NAS is mounted")?;
         ensure!(path.is_dir(), "Location must be a folder");
         #[cfg(unix)] {
             use std::os::unix::fs::OpenOptionsExt;
@@ -311,7 +341,8 @@ impl Root {
             let native = unix::cached_probe(&dir)?;
             Ok(Self { path, dir, native })
         }
-        #[cfg(not(unix))] { let _ = path; bail!("Hosting Locations requires Linux or macOS in Phase 1") }
+        #[cfg(windows)] { let dir = win::open_root(&path)?; Ok(Self { path, dir, native: true }) }
+        #[cfg(not(any(unix, windows)))] { let _ = path; bail!("Hosting Locations requires Linux, macOS or Windows") }
     }
     #[cfg(unix)]
     fn verified_dir(l: &Location) -> Result<fs::File> {
@@ -329,7 +360,8 @@ impl Root {
             let pinned = self.dir.metadata()?;
             ensure!(current.dev() == pinned.dev() && current.ino() == pinned.ino(), LocationError::MountChanged);
         }
-        ensure!(fs::canonicalize(&l.path)? == self.path, LocationError::MountChanged);
+        #[cfg(windows)] ensure!(win::id(&Self::verified_dir(l)?)? == win::id(&self.dir)?, LocationError::MountChanged);
+        ensure!(canonical(Path::new(&l.path))? == self.path, LocationError::MountChanged);
         Ok(())
     }
     #[cfg(unix)]
@@ -341,11 +373,11 @@ impl Root {
     }
     pub fn resolve(&self, raw: &str) -> Result<PathBuf> {
         let rel = relative(raw)?;
-        let resolved = fs::canonicalize(self.path.join(&rel))?;
+        let resolved = canonical(&self.path.join(&rel))?;
         ensure!(resolved.starts_with(&self.path), "Path escapes the location");
         // Strict policy: refuse symlinks even when they currently resolve inside.
         // Descriptor walks below prevent a later swap from redirecting a syscall.
-        #[cfg(unix)] { let _ = self.open_rel(&rel, false)?; }
+        #[cfg(any(unix, windows))] { let _ = self.open_rel(&rel, false)?; }
         Ok(resolved)
     }
 }
@@ -419,7 +451,7 @@ pub(crate) fn receive_sweep_allowed(config: &Path, dir: &Path) -> bool {
         part.as_os_str().to_string_lossy().eq_ignore_ascii_case(".dropbeam-staging"));
     if staging(dir) { return false; }
     let Ok(locations) = load(config) else { return false; };
-    let Ok(path) = fs::canonicalize(dir) else { return false; };
+    let Ok(path) = canonical(dir) else { return false; };
     if staging(&path) { return false; }
     for l in locations {
         let Ok(root) = canonical_missing(Path::new(&l.path)) else { return false; };
@@ -427,6 +459,10 @@ pub(crate) fn receive_sweep_allowed(config: &Path, dir: &Path) -> bool {
     }
     true
 }
+
+#[cfg(windows)]
+#[path = "locations_windows.rs"]
+mod win;
 
 #[cfg(unix)]
 mod unix {
@@ -1080,7 +1116,7 @@ mod unix {
 }
 
 // Fail closed on platforms without descriptor-relative filesystem protection.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl Root {
     pub fn stat_entry(&self, _: &str) -> Result<Option<(bool, u64)>> { bail!("Hosting unavailable") }
     pub fn stat_many(&self, _: &str, _: &[String]) -> Result<Vec<Option<(bool, u64, u64)>>> { bail!("Hosting unavailable") }
@@ -1165,7 +1201,7 @@ fn dispatch_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> 
                 let rel = path.as_str().context("Invalid stat path")?;
                 let rel_path = relative(rel)?;
                 let leaf = rel_path.file_name().context("Invalid stat path")?.to_string_lossy().into_owned();
-                let parent = rel_path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                let parent = rel_path.parent().map(slash).unwrap_or_default();
                 let full_parent = format!("{raw}/{parent}").trim_matches('/').to_string();
                 groups.entry(full_parent).or_default().push((rel.to_string(), leaf));
             }
@@ -1337,6 +1373,10 @@ fn check_space(path: &Path, bytes: u64) -> Result<()> {
         ensure!(unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } == 0, "Cannot determine free space for location transfer");
         let stat = unsafe { stat.assume_init() };
         let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+        ensure!(free >= bytes.saturating_add(64 * 1024 * 1024), "Insufficient free space for location transfer (64 MiB headroom required)");
+    }
+    #[cfg(windows)] {
+        let (free, _) = volume_bytes(path).context("Cannot determine free space for location transfer")?;
         ensure!(free >= bytes.saturating_add(64 * 1024 * 1024), "Insufficient free space for location transfer (64 MiB headroom required)");
     }
     Ok(())
@@ -1564,11 +1604,11 @@ impl Upload {
             // Keep the source's modification time so the copy is a faithful backup.
             crate::iroh_net::set_mtime_secs(&landed.path, item["mtime"].as_u64().unwrap_or(0));
             if landed.conflict {
-                let at = landed.path.strip_prefix(&root.path).unwrap_or(&landed.path).to_string_lossy().into_owned();
+                let at = slash(landed.path.strip_prefix(&root.path).unwrap_or(&landed.path));
                 log::info!("locations upload conflict friend={friend} location={} path={raw:?} landed={at:?}", l.id);
                 out.conflicts.push(Conflict { name, landed: at });
             } else if landed.replaced {
-                let at = landed.path.strip_prefix(&root.path).unwrap_or(&landed.path).to_string_lossy().into_owned();
+                let at = slash(landed.path.strip_prefix(&root.path).unwrap_or(&landed.path));
                 log::info!("locations upload replaced friend={friend} location={} path={raw:?}; previous version moved to .dropbeam-trash", l.id);
                 out.replaced.push(at);
             } else {
@@ -1762,12 +1802,12 @@ pub(crate) struct DownloadSource {
 impl DownloadSource {
     pub fn open(&self, path: &Path) -> Result<fs::File> {
         let item = self.items.iter().find(|i| i.0 == path).context("File is outside download selection")?;
-        #[cfg(unix)] {
-            let file = self.root.open_rel(&relative(&path.strip_prefix(&self.root.path)?.to_string_lossy())?, false)?;
+        #[cfg(any(unix, windows))] {
+            let file = self.root.open_rel(&relative(&slash(path.strip_prefix(&self.root.path)?))?, false)?;
             ensure!(file.metadata()?.is_file() && file.metadata()?.len() == item.2, "Download source size or type changed");
             Ok(file)
         }
-        #[cfg(not(unix))] { let _ = item; bail!("Hosting unavailable") }
+        #[cfg(not(any(unix, windows)))] { let _ = item; bail!("Hosting unavailable") }
     }
 }
 impl Snapshot {
@@ -1826,12 +1866,35 @@ fn download_snapshot_at(config: &Path, endpoint: &str, request: &Value, now: Ins
     Ok(snapshot)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
+    /// Unix symlink; on Windows a junction (the directory link any user can make).
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)] std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)] {
+            let out = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
+            assert!(out.status.success(), "mklink /J: {}", String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    /// Unix symlink; on Windows a file symlink (needs Developer Mode or admin, as on CI).
+    fn link_file(target: &Path, link: &Path) {
+        #[cfg(unix)] std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)] std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+    fn file_id(path: &Path) -> crate::iroh_net::receive_stage::Identity {
+        crate::iroh_net::receive_stage::Identity::of(&fs::File::open(path).unwrap()).unwrap()
+    }
+    /// Windows' temp folder is inside AppData, which Locations refuses to share;
+    /// keep fixtures beside the build instead.
+    fn test_base() -> PathBuf {
+        #[cfg(windows)] { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("location-tests") }
+        #[cfg(not(windows))] { std::env::temp_dir() }
+    }
     /// A sleeping NAS mount or a macOS privacy prompt can park a probe or a
     /// sweep inside a filesystem call for minutes. Neither may hold the shared
     /// probe cache while it waits, or every receive in the process stalls.
+    #[cfg(unix)]
     #[test]
     fn probe_sweep_and_probe_never_wait_on_the_probe_cache() {
         let dir = std::env::temp_dir().join(format!("dropbeam-probe-lock-{}", uuid::Uuid::new_v4()));
@@ -1859,7 +1922,6 @@ mod tests {
     }
     #[test]
     fn root_stage_ignores_config_capacity_moves_inode_and_hides_control_data() {
-        use std::os::unix::fs::MetadataExt;
         let f = Fixture::new();
         SPACE_OVERRIDE.with(|v| *v.borrow_mut() = Some((f.config.clone(), 1)));
         assert!(check_space(&f.config, 4096).is_err());
@@ -1873,7 +1935,7 @@ mod tests {
             assert!(!f.config.join("location-transfers").exists());
             let staged = upload.staging.join("received");
             fs::write(&staged, vec![42; 4096]).unwrap();
-            let before = fs::metadata(&staged).unwrap();
+            let before = file_id(&staged);
             let rows = [crate::models::FileIntegrity { index:0, name:"folder/data".into(), size:4096,
                 algorithm:"test".into(), digest:"a".repeat(64), peer_digest:"a".repeat(64),
                 verified:true, acknowledged:false, sha256:Some(sha256(&staged).unwrap()) }];
@@ -1884,8 +1946,8 @@ mod tests {
             assert!(upload.root.rename_item(".dropbeam-staging", "exposed").is_err());
             upload.finish_verified_progress(&header, vec![staged], &rows,
                 &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
-            let after = fs::metadata(f.root.join("folder/data")).unwrap();
-            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            let after = file_id(&f.root.join("folder/data"));
+            assert_eq!(before, after);
             assert!(!upload.staging.exists());
             drop(upload);
             let retry = Upload::prepare(&f.config, "owner-device", &header).unwrap();
@@ -1895,8 +1957,7 @@ mod tests {
             let landing = retry.finish_verified_progress(&header, vec![staged], &rows,
                 &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
             assert!(landing.conflicts.is_empty());
-            let retried = fs::metadata(f.root.join("folder/data")).unwrap();
-            assert_eq!((retried.dev(), retried.ino()), (after.dev(), after.ino()));
+            assert_eq!(file_id(&f.root.join("folder/data")), after);
             assert!(!retry.staging.exists());
             assert!(!f.root.join("folder/data (2)").exists());
             drop(retry);
@@ -1912,8 +1973,7 @@ mod tests {
             assert_eq!(landing.paths, vec![f.root.join("folder/data (2)")]);
             assert_eq!(fs::read(f.root.join("folder/data")).unwrap(), vec![42; 4096]);
             assert_eq!(fs::read(f.root.join("folder/data (2)")).unwrap(), vec![43; 4096]);
-            let kept = fs::metadata(f.root.join("folder/data")).unwrap();
-            assert_eq!((kept.dev(), kept.ino()), (after.dev(), after.ino()));
+            assert_eq!(file_id(&f.root.join("folder/data")), after);
             drop(different);
             // A repeat of the SAME changed file finds its own copy and stops there.
             let again = Upload::prepare(&f.config, "owner-device", &header).unwrap();
@@ -1941,14 +2001,18 @@ mod tests {
         SPACE_OVERRIDE.with(|v| *v.borrow_mut() = None);
     }
     fn age_stage(path: &Path) {
-        fs::File::open(path).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 3600)).unwrap();
+        #[cfg(unix)] let stage = fs::File::open(path).unwrap();
+        #[cfg(windows)] let stage = { use std::os::windows::fs::OpenOptionsExt;
+            // FILE_WRITE_ATTRIBUTES on a directory (FILE_FLAG_BACKUP_SEMANTICS).
+            fs::OpenOptions::new().access_mode(0x100).custom_flags(0x0200_0000).open(path).unwrap() };
+        stage.set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 3600)).unwrap();
     }
     #[test]
     fn stat_uses_listing_auth_rate_limit_and_safe_paths() {
         let mut f = Fixture::new();
         fs::create_dir_all(f.root.join("folder/empty")).unwrap();
         fs::write(f.root.join("folder/file"), b"data").unwrap();
-        std::os::unix::fs::symlink(&f.config, f.root.join("escape")).unwrap();
+        link_dir(&f.config, &f.root.join("escape"));
         let mut request = f.req("stat", "");
         request["paths"] = json!(["folder/file", "folder/empty", "absent", "escape/friends.json"]);
         let now = Instant::now();
@@ -2025,7 +2089,7 @@ mod tests {
         let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
         let staging = upload.staging.clone();
         fs::write(f.root.join("keep"), b"keep").unwrap();
-        std::os::unix::fs::symlink(&f.root, staging.join("escape")).unwrap();
+        link_dir(&f.root, &staging.join("escape"));
         assert!(upload.finish(&header, vec![]).is_err());
         drop(upload);
         assert!(staging.exists());
@@ -2059,7 +2123,7 @@ mod tests {
         assert!(snapshot.source.open(&path).is_err());
         fs::remove_file(&path).unwrap();
         assert!(snapshot.source.open(&path).is_err());
-        std::os::unix::fs::symlink(f.config.join("locations.json"), &path).unwrap();
+        link_file(&f.config.join("locations.json"), &path);
         assert!(snapshot.source.open(&path).is_err());
         drop(snapshot);
         assert!(f.root.exists());
@@ -2067,10 +2131,10 @@ mod tests {
     struct Fixture { dir: PathBuf, config: PathBuf, root: PathBuf, friend: String, location: Location }
     impl Fixture {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("dropbeam-location-test-{}", uuid::Uuid::new_v4()));
+            let dir = test_base().join(format!("dropbeam-location-test-{}", uuid::Uuid::new_v4()));
             let root = dir.join("NAS"); let config = dir.join("config");
             fs::create_dir_all(&root).unwrap(); fs::create_dir_all(&config).unwrap();
-            let dir = fs::canonicalize(dir).unwrap();
+            let dir = canonical(&dir).unwrap();
             let root = dir.join("NAS"); let config = dir.join("config");
             let friend = crate::friends::upsert_by_endpoint(&config, "owner-device", "Friend").id;
             let location = Location { id: "nas".into(), name: "Family NAS".into(), path: root.to_string_lossy().into_owned(), friend_ids: vec![friend.clone()], rights: Rights { upload: true, manage: true }, byte_cap: default_byte_cap(), device: None, marker: None, safe_publish: None };
@@ -2246,7 +2310,6 @@ mod tests {
 
     /// `locations.verify` on the host: hash the copies it holds, refuse the same
     /// things `locations.stat` refuses, and never follow a symlink off the root.
-    #[cfg(unix)]
     #[test]
     fn verify_digests_hashes_the_hosts_copies_and_keeps_the_stat_gate() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2257,7 +2320,7 @@ mod tests {
         // The sibling a conflicting upload lands as: "Verify copy" asks for it by
         // name when the requested name's digest doesn't match.
         fs::write(f.root.join("drop/clips/b (2).mp4"), b"same bytes").unwrap();
-        std::os::unix::fs::symlink(f.config.join("locations.json"), f.root.join("drop/clips/link.mp4")).unwrap();
+        link_file(&f.config.join("locations.json"), &f.root.join("drop/clips/link.mp4"));
         let items = json!([{"name":"clips/a.mp4","size":10},{"name":"clips/b.mp4","size":9},
             {"name":"clips/gone.mp4","size":4},{"name":"clips/link.mp4","size":4}]);
         let request = json!({"kind":"locations.verify","locations_v":VERSION,"id":"nas",
@@ -2324,21 +2387,20 @@ mod tests {
 
     #[test]
     fn root_binding_rejects_parent_absolute_reserved_and_symlink_escapes() {
-        use std::os::unix::fs::symlink;
         let f = Fixture::new(); let root = Root::open(&f.root).unwrap();
         fs::write(f.root.join("旅行 🏡.txt"), b"unicode").unwrap();
-        assert_eq!(root.resolve("./旅行 🏡.txt").unwrap(), fs::canonicalize(f.root.join("旅行 🏡.txt")).unwrap());
+        assert_eq!(root.resolve("./旅行 🏡.txt").unwrap(), canonical(&f.root.join("旅行 🏡.txt")).unwrap());
         for raw in ["../secret", "a/../b", "/tmp/secret", "//server/share", ".dropbeam-trash/x", "nested/.DROPBEAM-upload-x", "x\0y"] {
             let expected = if raw.contains("..") { "Parent traversal" } else if raw.starts_with('/') { "Absolute paths" } else if raw.contains('\0') { "Invalid relative path" } else { "Reserved location path" };
             error_message(relative(raw), expected);
         }
         let outside = f.dir.join("outside"); fs::create_dir(&outside).unwrap(); fs::write(outside.join("secret"), b"keep").unwrap();
-        symlink(&outside, f.root.join("escape")).unwrap();
+        link_dir(&outside, &f.root.join("escape"));
         error_message(root.resolve("escape/secret"), "Path escapes the location");
         error_message(root.new_folder("escape/new"), "Path escapes the location");
         error_message(root.rename_item("旅行 🏡.txt", "escape/new"), "Path escapes the location");
         error_message(root.trash("escape"), "Path escapes the location");
-        symlink(&outside, f.root.join(".dropbeam-trash")).unwrap();
+        link_dir(&outside, &f.root.join(".dropbeam-trash"));
         io_kind(root.trash("旅行 🏡.txt"), std::io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(outside.join("secret")).unwrap(), b"keep");
         assert!(f.root.join("旅行 🏡.txt").exists());
@@ -2434,7 +2496,7 @@ mod tests {
         assert_eq!(dir, f.root);
         assert!(dir.exists());
         assert!(!f.config.join("location-snapshots").exists());
-        std::os::unix::fs::symlink(f.dir.join("config"), f.root.join("link")).unwrap();
+        link_dir(&f.dir.join("config"), &f.root.join("link"));
         let skipped = download_snapshot(&f.config, "owner-device", &json!({"locations_v":VERSION,"id":"nas","paths":["link"]})).unwrap();
         assert!(skipped.paths.is_empty()); assert!(skipped.skipped[0].starts_with("link:"));
     }
@@ -2473,12 +2535,14 @@ mod tests {
     }
     #[test]
     fn reservation_publish_preserves_existing_files_directories_and_symlinks() {
-        let f = Fixture::new(); let mut root = Root::open(&f.root).unwrap(); root.native = false;
+        // Windows has no reservation mode: the same refusals hold for its native rename.
+        let f = Fixture::new(); #[allow(unused_mut)] let mut root = Root::open(&f.root).unwrap();
+        #[cfg(unix)] { root.native = false; }
         fs::write(f.root.join("source"), b"source").unwrap();
         fs::write(f.root.join("occupied"), b"precious").unwrap();
         io_kind(root.rename_item("source", "occupied"), std::io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(f.root.join("occupied")).unwrap(), b"precious");
-        std::os::unix::fs::symlink(f.root.join("occupied"), f.root.join("link")).unwrap();
+        link_file(&f.root.join("occupied"), &f.root.join("link"));
         io_kind(root.rename_item("source", "link"), std::io::ErrorKind::AlreadyExists);
         let staged_link = f.dir.join("link-staged"); fs::write(&staged_link, b"replacement").unwrap();
         assert!(root.land("link", &staged_link, &sha256(&staged_link).unwrap(), false, &std::sync::atomic::AtomicBool::new(false), |_| {}, |action| action()).is_err());
@@ -2507,6 +2571,7 @@ mod tests {
         assert!(!f.config.join("location-snapshots").exists());
         error_message(check_space(&f.config, u64::MAX), "Insufficient free space");
     }
+    #[cfg(unix)]
     #[test]
     fn blocklisted_roots_and_mirror_overlaps_are_refused() {
         let f = Fixture::new();
@@ -2537,12 +2602,14 @@ mod tests {
         assert_eq!(saved[0].marker, l.marker);
         l = load(&f.config).unwrap().remove(0);
         let marker = f.root.join(l.marker.as_ref().unwrap());
-        fs::write(&marker, b"different").unwrap();
+        // Open-existing + truncate: Windows refuses CREATE_ALWAYS on the hidden marker.
+        { use std::io::Write; let mut m = fs::OpenOptions::new().write(true).open(&marker).unwrap(); m.set_len(0).unwrap(); m.write_all(b"different").unwrap(); }
         error_kind(Root::for_location(&mut l), LocationError::MountChanged);
         fs::remove_file(marker).unwrap();
         for kind in ["ls", "mkdir", "rename", "trash"] { error_kind(dispatch(&f.config, "owner-device", &f.req(kind, "")), LocationError::MountChanged); }
         error_kind(save(&f.config, Some(f.location.clone()), None), LocationError::MountChanged);
     }
+    #[cfg(unix)]
     #[test]
     fn created_share_files_and_directories_inherit_usable_permissions() {
         use std::os::unix::fs::{PermissionsExt, MetadataExt};
@@ -2610,6 +2677,7 @@ mod tests {
         let root = Root::open(&f.root).unwrap(); root.new_folder("keep").unwrap();
         let trash = root.trash("keep").unwrap(); gc(&f.config).unwrap(); assert!(f.root.join(trash).is_dir());
     }
+    #[cfg(unix)]
     #[test]
     fn unix_colons_backslashes_and_supported_siblings_survive_snapshot() {
         let f = Fixture::new(); fs::create_dir(f.root.join("folder")).unwrap();
@@ -2638,6 +2706,7 @@ mod tests {
         assert_eq!(rows[0]["friendId"], f.friend); assert_eq!(rows[0]["item"], "folder-54");
     }
 
+    #[cfg(unix)]
     #[test]
     fn upload_session_never_reprobes_for_files_or_directories() {
         let f = Fixture::new();
@@ -2659,6 +2728,7 @@ mod tests {
         assert!(f.root.join("empty-31/nested").is_dir());
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_only_and_unknown_probe_errors_allow_browse_download_and_resave() {
         struct Reset;
@@ -2707,6 +2777,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn ordinary_publish_uses_native_operation_without_probes_and_sweeps_only_old_probe_files() {
         let f = Fixture::new();
@@ -2811,6 +2882,106 @@ mod tests {
         for path in [home.join("Library"), home.join("Library/Application Support")] {
             error_kind(validate_root(&f.config, &path), LocationError::UnsafeRoot);
         }
+    }
+
+    /// Windows (the OptiPlex case): a whole data drive such as `D:\` and a
+    /// folder in the profile may be shared; the system drive, Windows, Program
+    /// Files, ProgramData, the profile itself, AppData and the app config never.
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_paths_are_refused_and_data_drives_allowed() {
+        let f = Fixture::new();
+        let var = |k: &str| PathBuf::from(std::env::var_os(k).unwrap());
+        let drive = std::env::var("SystemDrive").unwrap();
+        let profile = var("USERPROFILE");
+        for path in [PathBuf::from(format!(r"{drive}\")), var("SystemRoot"), var("SystemRoot").join("System32"), var("ProgramFiles"),
+            var("ProgramData"), profile.clone(), profile.join("AppData"), var("APPDATA"), var("LOCALAPPDATA"), std::env::temp_dir(),
+            f.config.clone(), f.dir.clone()] {
+            if path.exists() { error_kind(validate_root(&f.config, &path), LocationError::UnsafeRoot); }
+        }
+        let mine = profile.join(format!("dropbeam-location-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&mine).unwrap();
+        let allowed = validate_root(&f.config, &mine);
+        fs::remove_dir(&mine).unwrap();
+        allowed.unwrap();
+        validate_root(&f.config, &f.root).unwrap();
+        // CI checks out on D:, the owner's data drive is D:; either way a
+        // non-system drive root is allowed and only the system drive is refused.
+        // (The fixture's own config lives on that drive, so check with one in %TEMP%.)
+        let data = PathBuf::from(format!(r"{}\", f.root.components().next().unwrap().as_os_str().to_string_lossy()));
+        if !data.to_string_lossy().to_uppercase().starts_with(&drive.to_uppercase()) {
+            let config = std::env::temp_dir().join(format!("dropbeam-location-config-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&config).unwrap();
+            let allowed = validate_root(&config, &data);
+            fs::remove_dir(&config).unwrap();
+            allowed.unwrap();
+        }
+        // Stored paths are plain `D:\…`, not `\\?\D:\…`, so Explorer and the UI agree.
+        assert!(!load(&f.config).unwrap()[0].path.starts_with(r"\\?\"));
+        assert_eq!(win::simplify(PathBuf::from(r"\\?\D:\Ashton\x")), PathBuf::from(r"D:\Ashton\x"));
+        assert_eq!(win::simplify(PathBuf::from(r"\\?\D:\")), PathBuf::from(r"D:\"));
+        assert_eq!(win::simplify(PathBuf::from(r"\\?\UNC\nas\share\x")), PathBuf::from(r"\\nas\share\x"));
+        for verbatim in [r"\\?\D:\con", r"\\?\D:\trailing.", r"\\?\Volume{1234}\x"] {
+            assert_eq!(win::simplify(PathBuf::from(verbatim)), PathBuf::from(verbatim));
+        }
+        assert_eq!(hosted(&f.config).unwrap()[0].safe_publish.as_deref(), Some("native"));
+    }
+
+    /// Junctions are refused like symlinks, reserved device names and Win32-
+    /// mangled names never reach the disk, no-replace holds case-insensitively,
+    /// and control data is hidden while published uploads are not.
+    #[cfg(windows)]
+    #[test]
+    fn windows_junctions_reserved_names_and_case_insensitive_no_replace() {
+        use std::os::windows::fs::MetadataExt;
+        let f = Fixture::new(); let root = Root::open(&f.root).unwrap();
+        for bad in ["CON", "nul.txt", "Com1.log", "lpt9", "AUX .txt", "CONIN$", "a.", "a ", "a<b", "a>b", "a|b", "a?b", "a*b", "a\"b", "a\u{1}b", "dir/PRN/x", "a\\b", "a:b"] {
+            assert!(relative(bad).is_err(), "{bad:?} must be refused");
+        }
+        for good in ["con-tents", "COM10", "LPT", "a.b", "nulx.txt", "folder/.hidden", "Ünïcødé 旅行.txt"] { relative(good).unwrap(); }
+        // A junction to a folder outside the location: not listed, not resolvable,
+        // not writable through, and no upload or download can use it.
+        let outside = f.dir.join("outside"); fs::create_dir(&outside).unwrap(); fs::write(outside.join("secret"), b"keep").unwrap();
+        link_dir(&outside, &f.root.join("junction"));
+        assert!(!root.listing("").unwrap().iter().any(|e| e.name == "junction"));
+        error_message(root.resolve("junction/secret"), "Path escapes the location");
+        assert!(root.ensure_dirs("junction/new").is_err());
+        assert!(root.new_folder("junction/new").is_err());
+        assert!(!outside.join("new").exists());
+        let header = json!({"locations_v":VERSION,"location":{"location_id":"nas","rel_path":"junction"},"location_transfer":"j",
+            "items":[{"name":"x","size":1,"sha256":"0".repeat(64)}],"dirs":[],"total":1});
+        assert!(Upload::prepare(&f.config, "owner-device", &header).is_err());
+        let skipped = download_snapshot(&f.config, "owner-device", &json!({"locations_v":VERSION,"id":"nas","paths":["junction"]})).unwrap();
+        assert!(skipped.paths.is_empty() && skipped.source.items.is_empty());
+        drop(skipped);
+        assert_eq!(fs::read(outside.join("secret")).unwrap(), b"keep");
+        // Case-insensitive names: a different "Report.PDF" lands beside "report.pdf".
+        fs::write(f.root.join("report.pdf"), b"original").unwrap();
+        let (u, h, src) = f.upload("Report.PDF", b"different");
+        let landing = u.finish(&h, vec![src]).unwrap();
+        assert_eq!(landing.conflicts, vec![Conflict { name: "Report.PDF".into(), landed: "Report (2).PDF".into() }]);
+        assert_eq!(fs::read(f.root.join("report.pdf")).unwrap(), b"original");
+        // The upload's temp name was hidden; the published file is not.
+        assert_eq!(fs::metadata(f.root.join("Report (2).PDF")).unwrap().file_attributes() & 2, 0);
+        let marker = load(&f.config).unwrap()[0].marker.clone().unwrap();
+        assert_ne!(fs::metadata(f.root.join(&marker)).unwrap().file_attributes() & 2, 0, "the mount marker is hidden");
+        drop(u);
+        // No-replace rename, including onto a name differing only in case.
+        fs::write(f.root.join("a.txt"), b"a").unwrap(); fs::write(f.root.join("b.txt"), b"b").unwrap();
+        io_kind(root.rename_item("a.txt", "B.TXT"), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(f.root.join("b.txt")).unwrap(), b"b");
+        root.rename_item("a.txt", "c.txt").unwrap();
+        // Protected OS entries (hidden + system, like desktop.ini) are never shared.
+        fs::write(f.root.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+        assert!(std::process::Command::new("attrib").args(["+h", "+s"]).arg(f.root.join("desktop.ini")).status().unwrap().success());
+        assert!(!root.listing("").unwrap().iter().any(|e| e.name == "desktop.ini"));
+        assert!(root.stat_entry("desktop.ini").unwrap().is_none());
+        // Trash stays recoverable and hidden; a junction is never moved or followed.
+        let trash = root.trash("c.txt").unwrap();
+        assert_eq!(fs::read(f.root.join(&trash)).unwrap(), b"a");
+        assert_ne!(fs::metadata(f.root.join(".dropbeam-trash")).unwrap().file_attributes() & 2, 0);
+        assert!(root.trash("junction").is_err());
+        assert!(outside.join("secret").exists());
     }
 
 }
