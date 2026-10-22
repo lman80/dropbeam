@@ -9,6 +9,9 @@ import SwiftUI
 /// server, lands when they wake. Neutral fills; the accent only on the plane and check.
 /// Reduce Motion shows one still frame plus the three steps, numbered.
 struct ServerExplainer: View {
+    /// `.push` (#45): a friend's message reaches your sleeping iPhone as a notification.
+    enum Kind { case offline, push }
+    var kind: Kind = .offline
     var serverName: String? = nil
     var friendName: String? = nil
     var compact = false
@@ -25,13 +28,19 @@ struct ServerExplainer: View {
         "It waits on the Transfer Server, locked so only they can open it",
         "It arrives when they’re back, then the server deletes its copy",
     ]
+    static let pushSteps = [
+        "A friend sends you something while your iPhone is asleep",
+        "The Transfer Server holds it, locked, and sends your iPhone a notification",
+        "You see who it’s from. Open DropBeam and it arrives",
+    ]
+    private var steps: [String] { kind == .push ? Self.pushSteps : Self.steps }
     static let duration = 9.0
     var body: some View {
         if reduceMotion || stillForQA {
             VStack(alignment: .leading, spacing: 14) {
                 stage(Frame.still)
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(Self.steps.enumerated()), id: \.offset) { i, step in
+                    ForEach(Array(steps.enumerated()), id: \.offset) { i, step in
                         HStack(alignment: .firstTextBaseline, spacing: 10) {
                             Text("\(i + 1)").font(.subheadline.weight(.semibold)).monospacedDigit().foregroundStyle(.secondary)
                             Text(step).font(.subheadline).fixedSize(horizontal: false, vertical: true)
@@ -48,32 +57,38 @@ struct ServerExplainer: View {
                     stage(frame)
                     ZStack {
                         ForEach(0..<3) { i in
-                            Text(Self.steps[i]).font(compact ? .footnote : .subheadline).foregroundStyle(.secondary)
+                            Text(steps[i]).font(compact ? .footnote : .subheadline).foregroundStyle(.secondary)
                                 .multilineTextAlignment(.center).opacity(frame.caption(i))
                         }
                         // Reserve the tallest caption so the layout never jumps.
-                        Text(Self.steps[1]).font(compact ? .footnote : .subheadline).multilineTextAlignment(.center).hidden()
+                        Text(steps[1]).font(compact ? .footnote : .subheadline).multilineTextAlignment(.center).hidden()
                     }
                     .frame(maxWidth: .infinity)
                 }
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(Self.steps.joined(separator: ". "))
+            .accessibilityLabel(steps.joined(separator: ". "))
         }
     }
 
     private var disc: CGFloat { compact ? 44 : 54 }
     private func stage(_ f: Frame) -> some View {
         HStack(alignment: .top, spacing: 0) {
-            station("iphone", "You", opacity: f.you) {
+            station(kind == .push ? "laptopcomputer" : "iphone", kind == .push ? (friendName ?? "Friend") : "You", opacity: f.you) {
                 badge("checkmark", fill: .beam, glyph: .white).opacity(f.check).scaleEffect(0.6 + 0.4 * f.checkScale)
             }
             station("server.rack", serverName ?? "Transfer Server", opacity: 1) {
                 badge("lock.fill", fill: .primary, glyph: Color(uiColor: .systemBackground)).opacity(f.lock).scaleEffect(0.6 + 0.4 * f.lockScale)
             }
-            station("laptopcomputer", friendName ?? "Friend", opacity: f.them) {
-                Image(systemName: "zzz").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-                    .offset(x: 0, y: 2 - 4 * f.zzzRise).opacity(f.zzz)
+            station(kind == .push ? "iphone" : "laptopcomputer", kind == .push ? "Your iPhone" : (friendName ?? "Friend"), opacity: f.them) {
+                ZStack {
+                    Image(systemName: "zzz").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                        .offset(x: 0, y: 2 - 4 * f.zzzRise).opacity(f.zzz)
+                    // The notification: while it waits on the server, the phone lights up.
+                    if kind == .push {
+                        badge("bell.fill", fill: .beam, glyph: .white).opacity(f.bell).scaleEffect(0.6 + 0.4 * f.bellScale)
+                    }
+                }
             }
         }
         .background(alignment: .topLeading) {
@@ -121,6 +136,7 @@ struct ServerExplainer: View {
         var planeX = 0.335, planeY = 0.0, plane = 1.0, planeBack = false
         var you = 1.0, them = 0.45, zzz = 1.0, zzzRise = 0.0
         var lock = 1.0, lockScale = 1.0, check = 0.0, checkScale = 0.0
+        var bell = 1.0, bellScale = 1.0
         var t = 0.4
         static let still = Frame()
         init() {}
@@ -138,6 +154,8 @@ struct ServerExplainer: View {
             lockScale = Self.track(t, [(0, 0), (0.42, 0), (0.46, 1.25), (0.49, 1), (1, 1)])
             check = Self.track(t, [(0, 0), (0.82, 0), (0.85, 1), (0.96, 1), (1, 0)])
             checkScale = Self.track(t, [(0, 0), (0.82, 0), (0.86, 1.25), (0.89, 1), (1, 1)])
+            bell = Self.track(t, [(0, 0), (0.48, 0), (0.51, 1), (0.66, 1), (0.69, 0), (1, 0)])
+            bellScale = Self.track(t, [(0, 0), (0.48, 0), (0.52, 1.3), (0.55, 1), (1, 1)])
         }
         /// Caption i's opacity (three thirds, short crossfades).
         func caption(_ i: Int) -> Double {
@@ -176,6 +194,11 @@ struct ServerExplainerSheet: View {
                     fact("moon.zzz.fill", "When someone you send to is offline, a Transfer Server holds your messages and files until they’re back.")
                     fact("lock.fill", "Everything stays locked. The server can’t open it, and deletes its copy once it’s delivered.")
                     fact("desktopcomputer", "A friend’s always-on Mac or PC can be one. iPhone can use servers but can’t be one.")
+                }
+                Section {
+                    ServerExplainer(kind: .push, serverName: serverName).padding(.vertical, 12)
+                } header: { Text("On your iPhone") } footer: {
+                    Text("When your iPhone is asleep, the server sends a notification so you know who it’s from — even with DropBeam closed.")
                 }
             }
             .beamList()

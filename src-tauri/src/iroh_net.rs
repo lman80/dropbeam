@@ -2185,6 +2185,9 @@ fn describe_paths(conn: &Connection) -> String {
         if !closed && path_is_validated_direct(&p) { "v" } else { "" },
         p.remote_addr())).collect::<Vec<_>>().join(" ")
 }
+pub(crate) fn locality_of(conn: &Connection) -> crate::models::Locality {
+    conn_locality(conn)
+}
 fn conn_locality(conn: &Connection) -> crate::models::Locality {
     use crate::models::Locality;
     // A final snapshot can outlive connection closure in iroh 1.2.
@@ -4094,7 +4097,23 @@ async fn serve_stream_inner(
                 Some(st) if !blocked => Some(crate::friends::chat_sender(&st.config_dir, &who).is_some()),
                 _ => None,
             };
-            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat })).await?;
+            // And our chosen NAME to a friend (#83): one who added us from a code
+            // made before we named ourselves fixes it on their next hello. A
+            // stranger or pending request learns nothing new here.
+            let my_name = match state.app.get().and_then(|app| app.try_state::<Arc<crate::AppState>>()) {
+                Some(st) if accepts_chat == Some(true) => Some(st.settings.lock().unwrap().display_name.clone()),
+                _ => None,
+            };
+            let mut reply = serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat, "name": my_name });
+            // A friend also learns which account (person) this device is, the
+            // same signed proof a hello carries: someone who added two of our
+            // devices from their codes sees ONE of us right away (#81).
+            if let (Some(_), Some(ep)) = (&my_name, state.get()) {
+                if let (Some(out), Some(profile)) = (reply.as_object_mut(), crate::link::profile(state, &ep.id().to_string()).as_object()) {
+                    out.extend(profile.clone());
+                }
+            }
+            write_frame(send, &reply).await?;
             send.finish()?;
         }
         Some("folder-hello") => {
@@ -4708,6 +4727,12 @@ async fn serve_stream_inner(
             }
             write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
             send.finish()?;
+        }
+        // "Find my safe speed" (#20): a friend's or own device's test data,
+        // read and thrown away.
+        Some("speed-test") => {
+            let config = location_config(state)?;
+            crate::safe_speed::serve_test(&config, &conn.remote_id().to_string(), send, recv).await?;
         }
         // Forward-compatible: a newer peer may send a stream kind we don't know
         // yet. Ack and ignore instead of erroring the stream, so adding message
@@ -6312,6 +6337,31 @@ fn apply_hello_reply_avatar(state: &Arc<IrohState>, who: &str, reply: &serde_jso
     let _ = app.emit("friends://changed", ());
 }
 
+/// A newer peer that has us as a friend answers our hello with the name it
+/// chose (#83): adopt it unless the user renamed them here.
+fn apply_hello_reply_name(state: &Arc<IrohState>, who: &str, reply: &serde_json::Value) {
+    let Some(name) = reply.get("name").and_then(|v| v.as_str()) else { return };
+    let Some(app) = state.app.get() else { return };
+    let Some(st) = app.try_state::<Arc<crate::AppState>>() else { return };
+    if crate::block::is_blocked(&st.config_dir, who) { return; }
+    if crate::friends::adopt_name_by_endpoint(&st.config_dir, who, name) {
+        let _ = app.emit("friends://changed", ());
+    }
+}
+
+/// A friend's answer that proves its account (#81): learn it exactly as from
+/// their own hello, so their devices group into one person now. Older peers
+/// (and answers to a stranger) carry no profile and change nothing.
+fn apply_hello_reply_device(state: &Arc<IrohState>, who: &str, reply: &serde_json::Value) {
+    if reply.get("device_os").is_none() { return; }
+    let Some(app) = state.app.get() else { return };
+    let Some(st) = app.try_state::<Arc<crate::AppState>>() else { return };
+    if crate::block::is_blocked(&st.config_dir, who) || crate::friends::chat_sender(&st.config_dir, who).is_none() { return; }
+    crate::friends::apply_device_hello(&st.config_dir, who, reply);
+    crate::friends::apply_revocations(&st.config_dir, who, reply);
+    let _ = app.emit("friends://changed", ());
+}
+
 /// Cache the encoded avatar thumbnail by (path, mtime) so a profile broadcast to
 /// N friends decodes the image at most once.
 static AVATAR_THUMB_CACHE: std::sync::Mutex<Option<(String, u64, Option<String>)>> =
@@ -6416,6 +6466,8 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
                     apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
+                    apply_hello_reply_name(&state, &conn.remote_id().to_string(), &reply);
+                    apply_hello_reply_device(&state, &conn.remote_id().to_string(), &reply);
                     // Older builds don't say; a null answer changes nothing.
                     if let (Some(accepts), Some(config)) = (reply["accepts_chat"].as_bool(), &config) {
                         if crate::friends::set_awaiting_accept(config, &conn.remote_id().to_string(), !accepts) {
@@ -6466,6 +6518,8 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
                     apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
+                    apply_hello_reply_name(&state, &conn.remote_id().to_string(), &reply);
+                    apply_hello_reply_device(&state, &conn.remote_id().to_string(), &reply);
                     // Older builds don't say; a null answer changes nothing.
                     if let (Some(accepts), Some(config)) = (reply["accepts_chat"].as_bool(), &config) {
                         if crate::friends::set_awaiting_accept(config, &conn.remote_id().to_string(), !accepts) {
@@ -6882,7 +6936,7 @@ pub async fn send_chat_any_within(state: &IrohState, ep: &Endpoint, eids: &[Stri
             .filter_map(|f| f.endpoint_id).collect(),
         _ => HashSet::new(),
     };
-    for eid in eids {
+    for eid in &rank_person_devices(state, eids) {
         if quick.is_some() && ios.contains(eid) && !crate::mailbox::seen_within(eid, Duration::from_secs(120)) {
             continue;
         }
@@ -6905,6 +6959,54 @@ pub async fn send_chat_any_within(state: &IrohState, ep: &Endpoint, eids: &[Stri
         }
     }
     last
+}
+
+/// Which of a person's devices to try first (#81): the one we're connected to
+/// over the local network, then any live connection, then the most recently
+/// seen; the rest keep their order (the conversation's owner device first).
+/// An offline device first used to cost a 12 s wait before the online one.
+fn rank_person_devices(state: &IrohState, eids: &[String]) -> Vec<String> {
+    if eids.len() < 2 {
+        return eids.to_vec();
+    }
+    let facts: Vec<(bool, bool, Option<Duration>)> = eids.iter().map(|e| {
+        let conn = state.friend_conns.lock().ok()
+            .and_then(|m| m.get(e).map(|c| c.conn.clone()))
+            .filter(|c| c.close_reason().is_none());
+        let local = conn.as_ref().is_some_and(|c| matches!(conn_locality(c), crate::models::Locality::Local));
+        (local, conn.is_some(), crate::mailbox::seen_ago(e))
+    }).collect();
+    order_devices(eids, &facts)
+}
+
+/// `rank_person_devices`'s order from (on the LAN, connected, seen ago) per device.
+fn order_devices(eids: &[String], facts: &[(bool, bool, Option<Duration>)]) -> Vec<String> {
+    let mut idx: Vec<usize> = (0..eids.len()).collect();
+    idx.sort_by_key(|&i| {
+        let (local, live, seen) = facts.get(i).copied().unwrap_or((false, false, None));
+        let tier = if local { 0 } else if live { 1 } else if seen.is_some() { 2 } else { 3 };
+        (tier, seen.unwrap_or(Duration::MAX))
+    });
+    idx.into_iter().map(|i| eids[i].clone()).collect()
+}
+
+#[cfg(test)]
+mod device_order_tests {
+    use super::*;
+
+    #[test]
+    fn a_persons_reachable_device_is_tried_before_an_offline_owner() {
+        let eids: Vec<String> = ["owner", "phone", "laptop", "tablet"].map(String::from).to_vec();
+        let s = |n| Some(Duration::from_secs(n));
+        // The owner hasn't been seen; the laptop is on our LAN; the phone was seen 5 s ago.
+        let facts = [(false, false, None), (false, false, s(5)), (true, true, s(60)), (false, false, s(1))];
+        assert_eq!(order_devices(&eids, &facts), ["laptop", "tablet", "phone", "owner"]);
+        // Nothing known: the given order (owner first) stands.
+        assert_eq!(order_devices(&eids, &[(false, false, None); 4]), eids);
+        // A live (relayed) connection beats a recent sighting, not the LAN.
+        let facts = [(false, true, s(30)), (true, true, s(40)), (false, false, s(1)), (false, false, None)];
+        assert_eq!(order_devices(&eids, &facts), ["phone", "owner", "laptop", "tablet"]);
+    }
 }
 
 /// Where one chat frame got to across a person's devices.
@@ -8022,6 +8124,8 @@ async fn write_folder_body<F: Fn(u64, u64)>(
             }
             if pace {
                 pace_bytes(n as u64).await;
+            } else {
+                pace_local(n as u64).await;
             }
             send.write_all(&buf[..n]).await?;
             remaining -= n as u64;
@@ -8829,14 +8933,45 @@ fn clear_force_relay(id: &str) {
     force_relay_set().lock().unwrap().remove(id);
 }
 
+/// "Limit local network transfers too" (#20): the upload cap also applies on
+/// the LAN, where a weak home router can be the one that falls over.
+static LIMIT_LOCAL: AtomicBool = AtomicBool::new(false);
+static LOCAL_BUCKET: std::sync::OnceLock<Mutex<(f64, Instant)>> = std::sync::OnceLock::new();
+
+pub fn set_limit_local(on: bool) {
+    LIMIT_LOCAL.store(on, Ordering::Relaxed);
+}
+
+/// The tighter of two caps in bytes/s (0 = none).
+fn tighter(a: u64, b: u64) -> u64 {
+    match (a, b) {
+        (0, x) | (x, 0) => x,
+        (a, b) => a.min(b),
+    }
+}
+
 /// Block until `n` bytes' worth of send budget is available. No-op when the cap
 /// is unlimited (the common case) — one relaxed atomic load, no contention.
+/// The router guard (#20) can hold it lower while the home router struggles.
 async fn pace_bytes(n: u64) {
-    let rate = UPLOAD_LIMIT_BPS.load(Ordering::Relaxed);
+    crate::safe_speed::SENT.fetch_add(n, Ordering::Relaxed);
+    let rate = tighter(UPLOAD_LIMIT_BPS.load(Ordering::Relaxed), crate::safe_speed::GUARD_BPS.load(Ordering::Relaxed));
+    pace_with(UPLOAD_BUCKET.get_or_init(|| Mutex::new((0.0, Instant::now()))), rate, n).await;
+}
+
+/// The same for a local-network send: free unless the user limits local
+/// transfers too, or the router guard is holding sending back.
+async fn pace_local(n: u64) {
+    crate::safe_speed::SENT.fetch_add(n, Ordering::Relaxed);
+    let user = if LIMIT_LOCAL.load(Ordering::Relaxed) { UPLOAD_LIMIT_BPS.load(Ordering::Relaxed) } else { 0 };
+    let rate = tighter(user, crate::safe_speed::GUARD_BPS.load(Ordering::Relaxed));
+    pace_with(LOCAL_BUCKET.get_or_init(|| Mutex::new((0.0, Instant::now()))), rate, n).await;
+}
+
+async fn pace_with(bucket: &Mutex<(f64, Instant)>, rate: u64, n: u64) {
     if rate == 0 {
         return;
     }
-    let bucket = UPLOAD_BUCKET.get_or_init(|| Mutex::new((0.0, Instant::now())));
     loop {
         let wait = {
             let mut g = bucket.lock().unwrap();
@@ -9485,6 +9620,8 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
                         if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
                         if pace {
                             pace_bytes(k as u64).await;
+                        } else {
+                            pace_local(k as u64).await;
                         }
                         write_payload(&mut uni, &buf[..k], |n| {
                             progress.fetch_add(n, Ordering::Relaxed);
@@ -10186,6 +10323,8 @@ async fn write_files_body_inner<F: Fn(u64, u64)>(
             if let Some(plain) = &mut plain { plain.update(&buf[..n]); }
             if pace {
                 pace_bytes(n as u64).await;
+            } else {
+                pace_local(n as u64).await;
             }
             write_payload(send, &buf[..n], |n| {
                 sent += n;

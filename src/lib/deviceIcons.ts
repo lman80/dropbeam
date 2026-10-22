@@ -106,3 +106,12 @@ export function sendTargets<T extends { id: string; createdAt: number; accountPu
 export function personKey<T extends { id: string; createdAt: number; accountPub?: string | null; endpointId?: string | null }>(friends: readonly T[], id: string, myAccount?: string | null): string {
   return personGroups(friends, myAccount)[id] ?? id
 }
+
+/** The records of the person whose conversation is `ownerId`: that record
+ *  first, then their other devices (someone else's shared account). Just the
+ *  one record for anybody else — and for the user's own devices. */
+export function personMembers<T extends { id: string; createdAt: number; accountPub?: string | null; endpointId?: string | null }>(friends: readonly T[], ownerId: string, myAccount?: string | null): T[] {
+  const groups = personGroups(friends, myAccount)
+  const owner = friends.find(f => f.id === ownerId)
+  return owner ? [owner, ...friends.filter(f => groups[f.id] === ownerId)] : []
+}

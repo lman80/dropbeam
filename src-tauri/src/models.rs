@@ -259,6 +259,14 @@ pub struct Settings {
     /// applies to internet/relay transfers — local-network sends stay full speed.
     #[serde(default)]
     pub upload_limit_mbps: u32,
+    /// Apply the upload limit on the local network too (#20): a weak home
+    /// router can fall over from a fast LAN transfer. Off by default.
+    #[serde(default)]
+    pub limit_local: bool,
+    /// "Protect my router" (#20): watch the router while sending and slow down
+    /// automatically when it struggles. Off by default.
+    #[serde(default)]
+    pub protect_router: bool,
     /// Show transfer speeds in megaBITS/sec (Mbps) instead of megaBYTES/sec
     /// (MB/s). Off by default (MB/s, what most file tools show).
     #[serde(default)]
@@ -374,6 +382,8 @@ impl Default for Settings {
             play_sounds: true,
             direct_mode: true,
             upload_limit_mbps: 0,
+            limit_local: false,
+            protect_router: false,
             show_megabits: false,
             require_direct: false,
             wait_for_direct: false,

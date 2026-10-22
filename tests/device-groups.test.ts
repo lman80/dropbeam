@@ -60,3 +60,23 @@ test("a friend's extra devices fold under one deterministic record; own devices 
   // Owner = smallest endpoint id, whatever the local creation order.
   assert.deepEqual(personGroups([{ id: 'x', createdAt: 1, accountPub: 'a', endpointId: 'zz' }, { id: 'y', createdAt: 9, accountPub: 'a', endpointId: 'aa' }], null), { x: 'y' })
 })
+
+test('a friend with several devices is one person: members, and online when any device is (#81)', async () => {
+  const { personMembers } = await import('../src/lib/deviceIcons.ts')
+  const { personPresence } = await import('../src/lib/presence.ts')
+  const f = (id: string, accountPub: string | null, endpointId: string) => ({ id, name: 'Ashton', createdAt: 1, accountPub, endpointId })
+  const friends = [f('mac', 'acct', 'e2'), f('phone', 'acct', 'e1'), f('pal', null, 'e3'), f('mine', 'me', 'e4')]
+  // The smallest endpoint id owns the conversation; the other device folds under it.
+  assert.deepEqual(personMembers(friends, 'phone', 'me').map(x => x.id), ['phone', 'mac'])
+  assert.deepEqual(personMembers(friends, 'pal', 'me').map(x => x.id), ['pal'])
+  assert.deepEqual(personMembers(friends, 'mine', 'me').map(x => x.id), ['mine'], 'own devices stay separate')
+  assert.deepEqual(personMembers(friends, 'gone', 'me'), [])
+  const now = Date.now()
+  // Only the Mac (not the owner record) was heard from just now.
+  const p = personPresence(personMembers(friends, 'phone', 'me'), { mac: now - 1000, phone: now - 3_600_000 }, {})
+  assert.equal(p.status, 'online')
+  assert.equal(p.lastSeen, now - 1000)
+  const old = personPresence(personMembers(friends, 'phone', 'me'), { phone: now - 3_600_000 }, {})
+  assert.deepEqual(old, { status: 'offline', lastSeen: now - 3_600_000 })
+  assert.deepEqual(personPresence([], {}, {}), { status: 'unknown', lastSeen: null })
+})

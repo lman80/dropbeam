@@ -118,6 +118,12 @@ pub fn update_settings(
     apply_autostart(&app, settings.launch_at_login);
     // Internet upload cap (0 = unlimited) — takes effect on the next chunk.
     crate::iroh_net::set_upload_limit_mbps(settings.upload_limit_mbps);
+    crate::iroh_net::set_limit_local(settings.limit_local);
+    crate::safe_speed::set_protect(settings.protect_router);
+    #[cfg(desktop)]
+    if settings.protect_router {
+        crate::safe_speed::start_guard(app.clone());
+    }
     crate::iroh_net::set_require_direct(settings.require_direct);
     crate::iroh_net::set_wait_for_direct(settings.wait_for_direct);
     crate::iroh_net::set_parallel_streams(settings.parallel_streams);
@@ -1341,6 +1347,31 @@ pub async fn ping_friend(
         crate::iroh_net::wake_chat_outbox_for(&state.config_dir, &id);
     }
     Ok(online)
+}
+
+/// "Find my safe speed" (#20): send test data to one of your devices or a
+/// friend that's online (local network first), faster and faster, while
+/// watching the router; recommends a limit (the UI offers to apply it).
+#[tauri::command]
+pub async fn find_safe_speed(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+) -> Result<crate::safe_speed::Report, String> {
+    let mine = crate::account::my_pub(&state.config_dir);
+    let mut all: Vec<crate::models::Friend> = friends::load(&state.config_dir).into_iter()
+        .filter(|f| f.endpoint_id.is_some() && !crate::block::is_blocked(&state.config_dir, f.endpoint_id.as_deref().unwrap_or("")))
+        .collect();
+    // Your own devices first, then those heard from most recently.
+    all.sort_by_key(|f| (f.account_pub.is_none() || f.account_pub != mine,
+        crate::mailbox::seen_ago(f.endpoint_id.as_deref().unwrap_or("")).unwrap_or(std::time::Duration::MAX)));
+    let targets = all.into_iter().take(8).filter_map(|f| f.endpoint_id.map(|e| (e, f.name))).collect();
+    crate::safe_speed::run(app, iroh.inner().clone(), targets).await
+}
+
+#[tauri::command]
+pub fn cancel_safe_speed() {
+    crate::safe_speed::CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Probe how we're connected to a friend right now (connection inspector). Returns

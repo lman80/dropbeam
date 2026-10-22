@@ -205,7 +205,8 @@ struct MyCodeSection: View {
         } header: { Text("Your Invite") } footer: {
             Text("Share it in Messages or anywhere. DropBeam connects phones directly — there’s no server — so keep DropBeam open while your friend adds you.")
         }
-        .task { load() }
+        // The code carries your name: fetch it again after a rename (#83).
+        .task(id: name) { load() }
         .task(id: bridge.settings?.avatar ?? "") {
             guard let raw = bridge.settings?.avatar else { avatar = nil; return }
             let path = LocalPaths.resolve(raw)

@@ -317,9 +317,12 @@ const handlers: BridgeHandlers = {
   myDeviceInfo: async () => { await st().refreshMyDevice(); return deviceSnapshot() },
   needsName: () => needsName(),
   setDisplayName: async a => {
-    const name = string(a, 'name').trim()
+    const name = [...string(a, 'name').trim()].slice(0, 64).join('').trim()
     if (!name) throw new Error('Enter your name.')
+    if (st().settingsFallback) await st().retryLoadSettings()
     await storeAction(() => st().saveSettings({ displayName: name }))
+    // Never "named" until the name really saved (#83) — friends would keep the device's name.
+    if (st().settings?.displayName !== name) throw new Error('Couldn’t save your name. Please try again.')
     localStorage.setItem('dropbeam.namedSelf', '1')
     resnapshot?.()
   },

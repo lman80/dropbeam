@@ -49,6 +49,7 @@ mod panic_log;
 #[cfg(any(target_os = "ios", test))]
 mod ios_log_policy;
 mod provenance;
+mod safe_speed;
 mod settings;
 mod sync;
 mod telemetry;
@@ -594,6 +595,12 @@ pub fn run() {
             let want_autostart = loaded.launch_at_login;
             // Honor the saved internet upload cap from first launch.
             iroh_net::set_upload_limit_mbps(loaded.upload_limit_mbps);
+            iroh_net::set_limit_local(loaded.limit_local);
+            safe_speed::set_protect(loaded.protect_router);
+            #[cfg(desktop)]
+            if loaded.protect_router {
+                safe_speed::start_guard(app.handle().clone());
+            }
             iroh_net::set_require_direct(loaded.require_direct);
             iroh_net::set_wait_for_direct(loaded.wait_for_direct);
             iroh_net::set_parallel_streams(loaded.parallel_streams);
@@ -995,6 +1002,8 @@ pub fn run() {
             commands::respond_to_offer,
             commands::ping_friend,
             commands::probe_connection,
+            commands::find_safe_speed,
+            commands::cancel_safe_speed,
             commands::force_relay,
             commands::friend_invite,
             commands::send_to_friend,
