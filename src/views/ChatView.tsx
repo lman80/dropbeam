@@ -1685,6 +1685,9 @@ const MessageRow = memo(function MessageRow({
           )}
 
           {!m.deleted && !MOBILE_UI && (
+            // The anchor keeps the bar at the bubble's bottom edge — or, on a
+            // message taller than the window, at the bottom of what you can see (#84).
+            <div className="chat-actions-anchor">
             <div className={`chat-actions${pinned ? ' pinned' : ''}`}>
               <IconButton
                 size="sm"
@@ -1723,6 +1726,7 @@ const MessageRow = memo(function MessageRow({
                   <MoreHorizontal />
                 </IconButton>
               )}
+            </div>
             </div>
           )}
         </motion.div>
