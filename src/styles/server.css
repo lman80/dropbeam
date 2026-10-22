@@ -86,6 +86,21 @@
   transform: scale(0.6);
 }
 .sx-lock { background: var(--text); color: var(--surface); }
+.sx-bell {
+  position: absolute;
+  top: -6px;
+  left: 16px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--accent);
+  color: var(--on-accent);
+  opacity: 0;
+}
+.sx-bell svg { width: 10px; height: 10px; }
+.sx-still .sx-bell { opacity: 1; }
 .sx-check { background: var(--green-dot); color: #fff; }
 .sx-lock svg, .sx-check svg { width: 10px; height: 10px; }
 .sx-zzz {
@@ -124,10 +139,13 @@
 }
 
 /* One 9s loop; each station/element has its own track over the same clock. */
-.sx:not(.sx-still) .sx-offline .sx-plane { animation: sx-plane 9s var(--ease-out) infinite; }
-.sx:not(.sx-still) .sx-offline .sx-them { animation: sx-them 9s ease infinite; }
-.sx:not(.sx-still) .sx-offline .sx-you { animation: sx-you 9s ease infinite; }
-.sx:not(.sx-still) .sx-offline .sx-zzz { animation: sx-zzz 9s ease infinite; }
+.sx:not(.sx-still) :is(.sx-offline, .sx-push) .sx-plane { animation: sx-plane 9s var(--ease-out) infinite; }
+.sx:not(.sx-still) :is(.sx-offline, .sx-push) .sx-them { animation: sx-them 9s ease infinite; }
+.sx:not(.sx-still) :is(.sx-offline, .sx-push) .sx-you { animation: sx-you 9s ease infinite; }
+.sx:not(.sx-still) :is(.sx-offline, .sx-push) .sx-zzz { animation: sx-zzz 9s ease infinite; }
+/* #45: the sleeping iPhone lights up with a notification while it waits. */
+.sx:not(.sx-still) .sx-push .sx-bell { animation: sx-bell 9s var(--ease-out) infinite; }
+.sx:not(.sx-still) .sx-push .sx-them { animation: sx-them-push 9s ease infinite; }
 .sx:not(.sx-still) .sx-lock { animation: sx-lock 9s var(--ease-out) infinite; }
 .sx:not(.sx-still) .sx-check { animation: sx-check 9s var(--ease-out) infinite; }
 .sx:not(.sx-still) .sx-cap-1 { animation: sx-cap1 9s ease infinite; }
@@ -173,6 +191,19 @@
   86% { opacity: 1; transform: scale(1.12); }
   89%, 97% { opacity: 1; transform: scale(1); }
   100% { opacity: 0; transform: scale(1); }
+}
+@keyframes sx-them-push {
+  0%, 47% { opacity: 0.45; }
+  51%, 64% { opacity: 1; }
+  67% { opacity: 0.6; }
+  70%, 100% { opacity: 1; }
+}
+@keyframes sx-bell {
+  0%, 48% { opacity: 0; transform: scale(0.6) rotate(0deg); }
+  51% { opacity: 1; transform: scale(1.15) rotate(-14deg); }
+  54% { transform: scale(1) rotate(12deg); }
+  57%, 66% { opacity: 1; transform: scale(1) rotate(0deg); }
+  69%, 100% { opacity: 0; transform: scale(0.6); }
 }
 @keyframes sx-cap1 { 0%, 30% { opacity: 1; } 33%, 100% { opacity: 0; } }
 @keyframes sx-cap2 { 0%, 33% { opacity: 0; } 36%, 63% { opacity: 1; } 66%, 100% { opacity: 0; } }

@@ -5,15 +5,21 @@
 // strip instead. Pure CSS; no gradients, no glow — the accent is spent only on
 // the plane and the check.
 import { useEffect, useState } from 'react'
-import { Check, Laptop, Lock, Send, Server, Smartphone, Users } from 'lucide-react'
+import { Bell, Check, Laptop, Lock, Send, Server, Smartphone, Users } from 'lucide-react'
 
-export type ExplainerKind = 'offline' | 'share'
+export type ExplainerKind = 'offline' | 'share' | 'push'
 
 const SCENES: Record<ExplainerKind, string[]> = {
   offline: [
     'Your friend is offline',
     'It waits on your Transfer Server, locked so only they can open it',
     'It arrives when they’re back — then the server deletes its copy',
+  ],
+  // #45: an iPhone that's asleep still hears about it.
+  push: [
+    'A friend sends something while your iPhone is asleep',
+    'Your Transfer Server holds it, locked, and sends the iPhone a notification',
+    'They see who it’s from — open DropBeam and it arrives',
   ],
   share: [
     'Friends can leave things here too',
@@ -47,8 +53,8 @@ export function ServerExplainer({ kind = 'offline', serverName, friendName, comp
   const stage = (
     <div className={`sx-stage sx-${kind}`} aria-hidden>
       <div className="sx-station sx-you">
-        <span className="sx-disc">{kind === 'share' ? <Users /> : <Smartphone />}</span>
-        <span className="sx-label">{kind === 'share' ? 'Friends' : 'You'}</span>
+        <span className="sx-disc">{kind === 'share' ? <Users /> : kind === 'push' ? <Laptop /> : <Smartphone />}</span>
+        <span className="sx-label">{kind === 'share' ? 'Friends' : kind === 'push' ? 'A friend' : 'You'}</span>
         <span className="sx-check"><Check strokeWidth={3} /></span>
       </div>
       <div className="sx-station sx-box">
@@ -58,9 +64,10 @@ export function ServerExplainer({ kind = 'offline', serverName, friendName, comp
         {kind === 'share' && <span className="sx-gauge"><span /></span>}
       </div>
       <div className="sx-station sx-them">
-        <span className="sx-disc">{kind === 'share' ? <Lock /> : <Laptop />}</span>
-        <span className="sx-label truncate-1">{kind === 'share' ? 'Only for them' : them}</span>
+        <span className="sx-disc">{kind === 'share' ? <Lock /> : kind === 'push' ? <Smartphone /> : <Laptop />}</span>
+        <span className="sx-label truncate-1">{kind === 'share' ? 'Only for them' : kind === 'push' ? 'iPhone' : them}</span>
         <span className="sx-zzz">z</span>
+        {kind === 'push' && <span className="sx-bell"><Bell strokeWidth={2.5} /></span>}
       </div>
       <span className="sx-track" />
       <span className="sx-plane"><Send /></span>

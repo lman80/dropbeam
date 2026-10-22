@@ -685,6 +685,8 @@ export function TransferServerPane() {
               <h3>Hold messages and files for friends who are offline</h3>
               <p>When someone you send to is away, this {COMPUTER} keeps it — locked so only they can open it — and hands it over the moment they’re back.</p>
             </div>
+            <ServerExplainer kind="push" compact />
+            <p className="srv-intro-copy muted">iPhones get a notification too, so people know a message is waiting even with DropBeam closed.</p>
             <div className="srv-intro-actions">
               <button className="btn btn-primary" onClick={() => setWizard(true)}>Set Up Transfer Server</button>
               <Fit check={check} />
