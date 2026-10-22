@@ -38,11 +38,12 @@ import { GifPicker } from '../components/GifPicker'
 import { avatarGradient } from '../lib/avatar'
 import { FriendAvatar } from '../components/FriendAvatar'
 import { useOwnDeviceLabels } from '../lib/ownDevices'
-import { personGroups } from '../lib/deviceIcons'
+import { personGroups, personMembers } from '../lib/deviceIcons'
+import { personDevices } from '../lib/deliveries'
 import { FileIcon as TypeIcon, fileKind as typeKind } from '../components/FileIcon'
 import { formatBytes } from '../lib/format'
 import { linkify } from '../lib/linkify'
-import { friendOnlineState, friendPresence, presenceLabel } from '../lib/presence'
+import { friendOnlineState, personPresence, presenceLabel } from '../lib/presence'
 import { EmptyState, IconButton, MenuButton, MenuPopover, type MenuItem } from '../components/ui'
 import { statusExplanation, type MessageState } from '../lib/chatStatus'
 import { decideFile, isDeclined, onServersChanged, serverApi, serverNoteText, usePendingFile } from '../lib/transferServer'
@@ -201,7 +202,8 @@ export function ChatView() {
     return () => { void api.setActiveChat(null) }
   }, [activeChatId])
 
-  const online = (f: Friend) => friendOnlineState(f, friendSeen, folderStatuses) === true
+  // A person reads online when ANY of their devices is (#81).
+  const online = (f: Friend) => personPresence(personMembers(friends, f.id, myAccount).concat(friends.some(x => x.id === f.id) ? [] : [f]), friendSeen, folderStatuses).status === 'online'
   const ownLabels = useOwnDeviceLabels()
 
   if (MOBILE_UI) return activeChatId ? <div className="mobile-page mobile-conversation"><Conversation key={activeChatId} friendId={activeChatId} /></div> : <div className="mobile-page mobile-chats"><MobileHeader title="Chats" /><div className="ios-list">{rows.map(({ friend, last }) => {
@@ -332,14 +334,17 @@ function Conversation({ friendId }: { friendId: string }) {
   // folder://status events fire continuously during a big folder sync, and a
   // record-level subscription re-rendered this entire (up to 2000-row) thread on
   // every tick. A boolean/string only re-renders when presence actually changes.
-  const onlineNow = useStore((s) =>
-    friend ? friendOnlineState(friend, s.friendSeen, s.folderStatuses) === true : false,
-  )
+  // One person, several devices (#81): online when any of them is.
+  const membersOf = (s: ReturnType<typeof useStore.getState>): Friend[] => {
+    const m = personMembers(s.friends, friendId, s.myDevice?.account_pub)
+    return m.length ? m : [friend]
+  }
+  const onlineNow = useStore((s) => personPresence(membersOf(s), s.friendSeen, s.folderStatuses).status === 'online')
   // An active check of this friend is in flight (thread just opened / refocused).
   const [checking, setChecking] = useState(() => !onlineNow)
   const presenceText = useStore((s) => {
     if (!friend) return ''
-    const p = friendPresence(friend, s.friendSeen, s.folderStatuses)
+    const p = personPresence(membersOf(s), s.friendSeen, s.folderStatuses)
     if (friend.awaitingAccept) return 'Hasn’t accepted your friend request yet'
     return p.status === 'online' ? 'Online' : checking ? 'Connecting…' : presenceLabel(p)
   })
@@ -393,6 +398,17 @@ function Conversation({ friendId }: { friendId: string }) {
     || (sv.offer === 'share' && sv.eid === friend.endpointId)))
 
   const [picking, setPicking] = useState(false)
+  // A friend with several devices: files go to all of them, or just the one
+  // picked here (#81). Messages go to whichever device answers first.
+  const allFriends = useStore((s) => s.friends)
+  const myAccount = useStore((s) => s.myDevice?.account_pub)
+  const theirDevices = useMemo(() => ownLabel ? [] : personDevices(allFriends, friendId, myAccount), [ownLabel, allFriends, friendId, myAccount])
+  const [toDevice, setToDevice] = useState('')
+  // A string, not an object: a fresh object per store change would re-render forever.
+  const onlineDevices = useStore((s) => theirDevices.filter((d) => {
+    const f = s.friends.find((x) => x.id === d.friendId)
+    return !!f && friendOnlineState(f, s.friendSeen, s.folderStatuses) === true
+  }).map((d) => d.eid).join(' '))
   const [text, setText] = useState('')
   const [reply, setReply] = useState<ChatMessage | null>(null)
   const [editing, setEditing] = useState<ChatMessage | null>(null)
@@ -672,7 +688,7 @@ function Conversation({ friendId }: { friendId: string }) {
     // Nothing staged and nothing typed → no-op.
     if (!body && stagedFiles.length === 0) return
     if (stagedFiles.length) {
-      void shareFilesInChat(friendId, [...stagedFiles], body)
+      void shareFilesInChat(friendId, [...stagedFiles], body, theirDevices.some((d) => d.eid === toDevice) ? toDevice : undefined)
       clearChatDraftFiles()
       setReply(null)
     } else if (body) {
@@ -1036,6 +1052,15 @@ function Conversation({ friendId }: { friendId: string }) {
               <StagedChip key={p} path={p} onRemove={() => unstageChatFile(p)} />
             ))}
           </div>
+        )}
+        {stagedFiles.length > 0 && theirDevices.length > 1 && (
+          <label className="composer-to">
+            <span>Send to</span>
+            <select className="input composer-to-select" value={theirDevices.some((d) => d.eid === toDevice) ? toDevice : ''} onChange={(e) => setToDevice(e.target.value)} aria-label={`Which of ${displayName}’s devices gets these files`}>
+              <option value="">All of {firstWord(displayName)}’s devices</option>
+              {theirDevices.map((d) => <option key={d.eid} value={d.eid}>{`${firstWord(displayName)}’s ${d.label} only${onlineDevices.split(' ').includes(d.eid) ? ' · online' : ''}`}</option>)}
+            </select>
+          </label>
         )}
 
         <div className={`composer-field${editing ? ' editing' : ''}`}>
@@ -2030,4 +2055,9 @@ function TextPreview({ src, onOpen }: { src: string; onOpen: () => void }) {
       {text === null ? 'Loading preview…' : text.length >= 1400 ? `${text}\n…` : text}
     </pre>
   )
+}
+
+/** "Alex" from "Alex Rivera" (a whole name with no spaces stays whole). */
+function firstWord(name: string): string {
+  return name.trim().split(/\s+/)[0] || name
 }

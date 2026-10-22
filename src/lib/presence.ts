@@ -117,3 +117,23 @@ export function claimPresenceChecks(
 export function resetPresenceChecks(): void {
   checkedAt.clear()
 }
+
+/**
+ * One person, several devices (#81): they read as online when ANY of their
+ * devices is, last seen at the latest any of them was; unknown only when
+ * every device is. `members` = the person's friend records (owner first).
+ */
+export function personPresence(
+  members: readonly { id: string; name: string }[],
+  friendSeen: Record<string, number>,
+  folderStatuses: Record<string, FolderStatus>,
+): Presence {
+  let best: Presence = { status: 'unknown', lastSeen: null }
+  for (const m of members) {
+    const p = friendPresence(m, friendSeen, folderStatuses)
+    const rank = (x: Presence) => (x.status === 'online' ? 2 : x.status === 'offline' ? 1 : 0)
+    const lastSeen = Math.max(best.lastSeen ?? -Infinity, p.lastSeen ?? -Infinity)
+    best = { status: rank(p) > rank(best) ? p.status : best.status, lastSeen: Number.isFinite(lastSeen) ? lastSeen : null }
+  }
+  return best
+}

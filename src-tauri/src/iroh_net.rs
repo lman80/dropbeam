@@ -4101,7 +4101,16 @@ async fn serve_stream_inner(
                 Some(st) if accepts_chat == Some(true) => Some(st.settings.lock().unwrap().display_name.clone()),
                 _ => None,
             };
-            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat, "name": my_name })).await?;
+            let mut reply = serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat, "name": my_name });
+            // A friend also learns which account (person) this device is, the
+            // same signed proof a hello carries: someone who added two of our
+            // devices from their codes sees ONE of us right away (#81).
+            if let (Some(_), Some(ep)) = (&my_name, state.get()) {
+                if let (Some(out), Some(profile)) = (reply.as_object_mut(), crate::link::profile(state, &ep.id().to_string()).as_object()) {
+                    out.extend(profile.clone());
+                }
+            }
+            write_frame(send, &reply).await?;
             send.finish()?;
         }
         Some("folder-hello") => {
@@ -6331,6 +6340,19 @@ fn apply_hello_reply_name(state: &Arc<IrohState>, who: &str, reply: &serde_json:
     }
 }
 
+/// A friend's answer that proves its account (#81): learn it exactly as from
+/// their own hello, so their devices group into one person now. Older peers
+/// (and answers to a stranger) carry no profile and change nothing.
+fn apply_hello_reply_device(state: &Arc<IrohState>, who: &str, reply: &serde_json::Value) {
+    if reply.get("device_os").is_none() { return; }
+    let Some(app) = state.app.get() else { return };
+    let Some(st) = app.try_state::<Arc<crate::AppState>>() else { return };
+    if crate::block::is_blocked(&st.config_dir, who) || crate::friends::chat_sender(&st.config_dir, who).is_none() { return; }
+    crate::friends::apply_device_hello(&st.config_dir, who, reply);
+    crate::friends::apply_revocations(&st.config_dir, who, reply);
+    let _ = app.emit("friends://changed", ());
+}
+
 /// Cache the encoded avatar thumbnail by (path, mtime) so a profile broadcast to
 /// N friends decodes the image at most once.
 static AVATAR_THUMB_CACHE: std::sync::Mutex<Option<(String, u64, Option<String>)>> =
@@ -6436,6 +6458,7 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
                     apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
                     apply_hello_reply_name(&state, &conn.remote_id().to_string(), &reply);
+                    apply_hello_reply_device(&state, &conn.remote_id().to_string(), &reply);
                     // Older builds don't say; a null answer changes nothing.
                     if let (Some(accepts), Some(config)) = (reply["accepts_chat"].as_bool(), &config) {
                         if crate::friends::set_awaiting_accept(config, &conn.remote_id().to_string(), !accepts) {
@@ -6487,6 +6510,7 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
                     apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
                     apply_hello_reply_name(&state, &conn.remote_id().to_string(), &reply);
+                    apply_hello_reply_device(&state, &conn.remote_id().to_string(), &reply);
                     // Older builds don't say; a null answer changes nothing.
                     if let (Some(accepts), Some(config)) = (reply["accepts_chat"].as_bool(), &config) {
                         if crate::friends::set_awaiting_accept(config, &conn.remote_id().to_string(), !accepts) {
@@ -6903,7 +6927,7 @@ pub async fn send_chat_any_within(state: &IrohState, ep: &Endpoint, eids: &[Stri
             .filter_map(|f| f.endpoint_id).collect(),
         _ => HashSet::new(),
     };
-    for eid in eids {
+    for eid in &rank_person_devices(state, eids) {
         if quick.is_some() && ios.contains(eid) && !crate::mailbox::seen_within(eid, Duration::from_secs(120)) {
             continue;
         }
@@ -6926,6 +6950,54 @@ pub async fn send_chat_any_within(state: &IrohState, ep: &Endpoint, eids: &[Stri
         }
     }
     last
+}
+
+/// Which of a person's devices to try first (#81): the one we're connected to
+/// over the local network, then any live connection, then the most recently
+/// seen; the rest keep their order (the conversation's owner device first).
+/// An offline device first used to cost a 12 s wait before the online one.
+fn rank_person_devices(state: &IrohState, eids: &[String]) -> Vec<String> {
+    if eids.len() < 2 {
+        return eids.to_vec();
+    }
+    let facts: Vec<(bool, bool, Option<Duration>)> = eids.iter().map(|e| {
+        let conn = state.friend_conns.lock().ok()
+            .and_then(|m| m.get(e).map(|c| c.conn.clone()))
+            .filter(|c| c.close_reason().is_none());
+        let local = conn.as_ref().is_some_and(|c| matches!(conn_locality(c), crate::models::Locality::Local));
+        (local, conn.is_some(), crate::mailbox::seen_ago(e))
+    }).collect();
+    order_devices(eids, &facts)
+}
+
+/// `rank_person_devices`'s order from (on the LAN, connected, seen ago) per device.
+fn order_devices(eids: &[String], facts: &[(bool, bool, Option<Duration>)]) -> Vec<String> {
+    let mut idx: Vec<usize> = (0..eids.len()).collect();
+    idx.sort_by_key(|&i| {
+        let (local, live, seen) = facts.get(i).copied().unwrap_or((false, false, None));
+        let tier = if local { 0 } else if live { 1 } else if seen.is_some() { 2 } else { 3 };
+        (tier, seen.unwrap_or(Duration::MAX))
+    });
+    idx.into_iter().map(|i| eids[i].clone()).collect()
+}
+
+#[cfg(test)]
+mod device_order_tests {
+    use super::*;
+
+    #[test]
+    fn a_persons_reachable_device_is_tried_before_an_offline_owner() {
+        let eids: Vec<String> = ["owner", "phone", "laptop", "tablet"].map(String::from).to_vec();
+        let s = |n| Some(Duration::from_secs(n));
+        // The owner hasn't been seen; the laptop is on our LAN; the phone was seen 5 s ago.
+        let facts = [(false, false, None), (false, false, s(5)), (true, true, s(60)), (false, false, s(1))];
+        assert_eq!(order_devices(&eids, &facts), ["laptop", "tablet", "phone", "owner"]);
+        // Nothing known: the given order (owner first) stands.
+        assert_eq!(order_devices(&eids, &[(false, false, None); 4]), eids);
+        // A live (relayed) connection beats a recent sighting, not the LAN.
+        let facts = [(false, true, s(30)), (true, true, s(40)), (false, false, s(1)), (false, false, None)];
+        assert_eq!(order_devices(&eids, &facts), ["phone", "owner", "laptop", "tablet"]);
+    }
 }
 
 /// Where one chat frame got to across a person's devices.
