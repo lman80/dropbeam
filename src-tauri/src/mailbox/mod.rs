@@ -89,6 +89,11 @@ pub fn note_seen(eid: &str) {
     crate::fanout::device_seen(eid);
 }
 
+/// How long ago `eid` last showed life (None = not since launch).
+pub fn seen_ago(eid: &str) -> Option<Duration> {
+    SEEN.lock().unwrap_or_else(|p| p.into_inner()).as_ref().and_then(|m| m.get(eid)).map(|t| t.elapsed())
+}
+
 /// Seen within `window`.
 pub fn seen_within(eid: &str, window: Duration) -> bool {
     SEEN.lock().unwrap_or_else(|p| p.into_inner()).as_ref()

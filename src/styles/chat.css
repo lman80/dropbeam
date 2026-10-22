@@ -527,11 +527,20 @@ html:not(.mobile) .chat-list-pane {
 .chat-linkcard-site { font-size: var(--text-11); color: var(--text-muted); }
 
 /* ── Hover actions, reactions ────────────────────────────────────────────── */
+/* The hover bar sits beside the bubble's BOTTOM edge, not its middle: on a long
+   message the middle could be far off screen (#84). The zero-height sticky
+   anchor rides up to the bottom of the visible part of a bubble taller than the
+   thread, so Copy is always right there. */
+.chat-actions-anchor {
+  position: sticky;
+  bottom: 6px;
+  height: 0;
+  z-index: 2;
+}
 .chat-actions {
   position: absolute;
-  top: 50%;
+  bottom: 0;
   left: 100%;
-  transform: translateY(-50%);
   display: flex;
   align-items: center;
   gap: 0;
@@ -548,7 +557,7 @@ html:not(.mobile) .chat-list-pane {
   padding: 0 6px 0 0;
   flex-direction: row-reverse;
 }
-.chat-main:hover > .chat-actions,
+.chat-main:hover > .chat-actions-anchor > .chat-actions,
 .chat-actions:focus-within,
 .chat-actions.pinned {
   opacity: 1;
@@ -948,6 +957,15 @@ html:not(.mobile) .chat-list-pane {
   flex-wrap: wrap;
   gap: 6px;
 }
+/* "Send to: All of Alex's devices ▾" — files for a friend with several devices (#81). */
+.composer-to {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--text-12);
+  color: var(--text-muted);
+}
+.composer-to-select { width: auto; max-width: 100%; min-width: 0; height: 28px; font-size: var(--text-12); }
 .staged-chip {
   display: inline-flex;
   align-items: center;

@@ -12,6 +12,7 @@ import { nativeReply, nativeChatSource, nativeTransfers, nativeThread } from './
 import { withMobileFileSource } from '../components/MobileFileSheet'
 import { restoredChatTransfer } from './chatTransfer'
 import { nativeBrowserPage, nativeHistoryPaths, locationChild, requireLocationRight } from './nativePhase3'
+import { streamApi } from './streamApi'
 import { appVersion } from './updater'
 import { searchGifs, type GifResult } from './gif'
 import { ownDeviceLabels, personGroups } from './deviceIcons'
@@ -309,6 +310,12 @@ const handlers: BridgeHandlers = {
     }
     return results
   },
+  // Open in place (docs/locations-v2.md): a 127.0.0.1 URL AVPlayer streams with
+  // seeking, or (for Quick Look) the whole file in the app cache.
+  browserOpen: a => { checkLocation(a, 'read'); return streamApi.readUrl(string(a, 'friendId'), string(a, 'locationId'), locationChild(string(a, 'path'), string(a, 'name'))) },
+  browserFetch: async a => { checkLocation(a, 'read'); return { path: await streamApi.cacheFile(string(a, 'friendId'), string(a, 'locationId'), locationChild(string(a, 'path'), string(a, 'name'))) } },
+  browserThumb: async a => ({ data: await streamApi.thumb(string(a, 'friendId'), string(a, 'locationId'), locationChild(string(a, 'path'), string(a, 'name')), Number(a.size) || 0, Number(a.modified) || 0, 160) }),
+  streamStatus: a => streamApi.status(string(a, 'friendId')),
   clearTransferCache: () => api.clearTransferCache(),
   exportLogs: async () => { const path = await api.exportDiagnostics(); await api.shareFiles([path]); return path },
   diagnosticsTest: () => api.diagnosticsTest(),
@@ -317,9 +324,12 @@ const handlers: BridgeHandlers = {
   myDeviceInfo: async () => { await st().refreshMyDevice(); return deviceSnapshot() },
   needsName: () => needsName(),
   setDisplayName: async a => {
-    const name = string(a, 'name').trim()
+    const name = [...string(a, 'name').trim()].slice(0, 64).join('').trim()
     if (!name) throw new Error('Enter your name.')
+    if (st().settingsFallback) await st().retryLoadSettings()
     await storeAction(() => st().saveSettings({ displayName: name }))
+    // Never "named" until the name really saved (#83) — friends would keep the device's name.
+    if (st().settings?.displayName !== name) throw new Error('Couldn’t save your name. Please try again.')
     localStorage.setItem('dropbeam.namedSelf', '1')
     resnapshot?.()
   },

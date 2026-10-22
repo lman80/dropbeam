@@ -374,12 +374,24 @@ function NameSetupModal() {
     }
   }
 
+  const [saving, setSaving] = useState(false)
   if (!show || !settings) return null
-  const finish = () => {
+  // Only call yourself named once the name really saved (#83): settings still
+  // loading (a slow first launch on Windows) or a failed write used to close
+  // this anyway, so friends kept seeing the computer's name ("DESKTOP-34RO0CL").
+  const finish = async () => {
     const trimmed = name.trim()
-    if (trimmed && trimmed !== settings.displayName) save({ displayName: trimmed })
-    localStorage.setItem('dropbeam.namedSelf', '1')
-    setShow(false)
+    if (!trimmed || saving) return
+    setSaving(true)
+    try {
+      if (useStore.getState().settingsFallback && !(await useStore.getState().retryLoadSettings())) return
+      if (trimmed !== useStore.getState().settings?.displayName) await save({ displayName: trimmed })
+      if (useStore.getState().settings?.displayName !== trimmed) return
+      localStorage.setItem('dropbeam.namedSelf', '1')
+      setShow(false)
+    } finally {
+      setSaving(false)
+    }
   }
   return (
     <>
@@ -395,7 +407,7 @@ function NameSetupModal() {
               </button>
             )}
             <span className="spacer" />
-            <button className="btn btn-primary" onClick={finish} disabled={!name.trim()}>
+            <button className="btn btn-primary" onClick={() => void finish()} disabled={!name.trim() || saving}>
               Continue
             </button>
           </>
@@ -413,7 +425,7 @@ function NameSetupModal() {
             className="input onboard-input"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => isEnterKey(e) && name.trim() && finish()}
+            onKeyDown={(e) => { if (isEnterKey(e) && name.trim()) void finish() }}
             placeholder="Your name"
             aria-label="Your name"
             maxLength={40}

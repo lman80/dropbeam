@@ -15,6 +15,8 @@ mod link;
 mod link_preview;
 mod location_sync;
 mod locations;
+mod stream;
+mod drive;
 mod mailbox;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod headless;
@@ -56,6 +58,7 @@ mod panic_log;
 #[cfg(any(target_os = "ios", test))]
 mod ios_log_policy;
 mod provenance;
+mod safe_speed;
 mod settings;
 mod sync;
 mod telemetry;
@@ -668,6 +671,12 @@ pub fn run() {
             let want_autostart = loaded.launch_at_login;
             // Honor the saved internet upload cap from first launch.
             iroh_net::set_upload_limit_mbps(loaded.upload_limit_mbps);
+            iroh_net::set_limit_local(loaded.limit_local);
+            safe_speed::set_protect(loaded.protect_router);
+            #[cfg(desktop)]
+            if loaded.protect_router {
+                safe_speed::start_guard(app.handle().clone());
+            }
             iroh_net::set_require_direct(loaded.require_direct);
             iroh_net::set_wait_for_direct(loaded.wait_for_direct);
             iroh_net::set_parallel_streams(loaded.parallel_streams);
@@ -818,6 +827,14 @@ pub fn run() {
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     iroh_net::broadcast_profile(app2, iroh2);
                 });
+            }
+            // Open in place: the block cache + 127.0.0.1 range server; on
+            // desktops also "Show Locations as a drive" (docs/locations-v2.md).
+            {
+                let cache = app.path().app_cache_dir().unwrap_or_else(|_| config_dir.join("cache"));
+                stream::init(&config_dir, &cache, iroh_state.clone(), app.handle().clone());
+                #[cfg(desktop)]
+                drive::init(&config_dir, &cache);
             }
             app.manage(iroh_state);
             log::info!("setup: iroh spawned + state managed");
@@ -1073,6 +1090,8 @@ pub fn run() {
             commands::respond_to_offer,
             commands::ping_friend,
             commands::probe_connection,
+            commands::find_safe_speed,
+            commands::cancel_safe_speed,
             commands::force_relay,
             commands::friend_invite,
             commands::send_to_friend,
@@ -1082,6 +1101,20 @@ pub fn run() {
             commands::save_location,
             commands::location_request,
             commands::upload_to_location,
+            stream::location_stat,
+            stream::location_read_url,
+            stream::location_thumb,
+            stream::location_cache_file,
+            stream::location_open,
+            stream::stream_status,
+            stream::stream_clear_cache,
+            drive::drive_status,
+            drive::drive_mount,
+            drive::drive_unmount,
+            drive::drive_refresh,
+            drive::drive_settings_set,
+            drive::drive_open,
+            drive::drive_fix_windows,
             mounts::list_mount_candidates,
             mailbox::cmds::server_check_device,
             mailbox::cmds::server_folder_space,
@@ -1146,6 +1179,9 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building DropBeam")
         .run(|_app, _event| {
+            // Take the drive away cleanly on quit (a crash is cleaned up at launch).
+            #[cfg(desktop)]
+            if let tauri::RunEvent::Exit = &_event { drive::shutdown_blocking(); }
             // A `dropbeam:` link (invite link, Camera-scanned friend QR): queue it
             // for the UI and tell a running one right away.
             #[cfg(target_os = "ios")]

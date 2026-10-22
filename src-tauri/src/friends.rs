@@ -891,7 +891,57 @@ pub fn accept_request(config_dir: &Path, endpoint_id: &str) -> Result<Friend, St
     if crate::block::is_blocked(config_dir, endpoint_id) {
         return Err("You blocked this person. Unblock them in Settings → Blocked first.".into());
     }
-    Ok(upsert_by_endpoint(config_dir, endpoint_id, &r.name))
+    let f = upsert_by_endpoint(config_dir, endpoint_id, &r.name);
+    // The request proved which account (person) it is: keep that, so a second
+    // device of a friend joins them at once instead of showing as a second
+    // "Alex" until that device happens to say hello again (#81). Never our own
+    // account, never a device its owner removed.
+    let mine = crate::account::my_pub(config_dir);
+    if let Some(account) = r.account_pub.as_deref().filter(|a| mine.as_deref() != Some(*a)
+        && !is_revoked(config_dir, a, endpoint_id) && !crate::account::is_own_device(config_dir, endpoint_id)) {
+        set_account_if_missing(config_dir, endpoint_id, account);
+        fold_person_threads(config_dir);
+        return Ok(get(config_dir, &f.id).unwrap_or(f));
+    }
+    Ok(f)
+}
+
+/// Record `account` for the friend at `endpoint_id` when none is known yet.
+fn set_account_if_missing(config_dir: &Path, endpoint_id: &str, account: &str) {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut friends = read_raw(config_dir);
+    let mut changed = false;
+    for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id) && f.account_pub.is_none()) {
+        f.account_pub = Some(account.to_owned());
+        changed = true;
+    }
+    if changed {
+        let _ = save(config_dir, &friends);
+    }
+}
+
+/// A friend we greeted answered with the name they chose for themselves (#83):
+/// adopt it unless the user renamed them here. Only an existing friend record
+/// changes (never a request, never one of our own devices — account sync names
+/// those). This is how a friend added from a code made before they picked
+/// their name ("DESKTOP-34RO0CL") gets the real one on the next hello, even
+/// when their own rename broadcast happened before we were their friend.
+pub fn adopt_name_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> bool {
+    let name = sanitize_display_name(name, "");
+    if name.is_empty() || endpoint_id.is_empty() || crate::account::is_own_device(config_dir, endpoint_id) {
+        return false;
+    }
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut friends = read_raw(config_dir);
+    let mut changed = false;
+    for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id) && !f.name_custom && f.name != name) {
+        f.name = name.clone();
+        changed = true;
+    }
+    if changed {
+        let _ = save(config_dir, &friends);
+    }
+    changed
 }
 
 /// Store the friend-at-`endpoint_id`'s profile picture path (received over the
@@ -2255,6 +2305,24 @@ mod awaiting_accept_tests {
     }
 
     #[test]
+    fn a_greeted_friend_answering_with_their_chosen_name_replaces_the_code_name() {
+        let d = dir();
+        // Added from a code made before they named themselves (#83).
+        let f = upsert_by_endpoint(&d, "win-eid", "DESKTOP-34RO0CL");
+        assert!(adopt_name_by_endpoint(&d, "win-eid", "  Old Desktop "));
+        assert_eq!(get(&d, &f.id).unwrap().name, "Old Desktop");
+        assert!(!adopt_name_by_endpoint(&d, "win-eid", "Old Desktop"), "no change, no write");
+        assert!(!adopt_name_by_endpoint(&d, "win-eid", "   "), "an empty answer keeps the name");
+        assert!(!adopt_name_by_endpoint(&d, "stranger", "Mallory"), "never adds anyone");
+        assert!(load(&d).iter().all(|f| f.endpoint_id.as_deref() != Some("stranger")));
+        // A name the user gave them here wins over theirs.
+        rename(&d, &f.id, "Basement PC".into()).unwrap();
+        assert!(!adopt_name_by_endpoint(&d, "win-eid", "Old Desktop"));
+        assert_eq!(get(&d, &f.id).unwrap().name, "Basement PC");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn a_new_request_is_told_apart_from_a_repeat() {
         let d = dir();
         assert!(!has_request(&d, "jo"));
@@ -2264,3 +2332,32 @@ mod awaiting_accept_tests {
     }
 }
 
+#[cfg(test)]
+mod person_request_tests {
+    use super::*;
+
+    fn dir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("db-person-req-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn accepting_a_second_device_of_a_friend_joins_them_into_one_person() {
+        let d = dir();
+        let mac = upsert_by_endpoint(&d, "mac-eid", "Alex");
+        set_device_info(&d, "mac-eid", Some("laptop"), Some("acct-alex"));
+        // Their phone asks (proving the same account) and the user accepts (#81).
+        assert!(add_request(&d, "phone-eid", "Alex", Some("acct-alex")));
+        let phone = accept_request(&d, "phone-eid").unwrap();
+        assert_eq!(phone.account_pub.as_deref(), Some("acct-alex"));
+        assert_eq!(thread_owner(&d, &phone.id).unwrap().id, mac.id, "one person, one conversation");
+        assert_eq!(person_endpoints(&d, &mac.id), ["mac-eid", "phone-eid"]);
+        // A request without proof stays its own contact.
+        assert!(add_request(&d, "pal-eid", "Pal", None));
+        let pal = accept_request(&d, "pal-eid").unwrap();
+        assert!(pal.account_pub.is_none());
+        assert_eq!(thread_owner(&d, &pal.id).unwrap().id, pal.id);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

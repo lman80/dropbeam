@@ -211,7 +211,7 @@ command has no decision), `agent_ctl.rs` (socket, log, events, Settings → Agen
 ## Op catalog
 
 `dropbeam ops` (or the `ops.describe` op) prints the live catalog with full JSON schemas.
-Bold arguments are required. 129 ops.
+Bold arguments are required. 141 ops.
 
 | Op | Risk | Input | What it does |
 |---|---|---|---|
@@ -292,6 +292,18 @@ Bold arguments are required. 129 ops.
 | `locations.mkdir` | write | **location**, **path**, **who** | Make a folder inside a friend's Location (needs manage rights). |
 | `locations.rename` | write | **location**, **path**, **to**, **who** | Rename or move an item inside a friend's Location (needs manage rights). |
 | `locations.trash` | destructive (confirm) | **location**, **path**, **who** | Move an item in a friend's Location to that Location's trash (recoverable there). |
+| `locations.stat` | read | **location**, **path**, **who** | Type, size, modified time and version tag of one item in a friend's Location. |
+| `locations.readUrl` | read | **location**, **path**, **who** | A link on this computer (http://127.0.0.1, works only here, only while DropBeam runs) that streams a file from a friend's Location without downloading it first; seeking works (HTTP Range). |
+| `locations.cacheFile` | read | **location**, **path**, **who** | Bring a whole file from a friend's Location into DropBeam's cache and return its path (kept a day). |
+| `locations.connection` | read | **who** | How this device reaches the device sharing a Location: Local, Direct or Relay, round trip and live speed. |
+| `locations.clearCache` | write |  | Empty the cache of streamed Location files. |
+| `drives.status` | read |  | Whether Locations show as a drive on this computer, where it's mounted, and the drive settings. |
+| `drives.mount` | write |  | Show Locations as a drive (Finder, File Explorer or Files). |
+| `drives.unmount` | write |  | Stop showing Locations as a drive. |
+| `drives.refresh` | write |  | Re-read which Locations the drive shows. |
+| `drives.settings` | write | **settings** | Change Settings → Drives (enabled, autoMount, cacheGb); only what's given changes. |
+| `speed.findSafe` | write |  | Find my safe speed: test sends while watching the router, then a recommended upload limit. |
+| `speed.cancelFind` | write |  | Stop a running speed.findSafe. |
 | `syncedFolders.list` | read |  | Local folders this device keeps copied into a friend's Location. |
 | `syncedFolders.status` | read |  | What each synced folder is doing now. |
 | `syncedFolders.add` | write | deleteRemote, **localPath**, **location**, path, **who** | Keep a local folder copied into a friend's Location. |
@@ -358,4 +370,6 @@ Tauri commands no op covers (`ops.describe` also lists them as `humanOnly`):
 | `save_pasted_image`, `paste_clipboard_image`, `clipboard_file_paths`, `download_gif`, `send_chat_gif` | clipboard paste and the GIF picker; agents send text and files |
 | `restart_app`, `quit_app` | would end the agent's own connection |
 | `force_relay` | developer test that slows one connection on purpose |
+| `location_thumb`, `location_open`, `drive_open` | picture previews for the browser grid; open a file or the drive on screen (agents use `locations.readUrl` / `locations.cacheFile`) |
+| `drive_fix_windows` | asks for administrator permission on screen |
 | `agent_settings`, `agent_set_access`, `agent_set_exec`, `agent_log`, `agent_clear_log`, `agent_install_cli` | Settings → Agents: an agent can't widen its own access or erase its trace |

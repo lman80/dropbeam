@@ -15,9 +15,11 @@ import { useStore, type View } from '../store'
 import { IS_MAC, IS_WINDOWS, MOBILE_UI, TRAY_NAME } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { LocationSettings } from '../components/LocationSettings'
+import { DriveSettings } from '../components/DriveSettings'
 import { TransferServerPane } from '../components/TransferServerSettings'
 import { AgentsPane } from '../components/AgentsSettings'
 import { InstallUpdateButton } from '../components/UpdateInstall'
+import { SafeSpeedDialog } from '../components/SafeSpeed'
 import { Dot, IconButton, InfoButton, ProgressBar, SectionHeader, Segmented, Spinner, Toggle } from '../components/ui'
 import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbackButton } from '../lib/feedback'
 
@@ -27,7 +29,7 @@ import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbac
 // location" on Locations opens the Locations pane, the GIF setup link in Chat
 // opens General, "Settings" under History's recoverable files opens Transfers —
 // otherwise it's the pane you last had open.
-type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'server' | 'privacy' | 'agents' | 'advanced'
+type Tab = 'general' | 'devices' | 'locations' | 'drives' | 'transfers' | 'server' | 'privacy' | 'agents' | 'advanced'
 const DEV_KEY = 'dropbeam.developer'
 // Everyday tabs first; the optional/advanced features after Privacy.
 const TABS: { value: Tab; label: string }[] = [
@@ -36,6 +38,7 @@ const TABS: { value: Tab; label: string }[] = [
   { value: 'devices', label: 'Devices' },
   { value: 'privacy', label: 'Privacy' },
   { value: 'locations', label: 'Locations' },
+  { value: 'drives', label: 'Drives' },
   { value: 'server', label: 'Transfer Server' },
   { value: 'agents', label: 'Agents' },
   { value: 'advanced', label: 'Advanced' },
@@ -119,6 +122,7 @@ export function SettingsView() {
   const myEid = useStore((s) => s.myEid)
   const [showEidQr, setShowEidQr] = useState(false)
   const [scanOperator, setScanOperator] = useState(false)
+  const [safeSpeed, setSafeSpeed] = useState(false)
   const appVer = useStore((s) => s.appVer)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<string | null>(null)
@@ -471,9 +475,26 @@ export function SettingsView() {
 
       <SectionHeader>Speed</SectionHeader>
       <div className="group">
-        <Row title="Upload limit" sub="In Mbps. Local network transfers always run at full speed.">
+        <Row title="Upload limit" sub={settings.limitLocal ? 'In Mbps, for every send.' : 'In Mbps. Local network transfers run at full speed.'}>
           <UploadLimit value={settings.uploadLimitMbps || 0} onChange={(uploadLimitMbps) => save({ uploadLimitMbps })} />
         </Row>
+        <Row title="Find my safe speed" sub="Not sure what to pick? Test how fast your router can go without trouble.">
+          <button className="btn btn-secondary btn-sm" onClick={() => setSafeSpeed(true)}>Test…</button>
+          {safeSpeed && <SafeSpeedDialog onClose={() => setSafeSpeed(false)} />}
+        </Row>
+        <ToggleRow
+          title="Limit local network transfers too"
+          sub="Use this if your Wi‑Fi drops when you send to a device at home."
+          on={settings.limitLocal}
+          disabled={!settings.uploadLimitMbps}
+          onChange={(v) => save({ limitLocal: v })}
+        />
+        <ToggleRow
+          title="Protect my router"
+          sub="Watches your router while sending and slows down if it starts to struggle."
+          on={settings.protectRouter}
+          onChange={(v) => save({ protectRouter: v })}
+        />
         <ToggleRow
           title="Show speeds in megabits"
           sub="Mbps instead of MB/s, on this device."
@@ -771,7 +792,7 @@ export function SettingsView() {
     </>
   )
 
-  const visibleTabs = TABS.filter((t) => (t.value !== 'locations' && t.value !== 'server' && t.value !== 'agents') || !MOBILE_UI)
+  const visibleTabs = TABS.filter((t) => (t.value !== 'locations' && t.value !== 'drives' && t.value !== 'server' && t.value !== 'agents') || !MOBILE_UI)
 
   return (
     <div className="page settings-page" ref={rootRef}>
@@ -786,6 +807,7 @@ export function SettingsView() {
         {tab === 'general' && general}
         {tab === 'devices' && <DevicesPanel />}
         {tab === 'locations' && <LocationSettings />}
+        {tab === 'drives' && <DriveSettings />}
         {tab === 'transfers' && transfers}
         {tab === 'server' && <TransferServerPane />}
         {tab === 'agents' && <AgentsPane />}
@@ -881,7 +903,9 @@ function UpdateRow({ onVersionTap }: { onVersionTap?: () => void }) {
 /** Upload cap: presets as a segmented control, plus a custom value. 0 = off. */
 const UPLOAD_PRESETS = [0, 50, 100, 150, 300]
 function UploadLimit({ value, onChange }: { value: number; onChange: (mbps: number) => void }) {
-  const [custom, setCustom] = useState(!UPLOAD_PRESETS.includes(value))
+  const [customPicked, setCustom] = useState(!UPLOAD_PRESETS.includes(value))
+  // A value set elsewhere ("Find my safe speed" → 117) shows as Custom too.
+  const custom = customPicked || !UPLOAD_PRESETS.includes(value)
   const seg = custom ? 'custom' : String(value)
   return (
     <div className="set-upload">

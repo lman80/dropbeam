@@ -1,7 +1,7 @@
 import { loadLocations } from '../lib/locationsLoad'
 import { errorText } from '../lib/errors'
 import { MobileHeader } from '../components/MobileHeader'
-import { IS_WINDOWS, MOBILE_UI } from '../lib/platform'
+import { MOBILE_UI } from '../lib/platform'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronLeft, ChevronRight, HardDrive, Info, RefreshCw } from 'lucide-react'
 import { locationsApi, onLocationsChanged, type HostedLocation, type HostedLocationStatus, type SharedLocation } from '../lib/api'
@@ -200,7 +200,7 @@ export function LocationsView() {
   const unavailable = friends.filter(f => errors[f.id])
   return <div className="locations-view page">
     <div className="page-header titlebar-drag" data-tauri-drag-region="deep"><h1 className="page-title">Locations</h1><div className="page-actions">
-      {!IS_WINDOWS && <button className="btn btn-secondary" onClick={() => setView('settings')}>Share a Folder…</button>}
+      <button className="btn btn-secondary" onClick={() => setView('settings')}>Share a Folder…</button>
       <button className="btn btn-primary" onClick={openSyncFolderSheet}>Sync a Folder…</button>
     </div></div>
 
@@ -248,6 +248,6 @@ export function LocationsView() {
     </div>}
 
     <SyncedFolders shared={shared} />
-    {!IS_WINDOWS && <SharedFromThisDevice />}
+    <SharedFromThisDevice />
   </div>
 }

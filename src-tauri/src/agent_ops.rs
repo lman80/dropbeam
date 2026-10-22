@@ -276,6 +276,29 @@ fn catalog() -> Vec<OpSpec> {
             .req("who", S, WHO).req("location", S, "Location name or id.").req("path", S, "Item path.").req("to", S, "New path.").build(),
         op("locations.trash", Destructive, "Move an item in a friend's Location to that Location's trash (recoverable there).")
             .req("who", S, WHO).req("location", S, "Location name or id.").req("path", S, "Item path.").out("{trashPath}").build(),
+        op("locations.stat", Read, "Type, size, modified time and version tag of one item in a friend's Location.")
+            .req("who", S, WHO).req("location", S, "Location name or id.").req("path", S, "Item path.")
+            .out("{isDir, size, modified, etag}").cmds(&["location_stat"]).build(),
+        op("locations.readUrl", Read, "A link on this computer (http://127.0.0.1, works only here, only while DropBeam runs) that streams a file from a friend's Location without downloading it first; seeking works (HTTP Range). Hand it to a player or reader.")
+            .req("who", S, WHO).req("location", S, "Location name or id.").req("path", S, "File path.")
+            .out("{url, kind, mime, size, etag}").cmds(&["location_read_url"]).build(),
+        op("locations.cacheFile", Read, "Bring a whole file from a friend's Location into DropBeam's cache on this computer and return its path (kept a day; reused while unchanged). Use locations.download to keep a copy in your download folder.")
+            .req("who", S, WHO).req("location", S, "Location name or id.").req("path", S, "File path.")
+            .out("path (text)").cmds(&["location_cache_file"]).build(),
+        op("locations.connection", Read, "How this device reaches the device sharing a Location right now: Local, Direct or Relay, round trip and live speed.")
+            .req("who", S, WHO).out("{path, rttMs, …}").cmds(&["stream_status"]).build(),
+        op("locations.clearCache", Write, "Empty the cache of streamed Location files (they're fetched again when opened).")
+            .out("bytes freed").cmds(&["stream_clear_cache"]).build(),
+        op("drives.status", Read, "Whether friends' and your devices' Locations show as a drive on this computer, where it's mounted, and the drive settings.")
+            .cmds(&["drive_status"]).build(),
+        op("drives.mount", Write, "Show Locations as a drive on this computer (Finder, File Explorer or Files).").out("where it's mounted").cmds(&["drive_mount"]).build(),
+        op("drives.unmount", Write, "Stop showing Locations as a drive.").cmds(&["drive_unmount"]).build(),
+        op("drives.refresh", Write, "Re-read which Locations the drive shows (after friends share or stop sharing).").cmds(&["drive_refresh"]).build(),
+        op("drives.settings", Write, "Change Settings → Drives: show Locations as a drive, mount it at launch, cache size.")
+            .req("settings", Obj, "{\"enabled\": true, \"autoMount\": true, \"cacheGb\": 10}").cmds(&["drive_settings_set"]).build(),
+        op("speed.findSafe", Write, "Find my safe speed: send test data to an online device or friend, faster and faster, while watching the router, and recommend an upload limit (apply it with settings.update uploadLimitMbps). Takes up to a minute or two.")
+            .out("{recommended limit, target, local, routerMs, …}").cmds(&["find_safe_speed"]).build(),
+        op("speed.cancelFind", Write, "Stop a running speed.findSafe.").cmds(&["cancel_safe_speed"]).build(),
         op("syncedFolders.list", Read, "Local folders this device keeps copied into a friend's Location.").cmds(&["list_synced_folders"]).build(),
         op("syncedFolders.status", Read, "What each synced folder is doing now.").cmds(&["synced_folder_statuses"]).build(),
         op("syncedFolders.add", Write, "Keep a local folder copied into a friend's Location.")
@@ -401,6 +424,10 @@ pub const EXCLUDED: &[(&str, &str)] = &[
     ("restart_app", "would end the agent's own connection; restart from the window"),
     ("quit_app", "would end the agent's own connection; quit from the menu"),
     ("force_relay", "developer test that slows one connection on purpose"),
+    ("location_thumb", "picture previews for the Locations browser grid"),
+    ("location_open", "opens a file in an app on screen (agents use locations.readUrl or locations.cacheFile)"),
+    ("drive_open", "opens Finder/File Explorer/Files on screen"),
+    ("drive_fix_windows", "asks for administrator permission on screen"),
     ("agent_settings", "Settings → Agents: an agent can't change its own access"),
     ("agent_set_access", "Settings → Agents: an agent can't change its own access"),
     ("agent_set_exec", "Settings → Agents: an agent can't let itself run commands"),
@@ -820,6 +847,33 @@ pub async fn run(app: &AppHandle, name: &str, i: &Value, ctx: &Ctx) -> R {
             crate::agent_ctl::remember_retry(&u.id, "locations.upload", i);
             ok(u)
         }
+        "locations.stat" | "locations.readUrl" | "locations.cacheFile" => {
+            let (host, loc) = find_location(app, &dir, &s(i, "who")?, &s(i, "location")?).await?;
+            let path = s(i, "path")?.trim_matches('/').to_owned();
+            match name {
+                "locations.stat" => ok(crate::stream::location_stat(app.state(), host.id, loc, path).await.map_err(failed)?),
+                "locations.readUrl" => ok(crate::stream::location_read_url(app.state(), host.id, loc, path).await.map_err(failed)?),
+                _ => ok(crate::stream::location_cache_file(app.clone(), app.state(), host.id, loc, path).await.map_err(failed)?),
+            }
+        }
+        "locations.connection" => { let f = resolve(&dir, &s(i, "who")?)?; ok(crate::stream::stream_status(app.state(), f.id).map_err(failed)?) }
+        "locations.clearCache" => ok(crate::stream::stream_clear_cache().map_err(failed)?),
+        "drives.status" => ok(crate::drive::drive_status().await.map_err(failed)?),
+        "drives.mount" => ok(crate::drive::drive_mount().await.map_err(failed)?),
+        "drives.unmount" => { crate::drive::drive_unmount().await.map_err(failed)?; done() }
+        "drives.refresh" => ok(crate::drive::drive_refresh().await.map_err(failed)?),
+        "drives.settings" => {
+            // Partial: start from what's saved, change only what was given.
+            let mut cur = serde_json::to_value(crate::stream::load_settings(&dir)).map_err(failed)?;
+            for (k, v) in i["settings"].as_object().into_iter().flatten() {
+                if cur.get(k).is_none() { return Err(bad(format!("no drive setting {k:?} (enabled, autoMount, cacheGb)"))); }
+                cur[k] = v.clone();
+            }
+            let next: crate::stream::DriveSettings = serde_json::from_value(cur).map_err(|e| bad(format!("settings: {e}")))?;
+            ok(crate::drive::drive_settings_set(next).await.map_err(failed)?)
+        }
+        "speed.findSafe" => ok(commands::find_safe_speed(app.clone(), app.state(), app.state()).await.map_err(failed)?),
+        "speed.cancelFind" => { commands::cancel_safe_speed(); done() }
         "syncedFolders.list" => ok(crate::location_sync::list_synced_folders(app.state())),
         "syncedFolders.status" => ok(crate::location_sync::synced_folder_statuses()),
         "syncedFolders.add" => {

@@ -181,6 +181,7 @@ struct BrowserView: View {
     @State private var selected = Set<String>()
     @State private var selecting = false
     @State private var tapped: BrowserEntry?
+    @State private var opened: BrowserEntry?
     @State private var editing: String?
     @State private var name = ""
     @State private var trashConfirm = false
@@ -249,6 +250,9 @@ struct BrowserView: View {
                     }
                 }
             }
+            .fullScreenCover(item: $opened) { entry in
+                OpenInPlaceView(friendID: friendID, location: location, path: path, entry: entry) { selected = [entry.name]; download() }.environmentObject(bridge)
+            }
             .alert(editing == "mkdir" ? "New Folder" : "Rename", isPresented: Binding(get: { editing != nil }, set: { if !$0 { editing = nil } })) {
                 let command = editing == "mkdir" ? "browserMkdir" : "browserRename"
                 TextField("Name", text: $name).textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -267,7 +271,7 @@ struct BrowserView: View {
                 Button {
                     Haptics.tap()
                     if selecting { if !selected.insert(entry.name).inserted { selected.remove(entry.name) } }
-                    else { tapped = entry }
+                    else { opened = entry }
                 } label: { rowContent(entry) }.buttonStyle(.plain).disabled(busy)
             }
         }
@@ -282,7 +286,10 @@ struct BrowserView: View {
         }
         .contextMenu {
             if !selecting {
-                if !entry.isDir { Button("Download", systemImage: "arrow.down.circle") { selected = [entry.name]; download() } }
+                if !entry.isDir {
+                    Button("Open", systemImage: "eye") { opened = entry }
+                    Button("Download", systemImage: "arrow.down.circle") { selected = [entry.name]; download() }
+                }
                 if rights.manage {
                     Button("Rename", systemImage: "pencil") { selected = [entry.name]; name = entry.name; editing = "rename" }
                     Button("Move to Trash", systemImage: "trash", role: .destructive) { selected = [entry.name]; trashConfirm = true }
@@ -293,7 +300,8 @@ struct BrowserView: View {
     private func rowContent(_ entry: BrowserEntry) -> some View {
         HStack(spacing: 14) {
             if selecting { Image(systemName: selected.contains(entry.name) ? "checkmark.circle.fill" : "circle").font(.title3).foregroundStyle(selected.contains(entry.name) ? Color.beam : Color.secondary).frame(width: 28, height: 44).accessibilityLabel(selected.contains(entry.name) ? "Selected" : "Not selected") }
-            FileGlyph(name: entry.name, symbol: entry.isDir ? "folder.fill" : nil, size: 40)
+            if !entry.isDir && RemoteThumb.applies(to: entry.name) { RemoteThumb(friendID: friendID, locationID: location.id, path: path, entry: entry, size: 40) }
+            else { FileGlyph(name: entry.name, symbol: entry.isDir ? "folder.fill" : nil, size: 40) }
             VStack(alignment: .leading, spacing: 3) {
                 Text(entry.name).font(.body).foregroundStyle(.primary).lineLimit(2).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
                 if !entry.isDir { Text("\(Formatters.bytes(entry.size)) · \(entry.date.formatted(.dateTime.month(.abbreviated).day().year()))").font(.subheadline).foregroundStyle(.secondary) }

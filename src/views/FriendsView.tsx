@@ -1,4 +1,4 @@
-import { deviceIcon, groupDevices, personGroups } from '../lib/deviceIcons'
+import { deviceIcon, groupDevices, personGroups, personMembers } from '../lib/deviceIcons'
 import { isEnterKey } from '../lib/keys'
 import { errorText } from '../lib/errors'
 import { relativeTime } from '../lib/dates'
@@ -40,7 +40,7 @@ import { ConnInfo } from '../components/ConnInspector'
 import { FriendAvatar } from '../components/FriendAvatar'
 import { EmptyState, IconButton, MenuButton, SectionHeader, Spinner, type MenuItem } from '../components/ui'
 import { avatarColor, avatarGradient, initials } from '../lib/avatar'
-import { claimPresenceChecks, friendPresence, presenceLabel } from '../lib/presence'
+import { claimPresenceChecks, friendPresence, personPresence, presenceLabel } from '../lib/presence'
 import { LOOK_ALIKE_HINT, joinNames, useLookAlikes } from '../lib/lookAlike'
 
 export function FriendsView() {
@@ -248,7 +248,9 @@ function YouSection() {
     return () => {
       alive = false
     }
-  }, [])
+    // The code carries your name: a code fetched before you named yourself
+    // made friends add you as the computer's name (#83). Re-fetch on rename.
+  }, [displayName])
 
   // A friendly message with a tap-to-add link, not a bare code: whoever gets
   // it in a text message knows what to do with it.
@@ -407,7 +409,8 @@ function FriendRow({ friend }: { friend: Friend }) {
   const [pingedOffline, setPingedOffline] = useState(false)
   const [conn, setConn] = useState<ConnDetail | null>(null)
 
-  const presence = friendPresence(friend, friendSeen, folderStatuses)
+  // A person reads online when ANY of their devices is (#81).
+  const presence = ownLabel ? friendPresence(friend, friendSeen, folderStatuses) : personPresence(personMembers(allFriends, friend.id, myAccount), friendSeen, folderStatuses)
   const isOnline = presence.status === 'online'
   const channel = Object.values(folderStatuses).find(
     (s) => s.peerName?.trim().toLowerCase() === friend.name.trim().toLowerCase(),
@@ -729,7 +732,9 @@ function YouCard() {
     return () => {
       alive = false
     }
-  }, [])
+    // The code carries your name: a code fetched before you named yourself
+    // made friends add you as the computer's name (#83). Re-fetch on rename.
+  }, [displayName])
 
   const saveName = () => {
     const n = name.trim()

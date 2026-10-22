@@ -106,6 +106,8 @@ const DEFAULT_SETTINGS: Settings = {
   playSounds: true,
   directMode: true,
   uploadLimitMbps: 0,
+  limitLocal: false,
+  protectRouter: false,
   showMegabits: false,
   requireDirect: false,
   waitForDirect: false,
@@ -365,7 +367,8 @@ interface AppStore {
   reactToMessage: (friendId: string, messageId: string, emoji: string) => Promise<void>
   editChatMessage: (friendId: string, messageId: string, text: string) => Promise<void>
   deleteChatMessage: (friendId: string, messageId: string) => Promise<void>
-  shareFilesInChat: (friendId: string, paths: string[], caption?: string) => Promise<void>
+  /** `device` (an endpoint id): only that one of the friend's devices gets the files (#81). */
+  shareFilesInChat: (friendId: string, paths: string[], caption?: string, device?: string) => Promise<void>
   addChatMessage: (m: ChatMessage) => void
   /** Files staged in the active chat's composer (drag-to-attach, iMessage-style):
    *  they wait, shown as chips, and go out with the next send. Cleared on chat
@@ -1695,12 +1698,12 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  shareFilesInChat: async (friendId, paths, caption) => {
+  shareFilesInChat: async (friendId, paths, caption, device) => {
     paths = paths.filter(Boolean)
     if (!paths.length) return
     try {
-      const t = await api.sendToFriend(friendId, paths)
-      setRetryPayload(t.id, { kind: 'friend', id: friendId, paths })
+      const t = await api.sendToFriend(friendId, paths, undefined, undefined, device)
+      setRetryPayload(t.id, { kind: 'friend', id: friendId, paths, device })
       if (!get().transfers[t.id]) get().upsertTransfer(t)
       const names = paths.map((p) => p.split(/[/\\]/).pop() || p)
       const m = await api.sendChatFileNote(friendId, names, t.bytesTotal || 0, paths, caption, t.id)

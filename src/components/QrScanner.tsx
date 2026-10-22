@@ -3,11 +3,12 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import jsQR from 'jsqr'
 import { fileSrc } from '../lib/api'
-import { CameraOff, ImageUp, X } from 'lucide-react'
+import { CameraOff, ImageUp, X, ZoomIn, ZoomOut } from 'lucide-react'
 import { IS_MAC, MOBILE_UI } from '../lib/platform'
 import { useEscape, useModalFocus } from './Dialog'
 import { IconButton } from './ui'
 import { decodeQrFromImage, imageFromTransfer, setScannerDrop } from '../lib/qrImage'
+import { hardwareZoom, MAX_DIGITAL_ZOOM, zoomCrop, zoomsForTick } from '../lib/qrZoom'
 
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|heic|heif|bmp|tiff?)$/i
@@ -42,6 +43,16 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
   const [reading, setReading] = useState(false)
   const [dropping, setDropping] = useState(false)
   const [code, setCode] = useState('')
+  // Zoom (#85): the slider's value; `hw` = the camera's own zoom range, if any.
+  const [zoom, setZoom] = useState(1)
+  const [hw, setHw] = useState<{ min: number; max: number; step: number } | null>(null)
+  const zoomRef = useRef(1)
+  const hwRef = useRef(false)
+  const changeZoom = (z: number) => {
+    setZoom(z); zoomRef.current = z
+    const track = stream.current?.getVideoTracks()[0]
+    if (hw && track) void track.applyConstraints({ advanced: [{ zoom: z } as unknown as MediaTrackConstraintSet] }).catch(() => {})
+  }
   const stop = useCallback(() => { stream.current?.getTracks().forEach(track => track.stop()); stream.current = null; setLive(false) }, [])
   /** true = accepted and closing. */
   const finish = useCallback((text: string): boolean => {
@@ -90,9 +101,15 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
       setPaste(true)
     }
     if (!navigator.mediaDevices?.getUserMedia) fail(new Error('Unavailable'))
-    else void navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } }, audio: false }).then(async media => {
+    // As many pixels as the camera gives (up to 1080p): zooming in reads the
+    // centre at full resolution, so a far-away code keeps enough detail.
+    else void navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false }).then(async media => {
       if (!alive || done.current || !cameraEnabled.current) { media.getTracks().forEach(track => track.stop()); return }
       stream.current = media
+      const range = hardwareZoom(media.getVideoTracks()[0])
+      hwRef.current = !!range
+      setHw(range)
+      if (range) { setZoom(range.min); zoomRef.current = range.min }
       // Laptop webcams face the user: mirror the PREVIEW (decoding reads raw frames).
       setMirror(media.getVideoTracks()[0]?.getSettings().facingMode !== 'environment')
       if (video.current) { video.current.srcObject = media; await video.current.play() }
@@ -103,16 +120,22 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
       if (done.current || !stream.current) return
       const v = video.current, c = canvas.current
       if (!v || !c || v.readyState < 2 || !v.videoWidth) return
-      const scale = Math.min(1, 960 / v.videoWidth)
-      c.width = Math.round(v.videoWidth * scale); c.height = Math.round(v.videoHeight * scale)
       const ctx = c.getContext('2d', { willReadFrequently: true })
       if (!ctx) return
       try {
-        ctx.drawImage(v, 0, 0, c.width, c.height)
-        const data = ctx.getImageData(0, 0, c.width, c.height)
         // Every 4th frame also tries inverted colors (a phone showing a light-on-dark QR).
-        const qr = jsQR(data.data, c.width, c.height, { inversionAttempts: ++frame % 4 === 0 ? 'attemptBoth' : 'dontInvert' })
-        if (qr?.data) finish(qr.data)
+        const invert = ++frame % 4 === 0 ? 'attemptBoth' : 'dontInvert'
+        // The whole frame and a zoomed-in centre (#85); with the camera's own
+        // zoom the frame is already zoomed, so the slider's value isn't re-applied.
+        for (const z of zoomsForTick(frame, hwRef.current ? 1 : zoomRef.current)) {
+          const r = zoomCrop(v.videoWidth, v.videoHeight, z)
+          c.width = r.dw; c.height = r.dh
+          ctx.drawImage(v, r.sx, r.sy, r.sw, r.sh, 0, 0, r.dw, r.dh)
+          const data = ctx.getImageData(0, 0, r.dw, r.dh)
+          const qr = jsQR(data.data, r.dw, r.dh, { inversionAttempts: invert })
+          if (qr?.data && finish(qr.data)) return
+          if (done.current) return
+        }
       } catch (e) { fail(e) }
     }, 110)
     return () => { alive = false; clearInterval(timer); stop() }
@@ -160,7 +183,7 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
       </div>
       <div className="dialog-body qrs-body">
         <div className={`qrs-stage${live && !dropping && !reading ? ' live' : ''}${dropping ? ' dropping' : ''}`}>
-          <video ref={video} autoPlay muted playsInline className="qrs-video" style={{ transform: mirror ? 'scaleX(-1)' : undefined, opacity: live ? 1 : 0 }} />
+          <video ref={video} autoPlay muted playsInline className="qrs-video" style={{ transform: `${mirror ? 'scaleX(-1) ' : ''}${!hw && zoom > 1 ? `scale(${zoom})` : ''}`.trim() || undefined, opacity: live ? 1 : 0 }} />
           <canvas ref={canvas} hidden />
           {live && !dropping && !reading && <div className="qrs-finder" aria-hidden="true"><i /><i /><i /><i /></div>}
           {status && <div className="qrs-stage-msg" role={error ? 'alert' : 'status'}>
@@ -169,6 +192,12 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
             <span>{status}</span>
           </div>}
         </div>
+        {live && !dropping && !reading && <label className="qrs-zoom" title="Too far away? Zoom in on the code.">
+          <ZoomOut size={15} aria-hidden />
+          <input type="range" aria-label="Zoom" min={hw?.min ?? 1} max={hw ? Math.min(hw.max, 10) : MAX_DIGITAL_ZOOM} step={hw?.step ?? 0.1} value={zoom}
+            onChange={e => changeZoom(Number(e.target.value))} />
+          <ZoomIn size={15} aria-hidden />
+        </label>}
         <p className="qrs-hint">{hint}</p>
         {notice && <p className="qrs-notice" role="alert">{notice}</p>}
         {paste ? <form className="qrs-paste" onSubmit={e => { e.preventDefault(); e.stopPropagation(); rejected.current = ''; finish(code) }}>

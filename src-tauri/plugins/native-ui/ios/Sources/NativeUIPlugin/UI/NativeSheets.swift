@@ -133,18 +133,46 @@ struct QRScanner: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> DataScannerViewController {
         let controller = DataScannerViewController(recognizedDataTypes: [.barcode(symbologies: [.qr])], qualityLevel: .balanced, recognizesMultipleItems: false, isHighFrameRateTrackingEnabled: false, isPinchToZoomEnabled: true, isGuidanceEnabled: true, isHighlightingEnabled: true)
         controller.delegate = context.coordinator
+        context.coordinator.startAutoZoom(controller)
         return controller
     }
     func updateUIViewController(_ controller: DataScannerViewController, context: Context) {
         guard !controller.isScanning else { return }
         do { try controller.startScanning() } catch { DispatchQueue.main.async { failure(error.localizedDescription) } }
     }
-    static func dismantleUIViewController(_ controller: DataScannerViewController, coordinator: Coordinator) { controller.stopScanning() }
+    static func dismantleUIViewController(_ controller: DataScannerViewController, coordinator: Coordinator) { coordinator.stopAutoZoom(); controller.stopScanning() }
     final class Coordinator: NSObject, DataScannerViewControllerDelegate {
         let recognized: (String) -> Void
         let failure: (String) -> Void
         private var delivered = false
+        private var zoomTask: Task<Void, Never>?
         init(_ recognized: @escaping (String) -> Void, _ failure: @escaping (String) -> Void) { self.recognized = recognized; self.failure = failure }
+        /// A code far away (a laptop screen across the desk) reads too small. Like
+        /// Alipay, zoom in by itself while nothing reads — ×1 → ×1.5 → ×2 → ×3 and
+        /// round again, ~1 s each — until a code reads or the person pinches (#85).
+        @MainActor func startAutoZoom(_ controller: DataScannerViewController) {
+            zoomTask?.cancel()
+            zoomTask = Task { @MainActor [weak self, weak controller] in
+                let ramp: [Double] = [1, 1.5, 2, 3]
+                var step = 0
+                var base: Double?
+                var mine: Double?
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 1_100_000_000)
+                    guard let me = self, let scanner = controller, !Task.isCancelled, !me.delivered else { return }
+                    guard scanner.isScanning else { continue }
+                    // The person pinched: their zoom wins from here on.
+                    if let mine, abs(scanner.zoomFactor - mine) > 0.01 { return }
+                    let start = base ?? scanner.zoomFactor
+                    base = start
+                    step = (step + 1) % ramp.count
+                    let zoom = min(max(start * ramp[step], scanner.minZoomFactor), scanner.maxZoomFactor)
+                    scanner.zoomFactor = zoom
+                    mine = zoom
+                }
+            }
+        }
+        func stopAutoZoom() { zoomTask?.cancel(); zoomTask = nil }
         func dataScanner(_ dataScanner: DataScannerViewController, didAdd addedItems: [RecognizedItem], allItems: [RecognizedItem]) { receive(addedItems) }
         func dataScanner(_ dataScanner: DataScannerViewController, didTapOn item: RecognizedItem) { receive([item]) }
         func dataScanner(_ dataScanner: DataScannerViewController, becameUnavailableWithError error: DataScannerViewController.ScanningUnavailable) { failure("Camera scanning stopped. Paste a code to continue.") }

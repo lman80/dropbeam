@@ -11,8 +11,11 @@ import { MenuButton, SectionHeader } from './ui'
 
 const DEFAULT_CAP = 500_000_000_000
 const empty = (): HostedLocation => ({ id: '', name: '', path: '', friendIds: [], rights: { upload: true, manage: false }, byteCap: DEFAULT_CAP })
+/** Windows' verbatim `\\?\D:\x` / `\\?\UNC\server\x` read as `D:\x` / `\\server\x`. */
+const displayPath = (path: string): string => path.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '')
 /** The folder's own name, so "where is it?" already answers "what's it called?". */
-const nameFromPath = (path: string): string => path.split(/[\\/]/).filter(Boolean).pop() || 'Shared folder'
+const nameFromPath = (path: string): string => displayPath(path).split(/[\\/]/).filter(Boolean).pop() || 'Shared folder'
+const PATH_PLACEHOLDER = IS_WINDOWS ? 'D:\\Shared' : '/Volumes/NAS/Shared'
 const baseName = (path: string): string => path.split(/[\\/]/).filter(Boolean).pop() || path
 /** What a friend may do, as plain-language choices instead of two checkboxes. */
 const ACCESS = [
@@ -114,11 +117,11 @@ function AddLocationWizard({ onCancel, onSaved }: { onCancel: () => void; onSave
     <form id="location-wizard" className="location-form" onSubmit={e => { e.preventDefault(); submit() }}>
       {step === 'where' && <div className="group location-pick-group">
         {mounts === null && <div className="row"><span className="row-sub">Looking for drives…</span></div>}
-        {(mounts || []).map(m => <button type="button" className="row location-pick" key={m.path} title={m.path} onClick={() => choose(m.path, m.label)}>
+        {(mounts || []).map(m => <button type="button" className="row location-pick" key={m.path} title={displayPath(m.path)} onClick={() => choose(m.path, m.label)}>
           <span className="location-glyph" aria-hidden>{m.kind === 'network' ? <Server /> : <HardDrive />}</span>
           <span className="row-main">
             <span className="row-title truncate-1">{m.label}</span>
-            <span className="row-sub truncate-1">{m.kind === 'network' ? 'Network drive' : 'External disk'}{m.freeBytes != null && m.totalBytes ? ` · ${formatBytes(m.freeBytes)} free` : ''}</span>
+            <span className="row-sub truncate-1">{m.kind === 'network' ? 'Network drive' : m.kind === 'fixed' ? 'Local drive' : 'External disk'}{m.freeBytes != null && m.totalBytes ? ` · ${formatBytes(m.freeBytes)} free` : ''}</span>
           </span>
         </button>)}
         <button type="button" className="row location-pick" onClick={() => { void browse() }}>
@@ -136,7 +139,7 @@ function AddLocationWizard({ onCancel, onSaved }: { onCancel: () => void; onSave
         </label>
         <div className="location-field">
           <span className="field-label">Folder</span>
-          <span className="location-choose-name" title={draft.path}><FolderOpen /><span className="truncate-1">{nameFromPath(draft.path)}</span></span>
+          <span className="location-choose-name" title={displayPath(draft.path)}><FolderOpen /><span className="truncate-1">{nameFromPath(draft.path)}</span></span>
         </div>
       </>}
 
@@ -194,7 +197,7 @@ function EditLocation({ draft: initial, onClose, onSaved }: { draft: HostedLocat
       <label className="location-field">
         <span className="field-label">Folder</span>
         <span className="location-inline">
-          <input className="input" required placeholder="/Volumes/NAS/Shared" value={draft.path} title={draft.path} onChange={e => setDraft({ ...draft, path: e.target.value })} />
+          <input className="input" required placeholder={PATH_PLACEHOLDER} value={draft.path} title={displayPath(draft.path)} onChange={e => setDraft({ ...draft, path: e.target.value })} />
           <button type="button" className="btn btn-secondary" onClick={async () => {
             try { const path = await api.pickDirectory(); if (path) setDraft(d => ({ ...d, path, name: d.name || nameFromPath(path) })) } catch (e) { setError(errorText(e)) }
           }}>Choose…</button>
@@ -255,19 +258,18 @@ export function LocationSettings() {
   const shownActivity = allActivity ? activity : activity.slice(0, ACTIVITY_CAP)
 
   return <section className="location-settings" aria-label="Locations">
-    <SectionHeader action={!IS_WINDOWS && <button className="btn btn-secondary btn-sm" disabled={!loaded || busy || adding} onClick={startAdding}>Share a Folder…</button>}>
+    <SectionHeader action={<button className="btn btn-secondary btn-sm" disabled={!loaded || busy || adding} onClick={startAdding}>Share a Folder…</button>}>
       Locations</SectionHeader>
     {error && <p className="form-error location-settings-error" role="alert">{error}</p>}
     <div className="group">
       {!loaded && !error && <div className="row"><span className="row-sub">Loading…</span></div>}
-      {IS_WINDOWS && loaded && !locations.length && <div className="row"><span className="row-sub">Sharing a folder from Windows isn’t available yet. You can still use locations friends share with you.</span></div>}
-      {!IS_WINDOWS && loaded && !locations.length && <div className="row"><span className="row-sub">Share a folder or NAS with the friends you pick.</span></div>}
+      {loaded && !locations.length && <div className="row"><span className="row-sub">Share a folder or NAS with the friends you pick.</span></div>}
       {locations.map(l => {
         const members = l.friendIds.map(id => nameOf(id) || 'a removed device')
         return <div className="row location-row" key={l.id}>
           <span className="location-glyph" aria-hidden><HardDrive /></span>
           <div className="row-main">
-            <div className="row-title truncate-1" title={l.path}>{l.name}</div>
+            <div className="row-title truncate-1" title={displayPath(l.path)}>{l.name}</div>
             {l.id === added
               ? <div className="row-sub location-added truncate-1"><Check size={12} aria-hidden /> Shared · friends find it under Locations</div>
               : <div className="row-sub truncate-1" title={members.join(', ')}>{members.length ? `${peopleLabel(members)} · ${accessLabel(l.rights)}` : 'Only you'}</div>}

@@ -109,14 +109,20 @@ Source of truth: the code on branch `ios` as of v0.52.2 (Rust engine `src-tauri/
 ### Locations
 | Feature | macOS | Windows | Linux | iOS | Notes |
 |---|---|---|---|---|---|
-| Host a Location (wizard, rights, cap, marker) | ✅ | ❌ | ✅ | ❌ | Windows: `Root::open` bails "requires Linux or macOS in Phase 1" but the UI is reachable (§3). iOS: by design (`locations::load` returns empty) |
-| Mount/drive suggestions in wizard | ✅ | ❌ | ✅ | N/A | `mounts.rs` macOS/Linux only |
-| Hosted "Gateway" cards + activity | ✅ | ❌ | ✅ | N/A | |
+| Host a Location (wizard, rights, cap, marker) | ✅ | ✅ | ✅ | ❌ | Windows (2026-10-22): handle-relative `Root` in `locations_windows.rs` — junctions/symlinks/mount points refused, native no-replace rename, whole data drives (`D:\`) allowed, system/profile/AppData refused; see locations-phase1.md "Windows hosts". Also `--server`. iOS: by design (`locations::load` returns empty) |
+| Mount/drive suggestions in wizard | ✅ | ✅ | ✅ | N/A | Windows: fixed/removable/network drive letters except the system drive, "Storage (D:)" |
+| Hosted "Gateway" cards + activity | ✅ | ✅ | ✅ | N/A | |
 | Browse / download | ✅ | ✅ | ✅ | ✅ | |
 | Upload files / folder | ✅ | ✅ | ✅ | ✅ | iOS also "Upload Photos" |
 | New folder / rename / trash | ✅ | ✅ | ✅ | ✅ | |
 | Sort (name/size/date) | ✅ | ✅ | ✅ | ❌ | iOS lists by name only |
 | Synced-to-a-location folders | ✅ | ✅ | ✅ | ❌ | iOS: undesirable (no background) |
+| Open in place (stream, seek, no copy first) | ✅ | ✅ | ✅ | ✅ | `stream.rs` block cache + 127.0.0.1 range server; host `locations.read` (v2). Desktop preview: image/video/audio/PDF/text; iOS: AVPlayer (video/audio), Quick Look (rest, fetched to cache). Needs a v2 host |
+| Path badge + live speed while streaming | ✅ | ✅ | ✅ | ✅ | `stream_status` |
+| Thumbnails for pictures | ✅ | ✅ | ✅ | ✅ | Host-made JPEG (`locations.thumb`); images only, no video posters |
+| Open with default app | ✅ | ✅ | ✅ | N/A | Through the drive when mounted, else a cached copy |
+| Locations as a drive | ✅ | ⚠️ | ⚠️ | ❌ | macOS: NFSv3 at `~/DropBeam Drives`, verified end to end. Linux: WebDAV + `gio mount` (compiled/tested in CI, not live-mounted). Windows: WebDAV + `net use`, WebClient/50 MB fix (compiled in CI, not live-mapped). iOS needs a File Provider extension (follow-up) |
+| Settings → Drives (on/off, start with app, cache size) | ✅ | ✅ | ✅ | ❌ | |
 
 ### History & recovery
 | Feature | macOS | Windows | Linux | iOS | Notes |
@@ -168,7 +174,7 @@ Ranked by user impact ÷ effort. Effort: **S** ≈ hours, **M** ≈ 1–2 days, 
 |---|---|---|---|---|---|
 | 1 | **iOS has no Shared Folders screen.** A folder can be joined (Folder Invite sheet, Friends → + → Join Shared Folder) but afterwards there's no way to see its status, find it, pause it, leave it or change its mode. | iOS | Users can join something they then can't manage or leave | new `UI/FoldersView.swift` (list + detail); `nativeBridge.ts` handlers wrapping `listPairs`/`getFolderStatuses`/`setFolderPaused`/`removePair`/`updatePair`/`verifyFolder` + `pairs`/`folderStatuses` snapshots; `Models.swift` `Pair`/`FolderStatus`; entry from Friends or Settings | M (read-only list + pause/leave) → L (full parity incl. roles) |
 | 2 | **Local Network banner/button is macOS-only but shows on Windows and Linux.** `lan_path_blocked()` fires there too; the banner says "Enable DropBeam under Local Network" and *Open Settings* opens an `x-apple.systempreferences:` URL that does nothing. | Windows, Linux | Misleading advice exactly when LAN transfers are slow | `src/App.tsx` `LocalNetworkBanner`; `src/views/SettingsView.tsx` (~L416); `src-tauri/src/commands.rs` `open_local_network_settings` (L653) — gate on macOS, give Windows firewall / "Private network" text + `ms-settings:network` link | S |
-| 3 | **Windows can open the Locations host wizard but saving always fails** ("Hosting Locations requires Linux or macOS in Phase 1"). | Windows | Dead-end UI | `src/components/LocationSettings.tsx`, `src/views/LocationsView.tsx` (*Share a folder* / *Set up a location* / *Add a location*): hide or explain on Windows. Real hosting = port `locations.rs` `Root` (descriptor-relative I/O) to Windows | S (hide/explain) · L (implement) |
+| 3 | ~~**Windows can open the Locations host wizard but saving always fails.**~~ Done 2026-10-22: Windows hosts Locations (`locations_windows.rs`), same wizard as macOS/Linux. | Windows | — | — | — |
 | 4 | **Dead iOS toggle "Prefer Direct Connections"** writes `preferDirectP2p`; nothing in the engine reads `prefer_direct_p2p`. | iOS | A switch that does nothing erodes trust | `UI/SettingsView.swift` L262 (remove), optionally drop the field from `models.rs` | S |
 | 5 | **iOS transfer cards lack the path badge, the wait-for-direct detail and "Send over relay anyway".** | iOS | With *Wait for a Direct Link* on, a parked send has no explanation or escape | `UI/SendView.swift` `TransferCard`; `Models.swift` `Transfer` (decode `detail`, `connDetail`); add `forceRelay` bridge handler → `api.forceRelay` | S |
 | 6 | **iOS can't dismiss finished/failed transfers.** | iOS | Send tab fills with stale cards until relaunch | `UI/SendView.swift` (swipe/✕ on non-active cards); `nativeBridge.ts` `removeTransfer` handler → `st().removeTransfer` | S |
@@ -207,8 +213,6 @@ Ranked by user impact ÷ effort. Effort: **S** ≈ hours, **M** ≈ 1–2 days, 
 | Where | What | Evidence |
 |---|---|---|
 | Desktop (Win/Linux) | Local Network banner + Settings *Open Settings* button target macOS only | `App.tsx` `LocalNetworkBanner`; `SettingsView.tsx` ~L416; `commands.rs` L653 opens `x-apple.systempreferences:`; `iroh_net.rs` L1379 `lan_path_blocked()` has no OS gate |
-| Desktop (Windows) | Locations host wizard reachable, always fails on save | `locations.rs` L314 `bail!("Hosting Locations requires Linux or macOS in Phase 1")`; `LocationSettings.tsx` rendered for every desktop (`SettingsView.tsx` L257 `!MOBILE_UI`) |
-| Desktop (Windows) | Wizard's drive/NAS suggestions always empty | `mounts.rs` L162 returns `vec![]` off macOS/Linux |
 | iOS | Joined shared folders are invisible afterwards | `NativeSheets.swift` `FolderInviteSheet`, `FriendsView.swift` L38 "Join Shared Folder"; no Swift view lists pairs; snapshots in `nativeBridge.ts` don't include `pairs`/`folderStatuses` |
 | iOS | "Prefer Direct Connections" toggle is inert | `SettingsView.swift` L262 → `preferDirectP2p`; `prefer_direct_p2p` is read nowhere outside `models.rs` |
 | iOS | Wait-for-direct has no escape | setting at `SettingsView.swift` L266; no `forceRelay` bridge handler |

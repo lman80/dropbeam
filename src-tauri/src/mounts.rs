@@ -3,8 +3,9 @@
 //! `/run/user/1000/gvfs/sftp:host=buddy-files` means: the wizard lists the NAS
 //! shares and external disks this device can already see and lets them pick one.
 //!
-//! Read-only and cheap: one read of /proc/mounts (Linux) or one directory
-//! listing of /Volumes (macOS), plus one statvfs per candidate. Nothing here
+//! Read-only and cheap: one read of /proc/mounts (Linux), one directory
+//! listing of /Volumes (macOS) or one GetLogicalDrives (Windows), plus one
+//! statvfs / GetDiskFreeSpaceExW per candidate. Nothing here
 //! grants access to anything — saving the location still goes through
 //! `locations::save`, which validates the root and writes the mount marker.
 use serde::Serialize;
@@ -22,7 +23,8 @@ pub struct MountCandidate {
     /// Shown only as a small hint under the label.
     pub fstype: String,
     /// "network" — a NAS / network drive; "removable" — an external or extra
-    /// disk. The wizard labels network mounts "NAS / network drive".
+    /// disk; "fixed" — another internal drive (Windows `D:`). The wizard labels
+    /// network mounts "Network drive".
     pub kind: String,
     pub free_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
@@ -154,12 +156,44 @@ fn expand_gvfs(list: Vec<MountCandidate>) -> Vec<MountCandidate> {
     out
 }
 
+/// One Windows drive letter as a wizard choice: "Storage (D:)". The system
+/// drive is never offered (Locations refuses it), nor are CD drives, RAM disks
+/// or letters with no medium. Pure: the caller asks Windows for the facts.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn describe_drive(letter: char, drive_type: u32, label: &str, fstype: &str, system_drive: &str) -> Option<MountCandidate> {
+    if !letter.is_ascii_alphabetic() || system_drive.trim_end_matches(['\\', ':']).eq_ignore_ascii_case(&letter.to_string()) { return None; }
+    // GetDriveTypeW: 2 removable, 3 fixed, 4 remote.
+    let (kind, fallback) = match drive_type { 2 => ("removable", "USB Drive"), 3 => ("fixed", "Local Disk"), 4 => ("network", "Network Drive"), _ => return None };
+    let letter = letter.to_ascii_uppercase();
+    let name = if label.trim().is_empty() { fallback } else { label.trim() };
+    Some(MountCandidate { label: format!("{name} ({letter}:)"), path: format!("{letter}:\\"), fstype: fstype.into(),
+        kind: kind.into(), free_bytes: None, total_bytes: None })
+}
+#[cfg(windows)]
+fn drives() -> Vec<MountCandidate> {
+    use windows::{core::PCWSTR, Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW}};
+    let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let mask = unsafe { GetLogicalDrives() };
+    let text = |b: &[u16]| String::from_utf16_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]);
+    (0..26u8).filter(|i| mask & (1 << i) != 0).filter_map(|i| {
+        let letter = (b'A' + i) as char;
+        let root: Vec<u16> = format!("{letter}:\\").encode_utf16().chain([0]).collect();
+        let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+        if !matches!(kind, 2..=4) { return None; }
+        let (mut label, mut fstype) = ([0u16; 261], [0u16; 261]);
+        // A card reader with no card or an offline network drive: skip quietly.
+        unsafe { GetVolumeInformationW(PCWSTR(root.as_ptr()), Some(&mut label), None, None, None, Some(&mut fstype)) }.ok()?;
+        describe_drive(letter, kind, &text(&label), &text(&fstype), &system)
+    }).collect()
+}
+
 fn candidates() -> Vec<MountCandidate> {
     #[cfg(target_os = "macos")] let mut list = volumes();
     #[cfg(target_os = "linux")]
     let mut list = expand_gvfs(parse_proc_mounts(&std::fs::read_to_string("/proc/mounts").unwrap_or_default(),
         std::env::var_os("HOME").as_deref().map(Path::new)));
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))] let mut list: Vec<MountCandidate> = vec![];
+    #[cfg(windows)] let mut list = drives();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))] let mut list: Vec<MountCandidate> = vec![];
     list.truncate(50);
     for m in &mut list {
         if let Some((free, total)) = crate::locations::volume_bytes(Path::new(&m.path)) {
@@ -227,6 +261,19 @@ gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw,nosuid,nodev,relatime,user_id=
         let stacked = parse_proc_mounts("//a/b /mnt/share cifs rw 0 0\n//c/d /mnt/share nfs4 rw 0 0\n", None);
         assert_eq!(stacked.len(), 1);
         assert_eq!(stacked[0].fstype, "nfs4");
+    }
+
+    /// Windows: the owner's data drive reads "Storage (D:)"; the system drive,
+    /// CD drives and unknown types are never offered.
+    #[test]
+    fn windows_drives_offer_data_disks_but_never_the_system_drive() {
+        let d = describe_drive('d', 3, "Storage", "NTFS", "C:").unwrap();
+        assert_eq!((d.label.as_str(), d.path.as_str(), d.kind.as_str(), d.fstype.as_str()), ("Storage (D:)", "D:\\", "fixed", "NTFS"));
+        assert_eq!(describe_drive('E', 2, "  ", "exFAT", "C:").unwrap().label, "USB Drive (E:)");
+        assert_eq!(describe_drive('Z', 4, "", "NTFS", "C:").unwrap().kind, "network");
+        assert!(describe_drive('C', 3, "Windows", "NTFS", "C:").is_none());
+        assert!(describe_drive('c', 3, "Windows", "NTFS", "C:\\").is_none());
+        for kind in [0, 1, 5, 6] { assert!(describe_drive('F', kind, "x", "x", "C:").is_none()); }
     }
 
     /// A GNOME gvfs share reads as its host, not as its connection string.
