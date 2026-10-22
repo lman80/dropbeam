@@ -134,3 +134,16 @@ and recorded (an agent that acts without a trace is a bug).
 
 ## Deviations / results
 (filled in as work lands)
+
+- **Phases 3–4 (branch `stream-drive`)** — details in [locations-v2.md](locations-v2.md).
+  - v2 is advertised as `locations_max: 2` beside the unchanged `locations_v: 1`
+    (v1 clients compare `locations_v == 1` exactly; bumping it would have broken them).
+  - No separate `locations.write`: drive saves stage locally and go through the
+    existing verified upload (`replace_existing` for overwrites). Commit = 2 s
+    write-idle (nfsserve has no COMMIT) or end of a WebDAV PUT.
+  - Thumbnails: images only (no video decoder in the tree).
+  - The range server and the WebDAV drive share one 127.0.0.1 hyper server
+    (per-run token). Linux/Windows mounting compiled + unit-tested in CI, not
+    live-mounted; macOS NFS verified end to end on the dev Mac.
+  - Settings → Drives is its own tab; drive settings live in `drive.json`
+    (not `settings.json`) to keep the change separate.

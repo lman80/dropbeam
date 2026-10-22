@@ -428,6 +428,25 @@ The Locations page's **Shared from this device** section shows each hosted folde
 
 > **Available (browsing):** macOS · Windows · Linux · iOS
 
+### Open files in place
+Open a file in a friend's Location without copying it first — it streams from their device as you watch, listen or scroll, over the fastest path DropBeam has (local network, direct, or relay).
+- **Desktop:** double-click a file (or click its name). Pictures, videos, music, PDFs and text open right in DropBeam; videos seek instantly. The title shows **Local network / Direct / Relay** and the live speed. **Open with Default App** opens it in the app you'd normally use (through the drive when it's showing, so only the parts the app reads are fetched); **Download** still keeps a copy.
+- **iOS:** tap a file. Videos and music play straight away (with seeking and picture-in-picture); documents and pictures open in Quick Look. Long-press for **Download**, **Rename**, **Move to Trash**.
+- Picture rows show small previews.
+- Parts you've opened are kept on this device so they open instantly next time (Settings → Drives → **Space for opened files**, 10 GB by default). If the file changes on the other device, DropBeam notices and shows the new version.
+- The other device needs an up-to-date DropBeam; older versions still browse and download as before.
+
+> **Available:** macOS · Windows · Linux · iOS
+
+### Locations as a drive
+Every Location friends share with you appears as one drive — **DropBeam Drives** in Finder, a drive letter in File Explorer, a network place in Files — with a folder per device and per Location. Any app can open, play and seek files on it.
+- **Settings → Drives:** **Show Locations as a drive** (on by default once someone shares a Location with you), **Show it when DropBeam starts**, **Open Drive**, **Remove Drive**. The Locations browser has **Open in Finder / File Explorer / Files**.
+- **Saving into the drive:** the file is saved on this device first, then uploaded and checked exactly like an upload (follow it in Send & Receive); it appears on the other device once checked. Saving over a file replaces it and its old version goes to the Location's trash. Creating folders, renaming and deleting need **Can also rename & delete**; without **Can add files** the drive is read-only.
+- **Windows:** uses Windows' WebDAV client. If it's off, or limits files to 50 MB, Settings → Drives offers **Allow large files** (one step; Windows asks for permission; up to 4 GB per file).
+- Quitting DropBeam removes the drive; a drive left behind by a crash is cleaned up at the next start.
+
+> **Available:** macOS · Windows · Linux · iOS ✗ (iPhone opens files in place in the app instead)
+
 ### Synced to a location — keep a folder copied to a friend's Location
 A one-way "my computer feeds the NAS" sync. Locations page → **Sync a folder here**:
 1. **Choose the folder** on this device.
