@@ -2185,6 +2185,9 @@ fn describe_paths(conn: &Connection) -> String {
         if !closed && path_is_validated_direct(&p) { "v" } else { "" },
         p.remote_addr())).collect::<Vec<_>>().join(" ")
 }
+pub(crate) fn locality_of(conn: &Connection) -> crate::models::Locality {
+    conn_locality(conn)
+}
 fn conn_locality(conn: &Connection) -> crate::models::Locality {
     use crate::models::Locality;
     // A final snapshot can outlive connection closure in iroh 1.2.
@@ -4724,6 +4727,12 @@ async fn serve_stream_inner(
             }
             write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
             send.finish()?;
+        }
+        // "Find my safe speed" (#20): a friend's or own device's test data,
+        // read and thrown away.
+        Some("speed-test") => {
+            let config = location_config(state)?;
+            crate::safe_speed::serve_test(&config, &conn.remote_id().to_string(), send, recv).await?;
         }
         // Forward-compatible: a newer peer may send a stream kind we don't know
         // yet. Ack and ignore instead of erroring the stream, so adding message
@@ -8115,6 +8124,8 @@ async fn write_folder_body<F: Fn(u64, u64)>(
             }
             if pace {
                 pace_bytes(n as u64).await;
+            } else {
+                pace_local(n as u64).await;
             }
             send.write_all(&buf[..n]).await?;
             remaining -= n as u64;
@@ -8922,14 +8933,45 @@ fn clear_force_relay(id: &str) {
     force_relay_set().lock().unwrap().remove(id);
 }
 
+/// "Limit local network transfers too" (#20): the upload cap also applies on
+/// the LAN, where a weak home router can be the one that falls over.
+static LIMIT_LOCAL: AtomicBool = AtomicBool::new(false);
+static LOCAL_BUCKET: std::sync::OnceLock<Mutex<(f64, Instant)>> = std::sync::OnceLock::new();
+
+pub fn set_limit_local(on: bool) {
+    LIMIT_LOCAL.store(on, Ordering::Relaxed);
+}
+
+/// The tighter of two caps in bytes/s (0 = none).
+fn tighter(a: u64, b: u64) -> u64 {
+    match (a, b) {
+        (0, x) | (x, 0) => x,
+        (a, b) => a.min(b),
+    }
+}
+
 /// Block until `n` bytes' worth of send budget is available. No-op when the cap
 /// is unlimited (the common case) — one relaxed atomic load, no contention.
+/// The router guard (#20) can hold it lower while the home router struggles.
 async fn pace_bytes(n: u64) {
-    let rate = UPLOAD_LIMIT_BPS.load(Ordering::Relaxed);
+    crate::safe_speed::SENT.fetch_add(n, Ordering::Relaxed);
+    let rate = tighter(UPLOAD_LIMIT_BPS.load(Ordering::Relaxed), crate::safe_speed::GUARD_BPS.load(Ordering::Relaxed));
+    pace_with(UPLOAD_BUCKET.get_or_init(|| Mutex::new((0.0, Instant::now()))), rate, n).await;
+}
+
+/// The same for a local-network send: free unless the user limits local
+/// transfers too, or the router guard is holding sending back.
+async fn pace_local(n: u64) {
+    crate::safe_speed::SENT.fetch_add(n, Ordering::Relaxed);
+    let user = if LIMIT_LOCAL.load(Ordering::Relaxed) { UPLOAD_LIMIT_BPS.load(Ordering::Relaxed) } else { 0 };
+    let rate = tighter(user, crate::safe_speed::GUARD_BPS.load(Ordering::Relaxed));
+    pace_with(LOCAL_BUCKET.get_or_init(|| Mutex::new((0.0, Instant::now()))), rate, n).await;
+}
+
+async fn pace_with(bucket: &Mutex<(f64, Instant)>, rate: u64, n: u64) {
     if rate == 0 {
         return;
     }
-    let bucket = UPLOAD_BUCKET.get_or_init(|| Mutex::new((0.0, Instant::now())));
     loop {
         let wait = {
             let mut g = bucket.lock().unwrap();
@@ -9578,6 +9620,8 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
                         if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
                         if pace {
                             pace_bytes(k as u64).await;
+                        } else {
+                            pace_local(k as u64).await;
                         }
                         write_payload(&mut uni, &buf[..k], |n| {
                             progress.fetch_add(n, Ordering::Relaxed);
@@ -10279,6 +10323,8 @@ async fn write_files_body_inner<F: Fn(u64, u64)>(
             if let Some(plain) = &mut plain { plain.update(&buf[..n]); }
             if pace {
                 pace_bytes(n as u64).await;
+            } else {
+                pace_local(n as u64).await;
             }
             write_payload(send, &buf[..n], |n| {
                 sent += n;

@@ -41,6 +41,9 @@ tauri-build = { version = "2.6.2", features = [] }
 
 [dependencies]
 netwatch = "0.19.3"
+# "Find my safe speed" (#20): the default gateway (router) to watch. Already in
+# the tree (iroh's netwatch) at this version — nothing new is downloaded.
+netdev = { version = "0.46", default-features = false, features = ["gateway"] }
 # Already cached/locked through Tauri; match its asset URL and Range decoding.
 percent-encoding = "2"
 http-range = "0.1"
@@ -136,6 +139,9 @@ notify-rust = "4.17"
 [target.'cfg(unix)'.dependencies]
 # Ignore SIGPIPE at startup so closed launcher pipes return an I/O error.
 libc = "0.2"
+# Unprivileged ICMP echo to the router for "Find my safe speed" (#20); already in
+# the tree (iroh/tokio) — no new download.
+socket2 = "0.6"
 
 # macOS only: native menu-bar drag-to-open. We attach a file-drag-accepting
 # overlay to the status-item button so dragging a file over the icon springs the

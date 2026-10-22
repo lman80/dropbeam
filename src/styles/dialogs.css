@@ -230,3 +230,9 @@ html:not(.mobile) .qrs-actions { padding-top: 16px; }
 /* Settings → Devices: what linking means (above) and what to do about a lost device (below). */
 .account-devices-note { margin: 8px 16px 0; font-size: var(--text-12); color: var(--text-muted); line-height: 1.45; text-wrap: pretty; }
 .account-devices-note.intro { margin: -2px 16px 10px; }
+
+/* ---- Find my safe speed (#20) ---- */
+.safe-speed { display: flex; flex-direction: column; gap: 10px; }
+.safe-speed p { margin: 0; line-height: 1.45; }
+.safe-speed-now { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+.safe-speed-title { margin: 0; font-size: var(--text-15); font-weight: 600; }

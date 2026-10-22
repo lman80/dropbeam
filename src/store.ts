@@ -106,6 +106,8 @@ const DEFAULT_SETTINGS: Settings = {
   playSounds: true,
   directMode: true,
   uploadLimitMbps: 0,
+  limitLocal: false,
+  protectRouter: false,
   showMegabits: false,
   requireDirect: false,
   waitForDirect: false,

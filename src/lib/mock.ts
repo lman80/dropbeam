@@ -51,6 +51,8 @@ let settings: Settings = {
   playSounds: true,
   directMode: false,
   uploadLimitMbps: 0,
+  limitLocal: false,
+  protectRouter: false,
   showMegabits: false,
   requireDirect: false,
   waitForDirect: false,
@@ -876,6 +878,17 @@ export const mockApi = {
   friendInvite: async (id: string): Promise<string> =>
     `dropbeamf1:MOCK${id}friendinvitewouldgohere0000`,
   myInviteCode: async (): Promise<string> => 'dropbeam:MOCKpersonalcodewouldgohere0000',
+  // Preview of "Find my safe speed" (#20): a short ramp that trips at 200 Mbps.
+  findSafeSpeed: async () => {
+    const wait = (ms: number) => new Promise(r => setTimeout(r, ms))
+    emit('safe-speed://progress', { phase: 'router' }); await wait(700)
+    emit('safe-speed://progress', { phase: 'device' }); await wait(700)
+    for (const [rate, health] of [[25, 'fine'], [50, 'fine'], [100, 'fine'], [150, 'strained'], [200, 'trouble']] as const) {
+      emit('safe-speed://progress', { phase: 'testing', rateMbps: rate, achievedMbps: rate - 2, health, routerMs: health === 'fine' ? 4 : 180, target: 'Ashton’s iPhone' }); await wait(900)
+    }
+    return { kind: 'limit' as const, safeMbps: 117, troubleMbps: 198, target: 'Ashton’s iPhone', local: true, routerMs: 3.2 }
+  },
+  cancelSafeSpeed: async () => {},
   addFriendByCode: async (code: string): Promise<Friend> => {
     const f: Friend = {
       id: `f${++counter}`,

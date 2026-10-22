@@ -17,6 +17,7 @@ import { MobileHeader } from '../components/MobileHeader'
 import { LocationSettings } from '../components/LocationSettings'
 import { TransferServerPane } from '../components/TransferServerSettings'
 import { InstallUpdateButton } from '../components/UpdateInstall'
+import { SafeSpeedDialog } from '../components/SafeSpeed'
 import { Dot, IconButton, InfoButton, ProgressBar, SectionHeader, Segmented, Spinner, Toggle } from '../components/ui'
 import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbackButton } from '../lib/feedback'
 
@@ -117,6 +118,7 @@ export function SettingsView() {
   const myEid = useStore((s) => s.myEid)
   const [showEidQr, setShowEidQr] = useState(false)
   const [scanOperator, setScanOperator] = useState(false)
+  const [safeSpeed, setSafeSpeed] = useState(false)
   const appVer = useStore((s) => s.appVer)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<string | null>(null)
@@ -469,9 +471,26 @@ export function SettingsView() {
 
       <SectionHeader>Speed</SectionHeader>
       <div className="group">
-        <Row title="Upload limit" sub="In Mbps. Local network transfers always run at full speed.">
+        <Row title="Upload limit" sub={settings.limitLocal ? 'In Mbps, for every send.' : 'In Mbps. Local network transfers run at full speed.'}>
           <UploadLimit value={settings.uploadLimitMbps || 0} onChange={(uploadLimitMbps) => save({ uploadLimitMbps })} />
         </Row>
+        <Row title="Find my safe speed" sub="Not sure what to pick? Test how fast your router can go without trouble.">
+          <button className="btn btn-secondary btn-sm" onClick={() => setSafeSpeed(true)}>Test…</button>
+          {safeSpeed && <SafeSpeedDialog onClose={() => setSafeSpeed(false)} />}
+        </Row>
+        <ToggleRow
+          title="Limit local network transfers too"
+          sub="Use this if your Wi‑Fi drops when you send to a device at home."
+          on={settings.limitLocal}
+          disabled={!settings.uploadLimitMbps}
+          onChange={(v) => save({ limitLocal: v })}
+        />
+        <ToggleRow
+          title="Protect my router"
+          sub="Watches your router while sending and slows down if it starts to struggle."
+          on={settings.protectRouter}
+          onChange={(v) => save({ protectRouter: v })}
+        />
         <ToggleRow
           title="Show speeds in megabits"
           sub="Mbps instead of MB/s, on this device."
@@ -878,7 +897,9 @@ function UpdateRow({ onVersionTap }: { onVersionTap?: () => void }) {
 /** Upload cap: presets as a segmented control, plus a custom value. 0 = off. */
 const UPLOAD_PRESETS = [0, 50, 100, 150, 300]
 function UploadLimit({ value, onChange }: { value: number; onChange: (mbps: number) => void }) {
-  const [custom, setCustom] = useState(!UPLOAD_PRESETS.includes(value))
+  const [customPicked, setCustom] = useState(!UPLOAD_PRESETS.includes(value))
+  // A value set elsewhere ("Find my safe speed" → 117) shows as Custom too.
+  const custom = customPicked || !UPLOAD_PRESETS.includes(value)
   const seg = custom ? 'custom' : String(value)
   return (
     <div className="set-upload">

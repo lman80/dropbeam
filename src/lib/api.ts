@@ -166,6 +166,10 @@ export interface Settings {
   directMode: boolean
   /** Cap internet upload speed (Mbps) to leave headroom; 0 = unlimited. */
   uploadLimitMbps: number
+  /** The upload limit applies on the local network too (#20). */
+  limitLocal: boolean
+  /** Watch the router while sending; slow down when it struggles (#20). */
+  protectRouter: boolean
   /** Show speeds in megabits/sec (Mbps) instead of megabytes/sec (MB/s). */
   showMegabits: boolean
   /** Only send over a direct path (local/p2p) — fail rather than use the relay. */
@@ -264,6 +268,11 @@ export interface HistoryItem {
 /** A successfully linked device; command and link wire fields use snake_case. */
 /** What the scanner shows before linking (S1): who, which way, and the
  *  safety code both screens must show before an account key moves. */
+/** What "Find my safe speed" found (#20). */
+export type SafeSpeedReport = ({ kind: 'limit'; safeMbps: number; troubleMbps: number } | { kind: 'noLimit'; topMbps: number }) & { target: string; local: boolean; routerMs: number }
+/** Live progress of the test. */
+export interface SafeSpeedProgress { phase: 'router' | 'device' | 'testing'; rateMbps?: number; achievedMbps?: number; health?: 'fine' | 'strained' | 'trouble'; routerMs?: number; target?: string }
+
 export interface LinkPreviewInfo { name: string; safety: string; direction: 'give' | 'take'; peerShowsCode: boolean
   /** Proof that the user went through the confirm step: hand it to linkDeviceSend. */
   confirmToken: string }
@@ -642,6 +651,9 @@ const realApi = {
     invoke<TransferUpdate>('send_to_friend', { id, paths, chatTransferId, chatAttempt, device: device ?? null }),
   /** Your permanent, reusable DropBeam code (stable device key + name). */
   myInviteCode: () => invoke<string>('my_invite_code'),
+  /** "Find my safe speed" (#20): a test send while the router is watched. */
+  findSafeSpeed: () => invoke<SafeSpeedReport>('find_safe_speed'),
+  cancelSafeSpeed: () => invoke<void>('cancel_safe_speed'),
   /** Add a friend from their permanent code; auto-fills their name, two-way. */
   addFriendByCode: (code: string) => invoke<Friend>('add_friend_by_code', { code }),
   /** macOS: a warning if the app is running from a spot that breaks folder
@@ -855,6 +867,16 @@ export interface ChatTyping {
 export function onChatTyping(cb: (t: ChatTyping) => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('chat://typing', (p) => cb(p as ChatTyping))
   return listen<ChatTyping>('chat://typing', (e) => cb(e.payload))
+}
+
+export function onSafeSpeedProgress(cb: (p: SafeSpeedProgress) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('safe-speed://progress', (p) => cb(p as SafeSpeedProgress))
+  return listen<SafeSpeedProgress>('safe-speed://progress', (e) => cb(e.payload))
+}
+/** "Protect my router" just capped sending (capMbps > 0) or lifted the cap (0). */
+export function onRouterGuard(cb: (capMbps: number) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('safe-speed://guard', (p) => cb((p as { capMbps: number }).capMbps))
+  return listen<{ capMbps: number }>('safe-speed://guard', (e) => cb(e.payload.capMbps))
 }
 
 export function onPairsChanged(cb: () => void): Promise<UnlistenFn> {
