@@ -161,3 +161,26 @@ and recorded (an agent that acts without a trace is a bug).
   calls instead of `taskkill`/`reg`/`attrib`. Admin steps re-launch DropBeam.exe itself with
   "runas" and one strictly-checked internal argument (`--background-task …`, `--fix-webdav`;
   elevate.rs); a unit test fails if a script host or system tool reappears in that code.
+- **Phase 1 (fixes):** #83 root cause was the first-run name screen marking you named even when
+  the save was refused while settings loaded (plus a stale invite code and a hello reply without
+  the name); #81 grouped devices only after each one's own hello — the hello reply now carries the
+  signed account proof and accepting a request keeps it. #84/#85 as planned (desktop + iOS).
+- **Phase 2 (Windows hosts):** as planned; every reparse point is refused (also hides OneDrive
+  placeholders), 8.3 short names can't reach `.dropbeam-*` (security fix). Added: **Keep running
+  when no one is signed in** for Windows (`background_host.rs`, a boot Scheduled Task running
+  `DropBeam.exe --server --config …` as the user via S4U, cross-session handover by stop file).
+- **Phase 6:** desktop only (iOS keeps its plain upload limit).
+- **Phase 7:** the Transfer Server was already complete; added the animated "your iPhone gets a
+  notification" guide. Owner-only: confirm push on a real iPhone.
+- **Security review** (after merge): exec re-checks permission every 2 s and stops when the asker
+  leaves; device linking/joining is window-only (an agent can't add a device to the account);
+  macOS drive is owner-only (0700); stranger exec refusals are rate-limited and not logged
+  verbatim; the CLI verifies it talks to the user's own DropBeam. Residual: any local process can
+  reach the macOS NFS port (nfsserve has no auth).
+- **Live tests (2026-10-22):** Mac ↔ Linux (ass-box, another network): friends added, Location
+  shared, browsed, 1 GB streamed with a matching sha256 (as fast as plain SSH on that link), the
+  drive auto-mounted in Finder, random reads matched, a file written on the Mac landed on Linux.
+  Windows (OptiPlex): the build ran headless from SSH, the CLI worked, `D:\` was shared as a
+  Location ("Storage (D:)" suggested) and the name became "Old Desktop" — then AVG deleted
+  DropBeam (first for the PowerShell behaviour, then `IDP.Generic` for every DropBeam build,
+  including the official 0.54.0). A Mac ↔ Windows streaming test could not be completed.
