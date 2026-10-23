@@ -416,8 +416,8 @@ async fn command(a: &Args) -> Result<i32, String> {
             if json_out { show(&json!(all)); return Ok(0); }
             for e in all {
                 let name = e["name"].as_str().unwrap_or("");
-                if e["isDir"] == true { println!("{:>10}  {:<16} {name}/", "", when(e["modified"].as_u64().unwrap_or(0) * 1000)); }
-                else { println!("{:>10}  {:<16} {name}", size(e["size"].as_u64().unwrap_or(0)), when(e["modified"].as_u64().unwrap_or(0) * 1000)); }
+                if e["isDir"] == true { println!("{:>10}  {:<16} {name}/", "", when(e["modified"].as_u64().unwrap_or(0))); }
+                else { println!("{:>10}  {:<16} {name}", size(e["size"].as_u64().unwrap_or(0)), when(e["modified"].as_u64().unwrap_or(0))); }
             }
         }
         "get" => {
