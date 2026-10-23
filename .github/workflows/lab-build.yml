@@ -1,0 +1,48 @@
+name: lab-build
+
+# Dev-only: builds the `dropbeam-lab` two-machine test driver (src-tauri/labtool)
+# for Windows x64 and uploads it as an artifact. Push any commit to the
+# `lab-build` branch to run it. Never builds installers, never touches Releases.
+on:
+  push:
+    branches: [lab-build]
+
+permissions:
+  contents: read
+
+jobs:
+  lab:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          key: lab-build
+
+      # The app library embeds the frontend at compile time, so dist/ must exist.
+      - run: npm ci
+      - run: npm run build
+
+      - name: Build dropbeam-lab
+        working-directory: src-tauri
+        run: cargo build --release -p dropbeam-lab
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dropbeam-lab-${{ matrix.platform }}
+          path: src-tauri/target/release/dropbeam-lab.exe
+          if-no-files-found: error
+          retention-days: 7

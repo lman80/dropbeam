@@ -9,7 +9,7 @@
 //!     prints `{"event":"ready","addr":"lab..."}` then one JSON line per
 //!     completed inbound transfer (files, rel paths, sha256s, bytes, ms).
 //!
-//! Sender:    dropbeam-lab send --to <labADDR> [--mode auto|direct|relay]
+//! Sender:    dropbeam-lab send --to <labADDR> [--mode auto|direct|relay|public|overlay]
 //!                [--suite quick|full|big] [--parallel on|off] [--dir <corpus>]
 //!     builds the corpus, runs each case over a fresh connection, prints one
 //!     JSON line per case with the local (expected) sha256s + throughput.
@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "usage:\n  dropbeam-lab serve [--dest <dir>] [--state <dir>]\n  dropbeam-lab send --to <labADDR> [--mode auto|direct|relay] [--suite quick|full|big|edge|many|mixed] [--only <case>] [--parallel on|off] [--profile] [--dir <corpus>]\n  dropbeam-lab results --to <labADDR>\n  dropbeam-lab info --to <labADDR>\n  dropbeam-lab push-update --to <labADDR> --bin <path>"
+                "usage:\n  dropbeam-lab serve [--dest <dir>] [--state <dir>]\n  dropbeam-lab send --to <labADDR> [--mode auto|direct|relay|public|overlay] [--suite quick|full|big|edge|many|mixed] [--only <case>] [--parallel on|off] [--profile] [--dir <corpus>]\n  dropbeam-lab results --to <labADDR>\n  dropbeam-lab info --to <labADDR>\n  dropbeam-lab push-update --to <labADDR> --bin <path>"
             );
             std::process::exit(2);
         }
@@ -141,6 +141,10 @@ async fn serve(args: &[String]) -> Result<()> {
                     s.write_all(&body).await?;
                     s.finish()?;
                     let _ = s.stopped().await;
+                    // Let the puller read everything and close first: dropping the
+                    // connection here raced its read ("connection lost") and aborted
+                    // whole send runs at the round-boundary reset.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
                     if req == b"reset" {
                         results.lock().unwrap().clear();
                         return Ok(json!({"event": "results-reset", "conn": idx}));
@@ -380,22 +384,38 @@ async fn send(args: &[String]) -> Result<()> {
     for case in &cases {
         if verify {
             // Round boundary: the next result on the receiver is this case's.
-            pull_results(&ep, &peer, true).await.context("reset receiver results")?;
+            let mut tries = 0;
+            loop {
+                match pull_results(&ep, &peer, true).await {
+                    Ok(_) => break,
+                    Err(_) if tries < 3 => { tries += 1; tokio::time::sleep(std::time::Duration::from_millis(300)).await; }
+                    Err(e) => return Err(e).context("reset receiver results"),
+                }
+            }
         }
-        let started = Instant::now();
+        // Hash the expected tree BEFORE starting the clock: hashing a big case
+        // used to land inside connectMs/ms (~1 s per 128 MiB) and understate speed.
         let (expected, exp_dirs) = labkit::expected_report(&case.paths)?;
+        let started = Instant::now();
         let expected_bytes: u64 = expected.iter().map(|f| f.size).sum();
         let result: Result<serde_json::Value> = async {
             let conn = ep
                 .connect(peer.clone(), labkit::ALPN)
                 .await
                 .context("dial peer")?;
+            // Connection setup (dial → QUIC handshake done) and time to the first
+            // confirmed payload byte, both from the case start.
+            let connect_ms = started.elapsed().as_millis() as u64;
+            let first_byte_ms = std::sync::atomic::AtomicU64::new(0);
             let path_start = labkit::conn_detail(&conn);
             let engaged = AtomicBool::new(false);
             // --profile: sample (elapsed_ms, bytes_confirmed) roughly every 2s so
             // a long transfer's rate-over-time shape is visible (decay vs sawtooth).
             let samples = Mutex::new(Vec::<(u64, u64)>::new());
-            let progress = |done, _| {
+            let progress = |done: u64, _| {
+                if done > 0 && first_byte_ms.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    first_byte_ms.store(started.elapsed().as_millis().max(1) as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 if profile {
                     let t = started.elapsed().as_millis() as u64;
                     let mut s = samples.lock().unwrap();
@@ -424,6 +444,8 @@ async fn send(args: &[String]) -> Result<()> {
                 "bytes": sent,
                 "ms": ms,
                 "mbps": (sent as f64 / (1024.0 * 1024.0)) / (ms as f64 / 1000.0),
+                "connectMs": connect_ms,
+                "firstByteMs": first_byte_ms.load(std::sync::atomic::Ordering::Relaxed),
                 "parallelEngaged": engaged.load(std::sync::atomic::Ordering::Relaxed),
                 // Path the QUIC connection was on at dial time vs after the
                 // transfer — shows relay→direct upgrades and hairpin routes.

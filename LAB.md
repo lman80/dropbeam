@@ -22,7 +22,7 @@ copies the lab code to the clipboard and shows friendly progress.
 **Sender** (driven by the runner on the first machine):
 
 ```
-dropbeam-lab send --to <labADDR> [--mode auto|direct|relay]
+dropbeam-lab send --to <labADDR> [--mode auto|direct|relay|public|overlay]
                   [--suite quick|full|big] [--parallel on|off] [--dir <corpus>]
 ```
 
@@ -46,8 +46,21 @@ expected hashes with the pulled receiver hashes, in connection order.
 The peer's advertised addresses are FILTERED before dialing: `direct` keeps
 only IP addrs, `relay` keeps only the relay URL (forces the initial dial + early
 bytes through the relay even on the same LAN), `auto` is production behavior.
-Note iroh may still hole-punch an upgrade mid-transfer in relay mode — exactly
+`public` / `overlay` keep only non-Tailscale / only Tailscale-style (100.64/10)
+IP addrs AND hide the other family from the sender's path selector, so a run
+measures DropBeam over the plain internet path vs over the overlay. Note iroh may still hole-punch an upgrade mid-transfer in relay mode — exactly
 like the shipping app; the first-case throughput is the relay-path signal.
+
+## A/B knobs and timings
+
+`sent` lines carry `connectMs` (dial → handshake done) and `firstByteMs` (first
+confirmed payload byte), both from the case start, which is AFTER the expected files
+are hashed. Lab-only env overrides (never set by the app) let one binary A/B the
+transport: `DROPBEAM_CC` (bbr|cubic|newreno), `DROPBEAM_INITIAL_WINDOW`,
+`DROPBEAM_ACK_THRESH` (n|off), `DROPBEAM_STREAM_WINDOW`, `DROPBEAM_SEND_WINDOW`,
+`DROPBEAM_LAN_STREAMS` / `DROPBEAM_NET_STREAMS` (1–4), `DROPBEAM_PATH_IDLE_MS`.
+Windows builds: push to the `lab-build` branch (`.github/workflows/lab-build.yml`).
+Results of the 2026-10-23 lab: docs/NETWORK-LAB-2026-10-23.md.
 
 ## Invariants
 
