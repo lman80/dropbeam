@@ -33,11 +33,33 @@ struct CallOverlay: View {
             if let call = calls.call {
                 if call.incoming && call.ringing && calls.ringInApp { IncomingCallCard(call: call) }
                 else if !(call.incoming && call.ringing) { InCallView(call: call) }
+            } else if let dial = calls.dialRequest {
+                DialConfirmCard(dial: dial)
             } else if let last = calls.last {
                 CallEndedCard(call: last)
             }
         }
         .animation(.spring(response: 0.3, dampingFraction: 0.9), value: calls.call?.id)
+    }
+}
+
+/// An agent asked to call: only a tap on Call opens the microphone/camera and rings.
+private struct DialConfirmCard: View {
+    let dial: CallCenter.DialRequest
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("Call \(dial.name)?").font(.title3.weight(.semibold))
+            Text(dial.video ? "Video call · asked by an agent · your camera turns on" : "Audio call · asked by an agent")
+                .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            HStack(spacing: 12) {
+                Button("Cancel", role: .cancel) { CallCenter.shared.cancelDial() }.buttonStyle(.bordered)
+                Button(dial.video ? "Video Call" : "Call") { CallCenter.shared.confirmDial() }.buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
+        .padding()
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 }
 

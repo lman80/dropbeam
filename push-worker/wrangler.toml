@@ -29,3 +29,9 @@ simple = { limit = 60, period = 60 }
 name = "RL_TOKEN"
 namespace_id = "7104"
 simple = { limit = 10, period = 60 }
+
+# /call: one VoIP push per (phone, call) a minute, across isolates of a location.
+[[ratelimits]]
+name = "RL_DEDUPE"
+namespace_id = "7105"
+simple = { limit = 1, period = 60 }

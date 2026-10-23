@@ -7,7 +7,7 @@ import {
 } from 'lucide-react'
 import { api } from '../lib/api'
 import {
-  acceptCall, answerRecordRequest, askToRecord, cameras, declineCall, hangup, offerTrackSwap, speakers,
+  acceptCall, answerRecordRequest, askToRecord, cameras, cancelDial, confirmDial, declineCall, hangup, offerTrackSwap, speakers,
   startCallEngine, stopRecording, switchCamera, toggleCamera, toggleMute, useCall, type CallSnapshot,
 } from '../lib/calls'
 import { useStore } from '../store'
@@ -71,6 +71,7 @@ export function CallHost() {
   const call = useCall((s) => s.call)
   const last = useCall((s) => s.last)
   const error = useCall((s) => s.error)
+  const dial = useCall((s) => s.dial)
   const toast = useStore((s) => s.toast)
 
   useEffect(() => startCallEngine(), [])
@@ -82,6 +83,7 @@ export function CallHost() {
 
   if (call && call.dir === 'in' && call.phase === 'ringing' && !call.autoAccept) return <Incoming call={call} />
   if (call) return <InCall call={call} />
+  if (dial) return <DialConfirm dial={dial} />
   if (last) return <Ended call={last} />
   return null
 }
@@ -108,6 +110,27 @@ function Incoming({ call }: { call: CallSnapshot }) {
         <button type="button" className="call-round call-decline" aria-label="Decline" onClick={declineCall} disabled={busy}><PhoneOff /></button>
         <button type="button" className="call-round call-accept" aria-label="Answer" onClick={() => void acceptCall()} disabled={busy} autoFocus>
           {call.video ? <Video /> : <Phone />}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/** An agent asked to call: only this click opens the microphone/camera and rings. */
+function DialConfirm({ dial }: { dial: { friendId: string; name: string; video: boolean } }) {
+  const busy = useCall((s) => s.busy)
+  const what = dial.video ? 'Video call' : 'Audio call'
+  return (
+    <div className="call-incoming" role="alertdialog" aria-modal="true" aria-label={`Call ${dial.name}?`}>
+      <Avatar person={dial.friendId} name={dial.name} size={64} />
+      <div className="call-incoming-text">
+        <div className="call-incoming-name">Call {dial.name}?</div>
+        <div className="call-incoming-sub">{what} · asked by an agent{dial.video ? ' · your camera turns on' : ''}</div>
+      </div>
+      <div className="call-incoming-actions">
+        <button type="button" className="call-round call-decline" aria-label="Cancel" title="Cancel" onClick={cancelDial} disabled={busy}><PhoneOff /></button>
+        <button type="button" className="call-round call-accept" aria-label={`Call (${what.toLowerCase()})`} title="Call" onClick={() => void confirmDial()} disabled={busy}>
+          {dial.video ? <Video /> : <Phone />}
         </button>
       </div>
     </div>

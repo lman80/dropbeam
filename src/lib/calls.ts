@@ -114,11 +114,14 @@ interface CallUi {
   busy: boolean
   /** Swap clean voice tracks after the call (both must tick it). */
   shareTracks: boolean
+  /** An agent asked to place a call (agent op calls.start): shown as "Call <name>?";
+   *  nothing rings and no microphone or camera opens until the person clicks Call. */
+  dial: { friendId: string; name: string; video: boolean } | null
 }
 
 export const useCall = create<CallUi>(() => ({
   call: null, last: null, local: null, remote: null, muted: false, cameraOn: false, remoteMuted: false, remoteCamera: null,
-  quality: null, recording: null, savedTo: null, error: null, busy: false, shareTracks: false,
+  quality: null, recording: null, savedTo: null, error: null, busy: false, shareTracks: false, dial: null,
 }))
 
 const set = useCall.setState
@@ -315,6 +318,14 @@ export async function acceptCall(): Promise<void> {
     set({ busy: false })
   }
 }
+
+/** The person clicked Call on an agent's "Call <name>?" — only now does media open. */
+export async function confirmDial(): Promise<void> {
+  const d = useCall.getState().dial
+  set({ dial: null })
+  if (d) await startCall(d.friendId, d.video).catch(() => {})
+}
+export function cancelDial() { set({ dial: null }) }
 
 export function declineCall() {
   const call = useCall.getState().call
@@ -557,7 +568,12 @@ export function startCallEngine(onEnded?: (c: CallSnapshot) => void): () => void
       else startRing(false)
     }),
     listen<{ callId: string; kind: string; sdp?: string; body?: Record<string, unknown> }>('call://signal', (e) => void onSignal(e.payload)),
-    listen<{ friendId: string; video: boolean }>('call://dial', (e) => { void startCall(e.payload.friendId, !!e.payload.video).catch(() => {}) }),
+    // An agent's calls.start: ask the person first (never startCall from here).
+    listen<{ friendId: string; name?: string; video: boolean }>('call://dial', (e) => {
+      const st = useCall.getState()
+      if (st.call && st.call.phase !== 'ended') return
+      set({ dial: { friendId: e.payload.friendId, name: e.payload.name || 'this friend', video: !!e.payload.video } })
+    }),
   ]
   // A call already in progress (the window reloaded): show its state.
   void api.status().then((s) => { if (s.call) set({ call: s.call }) }).catch(() => {})
@@ -596,7 +612,11 @@ async function onSignal(s: { callId: string; kind: string; sdp?: string; body?: 
   } else if (s.kind === 'call.media' && s.body) {
     set({ remoteMuted: !!s.body.muted, remoteCamera: !!s.body.camera })
   } else if (s.kind === 'call.record' && s.body?.action === 'deny') {
-    set({ error: `${useCall.getState().call?.name ?? 'They'} didn’t allow recording.` })
+    // Taken back mid-recording: the engine already closed the files and refuses
+    // more bytes; stop the recorders too.
+    const name = useCall.getState().call?.name ?? 'They'
+    if (recorders.length) { stopRecording(false); set({ error: `${name} stopped allowing recording. The recording so far is saved.` }) }
+    else set({ error: `${name} didn’t allow recording.` })
   }
 }
 

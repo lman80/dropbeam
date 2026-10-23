@@ -194,9 +194,15 @@ async function push(request, env) {
  * friend/own device in its hello), so only those devices can ring it, and none
  * of them can read the token. Only a wake-up goes through here: the call itself
  * travels over the iroh connection between the two devices.
+ * Who is calling: a plain `f` must be the verified signer (`caller`); a sealed
+ * `s` (opaque here) carries the caller's own signature, which the phone checks.
  * Limits (anti-spam ringing): per caller and per phone per minute (bindings
- * RL_SERVER/RL_TOKEN), an hourly per-phone budget, one push per (phone, call) a
- * minute (the caller redials every 2 s while it rings), then RL_GLOBAL.
+ * RL_SERVER/RL_TOKEN), one push per (phone, call) a minute (binding RL_DEDUPE;
+ * the caller redials every 2 s while it rings), then RL_GLOBAL. The hourly
+ * per-phone/per-caller budgets are per isolate (no KV / Durable Object bound —
+ * see the header): best effort, not a guarantee. Revocation is the phone's
+ * (wake.rs): a removed friend's sealed token expires, and the phone ends a push
+ * from a caller no longer in its contacts at once.
  */
 const CALLS_PER_PHONE_HOUR = 30
 const CALLS_PER_CALLER_HOUR = 60
@@ -230,12 +236,16 @@ async function call(request, env) {
   let p
   try { p = JSON.parse(b.payload) } catch { return json({ ok: false, reason: 'invalid' }, 400) }
   if (!p || p.c !== b.call) return json({ ok: false, reason: 'invalid' }, 400)
+  // A caller id in the clear must be the device that signed this request: no
+  // putting someone else's name on the phone's lock screen.
+  if (p.f != null && (typeof p.f !== 'string' || p.f.toLowerCase() !== b.caller.toLowerCase())) return json({ ok: false, reason: 'caller' }, 403)
   const out = { c: b.call, v: p.v === true }
   if (typeof p.s === 'string' && p.s.length <= 1024) out.s = p.s
-  else if (typeof p.f === 'string' && /^[0-9a-f]{64}$/i.test(p.f)) out.f = p.f
+  else if (typeof p.f === 'string' && /^[0-9a-f]{64}$/i.test(p.f)) out.f = p.f.toLowerCase()
   const phone = await sha256hex(tok.token.toLowerCase())
-  // The same call rings once per minute at most, whatever the redials do.
-  if (!bump(`d:${phone}:${b.call}:${Math.floor(Date.now() / 60_000)}`, 1)) return json({ ok: true, duplicate: true })
+  // The same call rings once per minute at most, whatever the redials do
+  // (per Cloudflare location through RL_DEDUPE; per isolate without it).
+  if (!(await allowOnce(env, `d:${phone}:${b.call}`))) return json({ ok: true, duplicate: true })
   if (!(await allowMinute(env, 'RL_SERVER', `c:${b.caller}`)) || !(await allowMinute(env, 'RL_TOKEN', `v:${phone}`))
     || !allowHour(`c:${b.caller}`, CALLS_PER_CALLER_HOUR) || !allowHour(`v:${phone}`, CALLS_PER_PHONE_HOUR)) {
     return json({ ok: false, reason: 'rate' }, 429)
@@ -358,6 +368,15 @@ function bump(bucket, max) {
 
 function allowHour(key, perHour) {
   return bump(`h:${key}:${Math.floor(Date.now() / 3_600_000)}`, perHour)
+}
+
+/** Once a minute per key: the RL_DEDUPE binding (limit 1 / 60 s), else per isolate. */
+async function allowOnce(env, key) {
+  const rl = env && env.RL_DEDUPE
+  if (rl && typeof rl.limit === 'function') {
+    try { return (await rl.limit({ key })).success } catch { /* fall back */ }
+  }
+  return bump(`${key}:${Math.floor(Date.now() / 60_000)}`, 1)
 }
 
 /** Per-minute limit through the `name` rate-limit binding (per Cloudflare

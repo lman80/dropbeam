@@ -10,11 +10,22 @@
 //! - The CALLER, when dialing a device fails, signs a `/call` request with its
 //!   endpoint key: sealed token + call id + a payload whose caller id is sealed
 //!   to the phone's notification key when known. The relay checks the signature
-//!   and the binding, rate-limits per phone, and asks APNs for a VoIP push.
+//!   and the binding (a plain caller id must be the signer), rate-limits per
+//!   phone, and asks APNs for a VoIP push.
+//! - The sealed caller id carries the caller's own signature over (call id,
+//!   caller): anyone may seal to the phone's public push key, so without it a
+//!   friend could put another friend's name on the lock screen. The phone shows
+//!   a name only for a verified caller in ITS contacts, and a call answered on
+//!   the lock screen before the engine had it connects only if the engine's call
+//!   comes from that same device (CallCenter.swift).
 //! - The phone reports the call to CallKit at once (iOS requires it), wakes the
 //!   engine and gets dialed again (calls/mod.rs redials every 2 s while it rings).
 //!   A caller who isn't a friend is refused by the engine as usual, and the
 //!   CallKit call ends.
+//! - Revocation: the sealed token lives TOKEN_TTL and is renewed by each hello.
+//!   A removed or blocked friend gets no new one, and the phone ends a push from
+//!   a caller no longer in its contacts at once (it can't stop the wake-up
+//!   itself until the token expires; the relay keeps no per-caller state).
 //! Without a configured relay (or VoIP token) calls ring only while the app runs.
 
 use std::collections::HashMap;
@@ -34,7 +45,8 @@ use crate::mailbox::{push, seal};
 /// The relay's call route (beside push::DEFAULT_URL's /push).
 pub const CALL_URL: &str = "https://dropbeam-push.ashton-mcp-worker.workers.dev/call";
 const BUNDLE: &str = "com.ashtonmiller.dropbeam";
-const TOKEN_TTL_MS: u64 = 90 * 24 * 3600 * 1000;
+/// Short enough that a removed friend's copy dies soon; hellos renew it.
+const TOKEN_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 const MAX_SEALED: usize = 2048;
 
 static LOCK: Mutex<()> = Mutex::new(());
@@ -162,10 +174,19 @@ pub fn signed_call(signer: &iroh::SecretKey, sealed: &str, call_id: &str, payloa
         "sig": seal::b64(&sig.to_bytes())})
 }
 
+/// What the caller signs inside the sealed part of a wake-up; the phone checks
+/// it with the caller's endpoint key (CallCenter.swift `verifiedCaller`).
+pub fn wake_sig_message(call_id: &str, caller: &str) -> Vec<u8> {
+    format!("dropbeam-call-wake-v1\n{call_id}\n{caller}").into_bytes()
+}
+
 /// What APNs and the relay see: the call id, audio/video and — sealed to the
-/// phone's notification key when we know it — who is calling.
-pub fn wake_payload(me: &str, call_id: &str, video: bool, push_key: Option<&[u8; 32]>) -> String {
-    let who = json!({"f": me}).to_string();
+/// phone's notification key when we know it, with our signature — who is
+/// calling. Plain, the relay itself checks it is the signer.
+pub fn wake_payload(signer: &iroh::SecretKey, call_id: &str, video: bool, push_key: Option<&[u8; 32]>) -> String {
+    let me = signer.public().to_string();
+    let sig = seal::b64(&signer.sign(&wake_sig_message(call_id, &me)).to_bytes());
+    let who = json!({"f": me, "c": call_id, "sig": sig}).to_string();
     let mut p = json!({"c": call_id, "v": video});
     match push_key.and_then(|k| seal::seal_small(k, who.as_bytes()).ok()) {
         Some(s) => p["s"] = json!(s),
@@ -180,7 +201,7 @@ pub async fn wake(state: &IrohState, endpoint: &str, call_id: &str, video: bool)
     let Some(sealed) = sealed_for(&config, endpoint) else { return false };
     let push_key = crate::mailbox::keys::peers(&config).get(endpoint)
         .and_then(|p| p.push_key.clone()).and_then(|k| seal::key32(&k).ok());
-    let payload = wake_payload(&ep.id().to_string(), call_id, video, push_key.as_ref());
+    let payload = wake_payload(ep.secret_key(), call_id, video, push_key.as_ref());
     let body = signed_call(ep.secret_key(), &sealed, call_id, &payload);
     let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(8)).build() else { return false };
     match client.post(CALL_URL).json(&body).send().await {
@@ -291,13 +312,22 @@ mod tests {
         // Not valid as a /push request (different domain string).
         let push_msg = push::request_message(body["caller"].as_str().unwrap(), "SEALED", "call-1", "{}", body["ts"].as_u64().unwrap());
         assert!(k.public().verify(&push_msg, &sig).is_err());
-        // Caller id sealed when the phone's key is known, plain otherwise.
+        // Caller id sealed when the phone's key is known (with the caller's
+        // signature over call id + caller), plain otherwise.
+        let me = k.public().to_string();
         let phone: [u8; 32] = rand::random();
-        let p: Value = serde_json::from_str(&wake_payload("me", "c1", true, Some(&seal::x25519_public(&phone)))).unwrap();
+        let p: Value = serde_json::from_str(&wake_payload(&k, "c1", true, Some(&seal::x25519_public(&phone)))).unwrap();
         assert!(p.get("f").is_none());
         let opened: Value = serde_json::from_slice(&seal::open_small(&phone, p["s"].as_str().unwrap()).unwrap()).unwrap();
-        assert_eq!(opened["f"], "me");
-        let p: Value = serde_json::from_str(&wake_payload("me", "c1", false, None)).unwrap();
-        assert_eq!((p["f"].as_str(), p["v"].as_bool(), p["c"].as_str()), (Some("me"), Some(false), Some("c1")));
+        assert_eq!((opened["f"].as_str(), opened["c"].as_str()), (Some(me.as_str()), Some("c1")));
+        let sig = seal::unb64(opened["sig"].as_str().unwrap()).unwrap();
+        let sig = iroh::Signature::from_bytes(&<[u8; 64]>::try_from(sig.as_slice()).unwrap());
+        assert!(k.public().verify(&wake_sig_message("c1", &me), &sig).is_ok());
+        // Bound to that call and that caller: no reuse for another call or name.
+        assert!(k.public().verify(&wake_sig_message("c2", &me), &sig).is_err());
+        let other = iroh::SecretKey::generate().public();
+        assert!(other.verify(&wake_sig_message("c1", &other.to_string()), &sig).is_err());
+        let p: Value = serde_json::from_str(&wake_payload(&k, "c1", false, None)).unwrap();
+        assert_eq!((p["f"].as_str(), p["v"].as_bool(), p["c"].as_str()), (Some(me.as_str()), Some(false), Some("c1")));
     }
 }

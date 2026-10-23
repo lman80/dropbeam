@@ -81,6 +81,10 @@ final class CallCenter: NSObject, ObservableObject {
     @Published var savedTo: String?
     /// I offered to swap clean voice tracks after the call.
     @Published private(set) var swapOffered = false
+    /// An agent asked to place a call (`call://dial`): "Call <name>?" — nothing
+    /// rings and no microphone or camera opens until the person taps Call.
+    struct DialRequest: Equatable { let friendId: String; let name: String; let video: Bool }
+    @Published private(set) var dialRequest: DialRequest?
     private var recorder: CallRecorder?
     private var recording: (recId: String, dir: String)?
     private var recordingCall: String?
@@ -160,8 +164,11 @@ final class CallCenter: NSObject, ObservableObject {
         case "call://state": if let c: CallSnapshot = decode(payload) { onState(c) }
         case "call://signal": onSignal(payload as? [String: Any] ?? [:])
         case "call://dial":
+            // An agent's calls.start: only asks; confirmDial() (a tap) places it.
             let p = payload as? [String: Any] ?? [:]
-            if let friend = p["friendId"] as? String { startCall(friendId: friend, video: p["video"] as? Bool ?? false) }
+            if let friend = p["friendId"] as? String, call == nil {
+                dialRequest = DialRequest(friendId: friend, name: p["name"] as? String ?? "this friend", video: p["video"] as? Bool ?? false)
+            }
         default: break
         }
     }
@@ -172,12 +179,20 @@ final class CallCenter: NSObject, ObservableObject {
         last = nil
         // Declined from the lock screen before the engine had the call.
         if declinedEarly.remove(c.id) != nil { Task { try? await bridge.action("callDecline", ["callId": c.id]) }; return }
+        let early = answerEarly.remove(c.id) != nil
+        let pushedBy = pushedFrom.removeValue(forKey: c.id)
         if let uuid = pushed.removeValue(forKey: c.id) {
-            // Already ringing from the push: name it properly.
-            uuids[c.id] = uuid
-            provider.reportCall(with: uuid, updated: update(for: c))
-            if answerEarly.remove(c.id) != nil { Task { await answer() } }
-            return
+            // Already ringing from the push. It goes on (and a lock-screen answer
+            // connects) only if the engine's call comes from the very device the
+            // verified push named — the engine has checked it is a friend or own
+            // device. Anything else: end that ring and ring this call afresh.
+            if let from = pushedBy, c.incoming, c.legs.first?.endpoint == from {
+                uuids[c.id] = uuid
+                provider.reportCall(with: uuid, updated: update(for: c))
+                if early { Task { await answer() } }
+                return
+            }
+            provider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
         }
         let uuid = UUID()
         uuids[c.id] = uuid
@@ -198,6 +213,8 @@ final class CallCenter: NSObject, ObservableObject {
     }
     /// Answered / declined on the lock screen while only the VoIP push had arrived.
     private var answerEarly: Set<String> = []
+    /// call id → the caller device a VoIP push named (verified, in my contacts).
+    private var pushedFrom: [String: String] = [:]
     private var declinedEarly: Set<String> = []
 
     private func update(for c: CallSnapshot) -> CXCallUpdate {
@@ -263,11 +280,20 @@ final class CallCenter: NSObject, ObservableObject {
             remoteMuted = body["muted"] as? Bool ?? false
             remoteCamera = body["camera"] as? Bool ?? false
         } else if kind == "call.record", body["action"] as? String == "deny" {
-            bridge.showToast("\(call?.name ?? "They") didn’t allow recording.")
+            // Taken back mid-recording: the engine closed it already; onState stops the recorder.
+            bridge.showToast(recorder != nil ? "\(call?.name ?? "They") stopped allowing recording. The recording so far is saved." : "\(call?.name ?? "They") didn’t allow recording.")
         }
     }
 
     // ── placing and answering ──
+
+    /// The person tapped Call on an agent's request.
+    func confirmDial() {
+        guard let d = dialRequest else { return }
+        dialRequest = nil
+        startCall(friendId: d.friendId, video: d.video)
+    }
+    func cancelDial() { dialRequest = nil }
 
     func startCall(friendId: String, video: Bool) {
         guard call == nil else { bridge.errorMessage = CallError.busy.localizedDescription; return }
@@ -710,7 +736,9 @@ extension CallCenter: PKPushRegistryDelegate {
         MainActor.assumeIsolated {
             let id = dict["c"] as? String ?? UUID().uuidString
             let video = dict["v"] as? Bool ?? false
-            let from = (dict["s"] as? String).flatMap(Self.openSealed)?["f"] as? String ?? dict["f"] as? String
+            // Sealed: the caller's own signature must check out (anyone can seal
+            // to my push key). Plain: the relay already bound it to the signer.
+            let from = dict["s"] is String ? (dict["s"] as? String).flatMap { Self.verifiedCaller($0, call: id) } : (dict["f"] as? String)?.lowercased()
             let names = Self.knownNames()
             let name = from.flatMap { names[$0] }
             // Already ringing for this call (the engine got there first)? Nothing to add.
@@ -720,6 +748,7 @@ extension CallCenter: PKPushRegistryDelegate {
             }
             let uuid = UUID()
             pushed[id] = uuid
+            if name != nil, let from { pushedFrom[id] = from }
             let u = CXCallUpdate()
             u.remoteHandle = CXHandle(type: .generic, value: from ?? "DropBeam")
             u.localizedCallerName = name ?? "DropBeam"
@@ -729,11 +758,13 @@ extension CallCenter: PKPushRegistryDelegate {
                 // Not one of this phone's friends or devices: never ring for it.
                 provider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
                 pushed.removeValue(forKey: id)
+                pushedFrom.removeValue(forKey: id)
                 return
             }
             // The caller redials every 2 s; if its call doesn't reach us soon, stop ringing.
             DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
                 let center = CallCenter.shared
+                center.pushedFrom.removeValue(forKey: id)
                 if let still = center.pushed.removeValue(forKey: id), center.call?.id != id {
                     center.provider.reportCall(with: still, endedAt: Date(), reason: .failed)
                 }
@@ -747,6 +778,29 @@ extension CallCenter: PKPushRegistryDelegate {
               let data = try? Data(contentsOf: url),
               let map = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { return [:] }
         return map
+    }
+
+    /// The caller in a sealed wake-up, only if its signature over (call id,
+    /// caller) checks out with that caller's endpoint key (calls/wake.rs).
+    private static func verifiedCaller(_ sealed: String, call: String) -> String? {
+        guard let inner = openSealed(sealed), let f = (inner["f"] as? String)?.lowercased(), inner["c"] as? String == call,
+              let sig = (inner["sig"] as? String).flatMap({ Data(base64Encoded: $0) }), let raw = hexData(f), raw.count == 32,
+              let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw),
+              key.isValidSignature(sig, for: Data("dropbeam-call-wake-v1\n\(call)\n\(f)".utf8)) else { return nil }
+        return f
+    }
+
+    private static func hexData(_ s: String) -> Data? {
+        guard s.count % 2 == 0, s.allSatisfy(\.isHexDigit) else { return nil }
+        var out = Data(capacity: s.count / 2)
+        var i = s.startIndex
+        while i < s.endIndex {
+            let j = s.index(i, offsetBy: 2)
+            guard let b = UInt8(s[i..<j], radix: 16) else { return nil }
+            out.append(b)
+            i = j
+        }
+        return out
     }
 
     /// Open `mailbox::seal::seal_small` (same as DropBeamNotify).

@@ -4,7 +4,8 @@
 //! `mod.rs` turns `Act`s into frames on each device's call stream.
 //!
 //! One call at a time per device. Glare (two people calling each other at the
-//! same moment) is settled in `glare_winner` before a second call is created.
+//! same moment) is settled in `glare_winner` (by endpoint id) before a second
+//! call is created.
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -55,7 +56,7 @@ pub enum End {
 pub enum LegState { Dialing, Ringing, Answered, Busy, Declined, Missed, Unavailable, Failed, Gone }
 
 impl LegState {
-    fn done(self) -> bool { !matches!(self, LegState::Dialing | LegState::Ringing | LegState::Answered) }
+    pub(crate) fn done(self) -> bool { !matches!(self, LegState::Dialing | LegState::Ringing | LegState::Answered) }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -291,10 +292,11 @@ impl Call {
     }
 }
 
-/// Two people called each other at the same moment. Both sides compare the
-/// two call ids the same way: the smaller id survives; the other call is
-/// dropped by its caller and the surviving one is answered automatically
-/// (each of them was trying to reach the other).
+/// Two people called each other at the same moment. Both sides compare the two
+/// devices' endpoint ids the same way: the call placed by the smaller one
+/// survives; the other call is dropped by its caller and the surviving one is
+/// answered automatically (each of them was trying to reach the other). Endpoint
+/// ids, not call ids: a caller picks its call id and could always "win".
 pub fn glare_winner<'a>(mine: &'a str, theirs: &'a str) -> &'a str {
     if mine < theirs { mine } else { theirs }
 }
@@ -455,6 +457,7 @@ mod tests {
 
     #[test]
     fn glare_is_settled_the_same_way_on_both_sides() {
+        // Endpoint ids (hex): the smaller device's call survives on both sides.
         assert_eq!(glare_winner("a1", "b2"), "a1");
         assert_eq!(glare_winner("b2", "a1"), "a1");
     }

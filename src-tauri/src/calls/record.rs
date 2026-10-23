@@ -5,11 +5,16 @@
 //! `call.record {action:"ask"}`, the other side answers `allow` or `deny`.
 //! `open` refuses until an `allow` arrived for THIS call, and the engine itself
 //! sends `started`/`stopped`, so the other side's "Recording" badge can't be
-//! skipped by a modified call screen on this side.
+//! skipped by a modified call screen on this side. A `deny` while recording
+//! (they took their yes back) closes the recording at once (`stopped`), and no
+//! more bytes are written to it. All of this binds honest DropBeam apps only: a
+//! modified app on the other side can record its own speaker output without
+//! asking, like any call app.
 //!
-//! Files land in `<Downloads>/DropBeam Calls/<date time> <name>/`: one file per
-//! voice (`Me.webm`, `<Name>.webm`), the mixed call (`Call.webm`, with video when
-//! there was any) and `call.json` saying who is in which file.
+//! Files land in `<Downloads>/DropBeam Calls/<date time> <name>/` under fixed
+//! names, whatever anyone is called: `Me.webm` (my voice), `Them - <Name>.webm`
+//! (theirs), `Call.webm` (mixed, with video when there was any; `.m4a` from an
+//! iPhone) and `call.json` saying who is in which file.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -73,22 +78,28 @@ struct Recording {
 }
 
 static RECS: Mutex<Option<HashMap<String, Recording>>> = Mutex::new(None);
-/// Recordings finished in the last while (rec id → folder, name): the iPhone
-/// encodes each track to a file and hands it over when it stops — which can be
-/// just after the call (and so the recording) ended.
-static RECENT: Mutex<Option<HashMap<String, (PathBuf, String, u64)>>> = Mutex::new(None);
+/// Recordings finished in the last while (rec id → folder, name, when, consent
+/// withdrawn): the iPhone encodes each track to a file and hands it over when it
+/// stops — which can be just after the call (and so the recording) ended.
+type Recent = (PathBuf, String, u64, bool);
+static RECENT: Mutex<Option<HashMap<String, Recent>>> = Mutex::new(None);
 const RECENT_MS: u64 = 10 * 60 * 1000;
 
-fn remember_recent(rec_id: &str, dir: &Path, name: &str) {
+fn remember_recent(rec_id: &str, dir: &Path, name: &str, revoked: bool) {
     let mut g = RECENT.lock().unwrap_or_else(|p| p.into_inner());
     let m = g.get_or_insert_with(HashMap::new);
     let now = super::now_ms();
-    m.retain(|_, (_, _, at)| now.saturating_sub(*at) < RECENT_MS);
-    m.insert(rec_id.to_string(), (dir.to_path_buf(), name.to_string(), now));
+    m.retain(|_, (_, _, at, _)| now.saturating_sub(*at) < RECENT_MS);
+    m.insert(rec_id.to_string(), (dir.to_path_buf(), name.to_string(), now, revoked));
 }
 
+fn recent(rec_id: &str) -> Option<Recent> {
+    RECENT.lock().unwrap_or_else(|p| p.into_inner()).as_ref().and_then(|m| m.get(rec_id)).cloned()
+}
+
+/// Fixed file names: a friend called "Me" or "Call" can't land in my track.
 fn track_file(track: &str, name: &str, ext: &str) -> String {
-    let label = match track { "me" => "Me".to_string(), "them" => safe_name(name), _ => "Call".to_string() };
+    let label = match track { "me" => "Me".to_string(), "them" => format!("Them - {}", safe_name(name)), _ => "Call".to_string() };
     format!("{label}.{ext}")
 }
 
@@ -130,16 +141,21 @@ pub fn open(calls: &Arc<Calls>, id: &str, download: &Path) -> Result<Value> {
     Ok(json!({ "recId": rec_id, "dir": dir }))
 }
 
-/// Append recorded bytes to one track: "me", "them" or "mixed".
-pub fn chunk(rec_id: &str, track: &str, ext: &str, bytes: &[u8]) -> Result<()> {
+/// Append recorded bytes to one track: "me", "them" or "mixed". Refused once
+/// the other person took their yes back.
+pub fn chunk(calls: &Calls, rec_id: &str, track: &str, ext: &str, bytes: &[u8]) -> Result<()> {
     anyhow::ensure!(matches!(track, "me" | "them" | "mixed"), "Unknown track.");
     anyhow::ensure!(matches!(ext, "webm" | "mp4" | "m4a" | "ogg"), "Unknown format.");
-    let late = with(|r| !r.contains_key(rec_id));
-    if late {
+    let call = with(|r| r.get(rec_id).map(|x| x.call_id.clone()));
+    if let Some(call) = call {
+        let allowed = calls.live.lock().unwrap().as_ref().filter(|l| l.call.id == call).is_none_or(|l| l.rec.they_allow);
+        anyhow::ensure!(allowed, "They haven't allowed recording.");
+    } else {
         // The call ended and closed the recording a moment before the screen's
-        // last chunks arrived: append them to the same files (for 10 minutes).
-        let (dir, name, _) = RECENT.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
-            .and_then(|m| m.get(rec_id)).cloned().context("This recording has stopped.")?;
+        // last chunks arrived: append them to the same files (for 10 minutes) —
+        // unless it closed because they took their yes back.
+        let (dir, name, _, revoked) = recent(rec_id).context("This recording has stopped.")?;
+        anyhow::ensure!(!revoked, "They stopped allowing recording.");
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(track_file(track, &name, ext)))?;
         f.write_all(bytes)?;
         return Ok(());
@@ -161,11 +177,10 @@ pub fn chunk(rec_id: &str, track: &str, ext: &str, bytes: &[u8]) -> Result<()> {
 pub fn close(calls: Option<&Arc<Calls>>, rec_id: &str) -> Result<Value> {
     let Some(rec) = with(|r| r.remove(rec_id)) else {
         // Already closed with the call: its folder is still the answer.
-        let g = RECENT.lock().unwrap_or_else(|p| p.into_inner());
-        let (dir, _, _) = g.as_ref().and_then(|m| m.get(rec_id)).cloned().context("This recording has stopped.")?;
+        let (dir, _, _, _) = recent(rec_id).context("This recording has stopped.")?;
         return Ok(json!({ "dir": dir }));
     };
-    remember_recent(rec_id, &rec.dir, &rec.name);
+    remember_recent(rec_id, &rec.dir, &rec.name, false);
     finish(calls, rec)
 }
 
@@ -185,8 +200,7 @@ pub fn import_file(rec_id: &str, track: &str, ext: &str, src: &Path) -> Result<V
     let (dir, name, open) = match open {
         Some((d, n)) => (d, n, true),
         None => {
-            let g = RECENT.lock().unwrap_or_else(|p| p.into_inner());
-            let (d, n, _) = g.as_ref().and_then(|m| m.get(rec_id)).cloned().context("This recording has stopped.")?;
+            let (d, n, _, _) = recent(rec_id).context("This recording has stopped.")?;
             (d, n, false)
         }
     };
@@ -234,15 +248,28 @@ fn finish(calls: Option<&Arc<Calls>>, rec: Recording) -> Result<Value> {
 
 fn rec_id_of(r: &Recording) -> String { r.rec_id.clone() }
 
-/// The call ended: close whatever is still recording for it.
-pub fn close_for_call(id: &str) {
-    let open: Vec<Recording> = with(|r| {
+fn take_for_call(id: &str) -> Vec<Recording> {
+    with(|r| {
         let keys: Vec<String> = r.iter().filter(|(_, x)| x.call_id == id).map(|(k, _)| k.clone()).collect();
         keys.into_iter().filter_map(|k| r.remove(&k)).collect()
-    });
-    for rec in open {
-        remember_recent(&rec_id_of(&rec), &rec.dir, &rec.name);
+    })
+}
+
+/// The call ended: close whatever is still recording for it.
+pub fn close_for_call(id: &str) {
+    for rec in take_for_call(id) {
+        remember_recent(&rec_id_of(&rec), &rec.dir, &rec.name, false);
         let _ = finish(None, rec);
+    }
+}
+
+/// They took their yes back mid-call: close my recording of call `id` now (the
+/// engine sends `stopped`, so both badges go off) and refuse any later bytes.
+/// What was recorded while they allowed it stays.
+pub fn revoke_for_call(calls: &Arc<Calls>, id: &str) {
+    for rec in take_for_call(id) {
+        remember_recent(&rec_id_of(&rec), &rec.dir, &rec.name, true);
+        let _ = finish(Some(calls), rec);
     }
 }
 
@@ -304,8 +331,8 @@ mod tests {
         std::fs::write(&them, b"aac").unwrap();
         import_file(&rec_id, "them", "m4a", &them).unwrap();
         let meta: Value = serde_json::from_slice(&std::fs::read(dir.join("call.json")).unwrap()).unwrap();
-        assert_eq!(meta["tracks"]["them"]["file"], "Bea.m4a");
-        assert_eq!(std::fs::read(dir.join("Bea.m4a")).unwrap(), b"aac");
+        assert_eq!(meta["tracks"]["them"]["file"], "Them - Bea.m4a");
+        assert_eq!(std::fs::read(dir.join("Them - Bea.m4a")).unwrap(), b"aac");
         // Only the app's own temp recordings are taken.
         let other = tmp.join(format!("notes-{}.m4a", rand::random::<u32>()));
         std::fs::write(&other, b"x").unwrap();
@@ -314,6 +341,21 @@ mod tests {
         assert!(import_file("nope", "mixed", "m4a", &other).is_err());
         let _ = std::fs::remove_file(&other);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn track_files_have_fixed_names_whatever_the_friend_is_called() {
+        for name in ["Me", "Call", "me", "Them", "../Me", ""] {
+            let files: Vec<String> = ["me", "them", "mixed"].iter().map(|t| track_file(t, name, "webm")).collect();
+            assert_eq!(files[0], "Me.webm");
+            assert_eq!(files[2], "Call.webm");
+            assert!(files[1].starts_with("Them - ") && !files[1].contains('/'), "{files:?}");
+            let mut uniq = files.clone();
+            uniq.sort();
+            uniq.dedup();
+            assert_eq!(uniq.len(), 3, "{name}: {files:?}");
+        }
+        assert_eq!(track_file("them", "Bea", "m4a"), "Them - Bea.m4a");
     }
 
     #[test]

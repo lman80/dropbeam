@@ -60,7 +60,7 @@ stays open as the call's line. Frames:
 | `call.unavailable {reason?}` | not reachable for calls (`unsupported`: this device can't take calls) |
 | `call.cancel` | caller stopped before an answer |
 | `call.taken` | another of your devices answered — stop ringing |
-| `call.glare` | we are calling you at this moment and our call wins |
+| `call.glare` | we are calling you at this moment and our call wins (honoured only on your own ringing call to that device, and only if the rule below agrees) |
 | `call.hangup` | end |
 | `call.media {muted, camera}` · `call.record {action}` · `call.sdp` | mid-call |
 
@@ -68,8 +68,15 @@ stays open as the call's line. Frames:
   missed call.
 - **Several devices ring; the first to answer wins** — the others get `call.taken`
   (no history line on them). A decline on any device ends the call for all.
-- **Glare** (both call each other at once): both sides compare the two call ids; the
-  smaller one survives and is answered automatically on the other side.
+- **Glare** (both call each other at once): both sides compare the two devices'
+  endpoint ids (never the call ids — a caller picks those); the call placed by the
+  smaller one survives and is answered automatically on the other side. That is the
+  only call ever answered without a tap, and only while my own call to that very
+  device is still ringing: a `call.glare` on a call *they* placed, after an answer, or
+  claiming a win the rule denies is ignored, and nothing is remembered for a later call
+  (my call waits at most 10 s for theirs). The auto-answered call is never more than
+  either side was calling with: video only if both called with video (`video =
+  theirs && mine`), so my audio call never turns my camera on.
 - **Timeouts**: callee rings 45 s; caller gives up at 50 s; answered calls must get
   media flowing within 30 s.
 - **Non-trickle ICE**: each side waits for gathering to complete (fast — the only
@@ -107,9 +114,11 @@ stays open as the call's line. Frames:
 - **Connections carrying a call are never rotated** by the friend-connection
   housekeeping (`iroh_net::cached_friend_conn`).
 - Agents (`agent_ops.rs`): `calls.status`, `calls.history`, `calls.recordings` (read),
-  `calls.start` (rings from this computer's call screen; someone must be there to
-  talk) and `calls.hangup`. Answering, recording and the WebRTC plumbing are
-  person-only (EXCLUDED with reasons).
+  `calls.start` and `calls.hangup`. `calls.start` only *asks*: the call screen opens
+  with "Call <name>? (audio/video) — Call / Cancel" (`call://dial` carries
+  `confirm: true`); nothing rings and no microphone or camera opens until a person
+  clicks Call. Answering, recording and the WebRTC plumbing are person-only (EXCLUDED
+  with reasons).
 
 ## Recording (on the device, with consent)
 
@@ -118,11 +127,18 @@ stays open as the call's line. Frames:
 - `call_record_open` is refused until an `allow` for this call arrived. The **engine**
   (not the screen) sends `started`/`stopped`, so the other side's red "Recording"
   badge can't be skipped by a modified call screen on the recorder's side.
+- **Taking it back**: a `deny` while recording closes the recording at once (the engine
+  sends `stopped`, both badges go off) and the engine refuses every later chunk; what
+  was recorded while they allowed it stays.
+- **What this does and doesn't protect**: consent and the badge bind *honest* DropBeam
+  apps only. A modified app (or any screen recorder) on the other side can record what
+  it plays and captures without asking, as with any call app. They stop an unmodified
+  DropBeam from recording you without your yes, and tell you when it does.
 - Desktop: MediaRecorder writes three files to
-  `<Downloads>/DropBeam Calls/<date time> <Name>/`: `Me.webm` (your voice),
-  `<Name>.webm` (their voice), `Call.webm` (both voices mixed, with their video when
-  there was any) and `call.json` (participants, start/end, which file is whose).
-  Nothing is uploaded anywhere.
+  `<Downloads>/DropBeam Calls/<date time> <Name>/` under fixed names, whatever the
+  friend is called: `Me.webm` (your voice), `Them - <Name>.webm` (their voice),
+  `Call.webm` (both voices mixed, with their video when there was any) and `call.json`
+  (participants, start/end, which file is whose). Nothing is uploaded anywhere.
 - **Swap clean tracks** (for AI notes): while recording, either side can offer to swap;
   when both agreed (`call.record {action:"share"}` both ways), after the call each side
   sends its own `Me` track to the other through the normal verified file transfer, so
@@ -131,7 +147,7 @@ stays open as the call's line. Frames:
   voice-processing audio unit itself (a custom WebRTC audio device on the same unit
   WebRTC's built-in device uses). A recording gets your voice after echo cancellation
   (silent while muted) and exactly what plays from the other side. Each voice and the
-  mixed call are encoded on the phone as AAC (`Me.m4a`, `<Name>.m4a`, `Call.m4a`). When
+  mixed call are encoded on the phone as AAC (`Me.m4a`, `Them - <Name>.m4a`, `Call.m4a`). When
   recording stops or the call ends, they move into Documents/DropBeam Calls/<date> <name>/
   next to `call.json`, which shows in the Files app under DropBeam. The engine accepts
   the files for 10 minutes after the call closed the recording, and only from the app's
@@ -209,6 +225,28 @@ engine starts and the caller — redialing every 2 s while it rings — reaches 
 the wake-up uses the relay; the call itself always runs over iroh. Without a
 configured relay or VoIP token, calls ring only while DropBeam runs.
 
+Who the lock screen names, and what a lock-screen answer connects to:
+
+- The sealed part is `{f: caller, c: call id, sig}`, `sig` = the caller's Ed25519
+  signature (its endpoint key) over `"dropbeam-call-wake-v1\n" + c + "\n" + f`. The
+  phone's push key is public to every friend, so without the signature one friend
+  could seal another friend's id. The phone shows a name only when the signature
+  checks, `c` is this push's call id and `f` is in its contacts; otherwise the CallKit
+  call ends at once. A plain `f` (no push key known yet) must equal the request's
+  verified signer — the relay refuses anything else.
+- A call answered on the lock screen before the engine had it connects only if the
+  engine's call comes from that same device `f` (the engine has checked it is a friend
+  or own device). A different caller ends that ring and rings normally.
+- Limits: per-minute limits and the one-push-per-call dedupe use Cloudflare
+  rate-limit bindings (`RL_SERVER`, `RL_TOKEN`, `RL_DEDUPE`, `RL_GLOBAL`; per
+  Cloudflare location). The hourly budgets are per isolate (best effort): the relay
+  deliberately has no KV or Durable Object (a KV write quota anyone can exhaust would
+  be a kill switch).
+- Revocation: the sealed token expires after 30 days and each hello renews it; a
+  removed or blocked friend gets no new hellos, and until their copy expires a push
+  from them only wakes the phone for a CallKit report that ends at once (they are no
+  longer in its contacts). The relay keeps no per-caller revocation list.
+
 **Owner-only steps**: (1) docs/PUSH-SETUP.md steps 1–4 if not done (the APNs auth key
 also covers VoIP pushes; no separate VoIP certificate); (2) `cd push-worker && wrangler
 deploy` (no new secrets); (3) the "Voice over IP" background mode is in the app's
@@ -227,7 +265,11 @@ with real endpoints and the real accept loop: a friend call that rings, answers,
 carries media through both TURN bridges as datagrams (including a fragmented 3 KB
 packet), passes mid-call frames, hangs up and logs both sides; strangers and blocked
 people can't ring; a device without WebRTC says so; busy/decline/missed; rate limit;
-two devices of one person (first answer wins, the other stops); glare.
+two devices of one person (first answer wins, the other stops); glare (settled by
+endpoint id, no audio→video upgrade); a forged `call.glare` on the caller's own call
+answers nothing; `call.glare` is ignored unless my ringing call to that device loses;
+taking recording consent back stops the recording and refuses later chunks; fixed
+recording file names; an agent's dial only asks.
 
 `calls::lab_tests` (`#[ignore]`, needs Chrome): real WebRTC in headless Chrome with fake
 camera/mic, two peer connections each limited to its own bridge, bridges joined by a

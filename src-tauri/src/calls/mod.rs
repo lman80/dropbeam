@@ -50,6 +50,8 @@ const RING_PER_MINUTE: usize = 5;
 const RING_PER_HOUR: usize = 30;
 /// Mid-call frames the two call screens exchange through the engine.
 const PASS_KINDS: &[&str] = &["call.media", "call.record", "call.sdp"];
+/// After a `call.glare` our own call keeps ringing this long for theirs to arrive.
+const GLARE_WAIT: Duration = Duration::from_secs(10);
 /// Shown when this device's call screen can't do WebRTC.
 pub const UNSUPPORTED: &str = "Calls need a newer system web view on this computer (WebRTC isn’t available here).";
 
@@ -97,6 +99,10 @@ struct Live {
     auto_accept: bool,
     /// Glare loser: ended without a history line.
     silent: bool,
+    /// Our outgoing call lost the glare to this device of theirs (it said
+    /// `call.glare` and the rule agrees): kept ringing until its call arrives —
+    /// the only call answered without a tap — or GLARE_WAIT passes.
+    glare_wait: Option<(String, Instant)>,
     unsupported: bool,
     rec: record::Consent,
 }
@@ -106,9 +112,8 @@ pub struct Calls {
     live: Mutex<Option<Live>>,
     last: Mutex<Option<Value>>,
     rate: Mutex<HashMap<String, VecDeque<Instant>>>,
-    /// We dropped our call to this person because theirs to us won the glare:
-    /// their call, arriving in a moment, is answered automatically.
-    glare: Mutex<Option<(String, Instant)>>,
+    /// This device's endpoint id: glare is settled by comparing endpoint ids.
+    me: OnceLock<String>,
     /// The call screen can do WebRTC here (reported by the UI; false until then).
     capable: std::sync::atomic::AtomicBool,
     app: OnceLock<AppHandle>,
@@ -123,6 +128,7 @@ impl Calls {
     fn bind(&self, state: &IrohState) {
         if let Some(app) = state.app.get() { let _ = self.app.set(app.clone()); }
         if let Ok(c) = crate::iroh_net::location_config(state) { let _ = self.config.set(c); }
+        if let Some(ep) = state.get() { let _ = self.me.set(ep.id().to_string()); }
     }
 
     fn emit(&self, event: &str, payload: Value) {
@@ -272,7 +278,7 @@ pub async fn start(state: &IrohState, friend_id: &str, video: bool) -> Result<Va
     let mut guard = calls.live.lock().unwrap();
     anyhow::ensure!(guard.is_none(), "You're already in a call.");
     let l = Live { call: Call::outgoing(&id, &owner.id, video, &eps, now_ms()), tag, user, pass, bridge: Some(bridge),
-        name: owner.name.clone(), offer: None, legs: HashMap::new(), auto_accept: false, silent: false, unsupported: false, rec: Default::default() };
+        name: owner.name.clone(), offer: None, legs: HashMap::new(), auto_accept: false, silent: false, glare_wait: None, unsupported: false, rec: Default::default() };
     let out = json!({ "callId": id, "turn": turn_info(&l), "call": Calls::snapshot(&l) });
     calls.emit("call://state", Calls::snapshot(&l));
     *guard = Some(l);
@@ -345,7 +351,10 @@ async fn run_leg(calls: Arc<Calls>, id: String, ep: String, conn: Connection, mu
         return;
     }
     pump(&calls, &id, &ep, &mut send, &mut recv, rx).await;
-    calls.apply(&id, Ev::Lost(ep));
+    // A device that said `call.glare` closes its stream: its own call is coming,
+    // so the leg waits (the ticker ends it after GLARE_WAIT).
+    let waiting = calls.live.lock().unwrap().as_ref().is_some_and(|l| l.call.id == id && l.glare_wait.as_ref().is_some_and(|(e, _)| *e == ep));
+    if !waiting { calls.apply(&id, Ev::Lost(ep)); }
 }
 
 async fn pump(calls: &Arc<Calls>, id: &str, ep: &str, send: &mut SendStream, recv: &mut RecvStream, mut rx: mpsc::UnboundedReceiver<Option<Value>>) {
@@ -381,11 +390,18 @@ fn on_frame(calls: &Arc<Calls>, id: &str, ep: &str, frame: Value) {
             ev(Ev::Unavailable)
         }
         "call.glare" => {
-            // They're calling us at this very moment and their call wins.
+            // "I'm calling you at this very moment and my call wins." Honoured only
+            // on OUR ringing call to that very device, and only when the rule both
+            // sides apply (endpoint ids, which neither side picks per call) says
+            // theirs wins. On a call they placed, after an answer, or claiming a
+            // win the rule denies, it is no glare at all.
             let mut g = calls.live.lock().unwrap();
-            if let Some(l) = g.as_mut().filter(|l| l.call.id == id) {
-                l.silent = true;
-                *calls.glare.lock().unwrap() = Some((l.call.person.clone(), Instant::now()));
+            let Some(l) = g.as_mut().filter(|l| l.call.id == id && l.call.dir == Dir::Out) else { return };
+            let ringing = l.call.phase == Phase::Ringing && l.call.legs.iter().any(|x| x.endpoint == ep && !x.state.done());
+            if !ringing { return; }
+            if calls.me.get().is_some_and(|me| signal::glare_winner(me, ep) == ep) {
+                l.glare_wait = Some((ep.to_string(), Instant::now()));
+                return;
             }
             drop(g);
             ev(Ev::Unavailable)
@@ -441,6 +457,8 @@ fn note_record(calls: &Arc<Calls>, id: &str, body: &Value, from_me: bool) {
         let snap = Calls::snapshot(l);
         drop(guard);
         calls.emit("call://state", snap);
+        // They took their yes back: my recording stops now, not when my screen agrees.
+        if !from_me && body["action"] == "deny" { record::revoke_for_call(calls, id); }
     }
 }
 
@@ -448,8 +466,16 @@ fn spawn_ticker(calls: Arc<Calls>, id: String) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let alive = calls.live.lock().unwrap().as_ref().is_some_and(|l| l.call.id == id);
+            let (alive, expired) = {
+                let mut g = calls.live.lock().unwrap();
+                match g.as_mut().filter(|l| l.call.id == id) {
+                    Some(l) => (true, l.glare_wait.take_if(|(_, t)| t.elapsed() > GLARE_WAIT).map(|(ep, _)| ep)),
+                    None => (false, None),
+                }
+            };
             if !alive { break; }
+            // Their call never came after `call.glare`: that device is out.
+            if let Some(ep) = expired { calls.apply(&id, Ev::Unavailable(ep)); }
             calls.apply(&id, Ev::Tick(now_ms()));
         }
     });
@@ -488,25 +514,31 @@ pub(crate) async fn serve_offer(conn: &Connection, send: &mut SendStream, recv: 
         let _ = send.finish();
         return Ok(());
     }
-    let video = req["video"].as_bool().unwrap_or(false);
-    // Busy, or both calling each other at once?
-    enum Seen { Free, Glare(String), Lost, Busy }
+    let mut video = req["video"].as_bool().unwrap_or(false);
+    // Busy, or both calling each other at once? Glare only while our own call is
+    // ringing THIS device; the call placed by the device with the smaller
+    // endpoint id survives (both sides compute the same, and neither picks it
+    // per call — call ids are the caller's to choose).
+    enum Seen { Free, Glare(String, bool), Lost, Busy }
     let seen = {
         let guard = calls.live.lock().unwrap();
-        match guard.as_ref() {
-            None => Seen::Free,
-            Some(l) if l.call.dir == Dir::Out && l.call.person == friend.id && l.call.phase == Phase::Ringing =>
-                if signal::glare_winner(&l.call.id, &id) == id { Seen::Glare(l.call.id.clone()) } else { Seen::Lost },
-            Some(_) => Seen::Busy,
+        match (guard.as_ref(), calls.me.get()) {
+            (None, _) => Seen::Free,
+            (Some(l), Some(me)) if l.call.dir == Dir::Out && l.call.person == friend.id && l.call.phase == Phase::Ringing
+                && l.call.legs.iter().any(|x| x.endpoint == who && !x.state.done()) =>
+                if signal::glare_winner(me, &who) == who { Seen::Glare(l.call.id.clone(), l.call.video) } else { Seen::Lost },
+            (Some(_), _) => Seen::Busy,
         }
     };
     let lab_answer = lab_flags().is_some_and(|l| l["autoAnswer"] == true);
     let (auto_accept, glare_cancel) = match seen {
-        Seen::Free => {
-            let recent = calls.glare.lock().unwrap().take();
-            (lab_answer || recent.is_some_and(|(p, t)| p == friend.id && t.elapsed() < Duration::from_secs(10)), None)
+        Seen::Free => (lab_answer, None),
+        Seen::Glare(mine, my_video) => {
+            // Answered without a tap: never with more than I was calling with
+            // (my audio call never turns my camera on).
+            video &= my_video;
+            (true, Some(mine))
         }
-        Seen::Glare(mine) => (true, Some(mine)),
         Seen::Lost => {
             // Our own call to them wins; they drop theirs when ours arrives.
             write_frame(send, &refuse("call.glare")).await?;
@@ -519,7 +551,7 @@ pub(crate) async fn serve_offer(conn: &Connection, send: &mut SendStream, recv: 
             let (mut missed, _) = Call::incoming(&id, &friend.id, video, &who, now_ms());
             missed.on(Ev::Canceled(who.clone()), now_ms());
             calls.record_history(&Live { call: missed, tag, user: String::new(), pass: String::new(), bridge: None,
-                name: friend.name.clone(), offer: None, legs: HashMap::new(), auto_accept: false, silent: false, unsupported: false, rec: Default::default() });
+                name: friend.name.clone(), offer: None, legs: HashMap::new(), auto_accept: false, silent: false, glare_wait: None, unsupported: false, rec: Default::default() });
             return Ok(());
         }
     };
@@ -538,7 +570,7 @@ pub(crate) async fn serve_offer(conn: &Connection, send: &mut SendStream, recv: 
         let mut legs = HashMap::new();
         legs.insert(who.clone(), LegIo { tx: tx.clone(), conn: conn.clone() });
         let l = Live { call, tag, user, pass, bridge: Some(bridge), name: friend.name.clone(), offer: Some(offer), legs,
-            auto_accept, silent: false, unsupported: false, rec: Default::default() };
+            auto_accept, silent: false, glare_wait: None, unsupported: false, rec: Default::default() };
         for a in acts { if let Act::Send(_, f) = a { let _ = tx.send(Some(f)); } }
         let snap = Calls::snapshot(&l);
         *guard = Some(l);

@@ -80,11 +80,11 @@ pub fn call_record_open(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: I
 
 /// Recorded bytes (raw body) for one track; headers x-rec-id, x-track, x-ext.
 #[tauri::command]
-pub fn call_record_chunk(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+pub fn call_record_chunk(iroh: Iroh<'_>, request: tauri::ipc::Request<'_>) -> Result<(), String> {
     let h = |k: &str| request.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else { return Err("Expected recorded bytes.".into()) };
     if bytes.len() > 32 << 20 { return Err("Chunk too large.".into()); }
-    super::record::chunk(&h("x-rec-id"), &h("x-track"), &h("x-ext"), bytes).map_err(e)
+    super::record::chunk(&super::calls_of(&iroh), &h("x-rec-id"), &h("x-track"), &h("x-ext"), bytes).map_err(e)
 }
 
 /// iOS: a finished track file the phone encoded (in its temp folder) joins the

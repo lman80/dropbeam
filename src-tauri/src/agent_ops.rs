@@ -380,9 +380,9 @@ fn catalog() -> Vec<OpSpec> {
             .out("[{friendId, name, at, outgoing, video, outcome, durationMs, text}]").cmds(&["call_history"]).build(),
         op("calls.recordings", Read, "Call recordings saved on this device (made with both people's agreement), newest first, with which file holds whose voice.")
             .out("[{dir, meta: {with, startedAt, endedAt, tracks}}]").cmds(&["call_recordings"]).build(),
-        op("calls.start", Write, "Ring a friend (all their devices) from this computer's call screen. It rings in their DropBeam like any call and they decide whether to answer; a person has to be at this computer to talk. Recording is never started by an agent.")
+        op("calls.start", Write, "Ask the person at this computer to call a friend: the call screen opens with \"Call <name>? (audio/video) — Call / Cancel\". Nothing rings and no microphone or camera opens until they click Call; then it rings all the friend's devices like any call. Recording is never started by an agent.")
             .req("who", S, WHO).opt("video", B, "Video call (default: audio only).").dry()
-            .out("{ringing: true}").promise("Opens the call screen here and rings them; nothing is recorded. Recorded in the agent activity log.").build(),
+            .out("{confirming: true}").promise("Shows a call confirmation here; only a person's click places the call. Recorded in the agent activity log.").build(),
         op("calls.hangup", Write, "End the current call, or stop it ringing (an incoming call is declined).")
             .out("{ended: true}").cmds(&["call_hangup", "call_decline"]).build(),
 
@@ -399,7 +399,7 @@ fn catalog() -> Vec<OpSpec> {
 /// (an agent must not be able to widen its own access) stay human-only.
 pub const EXCLUDED: &[(&str, &str)] = &[
     ("call_capable", "the call screen reports whether its web view can do WebRTC"),
-    ("call_start", "call screen WebRTC plumbing (calls.start asks the window to place the call)"),
+    ("call_start", "call screen WebRTC plumbing (calls.start only asks the person, who clicks Call)"),
     ("call_offer", "call screen WebRTC plumbing"),
     ("call_accept", "answering is the person's decision on their call screen"),
     ("call_answer", "answering is the person's decision on their call screen"),
@@ -577,6 +577,12 @@ pub(crate) fn resolve(dir: &Path, who: &str) -> Result<Friend, OpError> {
 }
 
 /// The id of the conversation a person's messages live under.
+/// What `calls.start` asks the call screen: a confirmation to show, never a call
+/// to place (`confirm` is always set; the screens start media only on a click).
+fn dial_request(friend_id: &str, name: &str, video: bool) -> Value {
+    json!({"friendId": friend_id, "name": name, "video": video, "confirm": true, "fromAgent": true})
+}
+
 fn thread_id(dir: &Path, f: &Friend) -> String {
     friends::thread_owner(dir, &f.id).map(|o| o.id).unwrap_or_else(|| f.id.clone())
 }
@@ -716,11 +722,12 @@ pub async fn run(app: &AppHandle, name: &str, i: &Value, ctx: &Ctx) -> R {
             let iroh = app.state::<Arc<crate::iroh_net::IrohState>>();
             if !crate::calls::calls_of(&iroh).capable() { return Err(failed(crate::calls::UNSUPPORTED)); }
             if crate::calls::calls_of(&iroh).status()["call"].is_object() { return Err(failed("Already in a call.")); }
-            // The window places it: WebRTC (camera, microphone) lives on the call screen.
+            // The window asks the person: only their click opens the microphone or
+            // camera and rings (WebRTC lives on the call screen).
             #[cfg(desktop)]
             crate::show_main_window(app);
-            app.emit_to("main", "call://dial", json!({"friendId": thread_id(&dir, &f), "video": video})).map_err(failed)?;
-            Ok(json!({"ringing": true, "who": f.name, "video": video}))
+            app.emit_to("main", "call://dial", dial_request(&thread_id(&dir, &f), &f.name, video)).map_err(failed)?;
+            Ok(json!({"confirming": true, "who": f.name, "video": video}))
         }
         "calls.hangup" => {
             let iroh = app.state::<Arc<crate::iroh_net::IrohState>>();
@@ -1035,6 +1042,19 @@ pub fn summarize(name: &str, i: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_dial_only_asks_the_person() {
+        let d = dial_request("f1", "Bea", true);
+        assert_eq!(d["confirm"], true);
+        assert_eq!(d["fromAgent"], true);
+        assert_eq!((d["name"].as_str(), d["video"].as_bool()), (Some("Bea"), Some(true)));
+        // The op can't open media itself: answering, offering and recording stay human-only.
+        for c in ["call_start", "call_offer", "call_accept", "call_answer", "call_record_open"] {
+            assert!(EXCLUDED.iter().any(|e| e.0 == c), "{c}");
+            assert!(!CATALOG.iter().any(|o| o.commands.contains(&c)), "{c}");
+        }
+    }
 
     /// Every command lib.rs registers, as written in `generate_handler![…]`.
     fn registered_commands() -> Vec<String> {

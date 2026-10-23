@@ -256,7 +256,7 @@ Bold arguments are required. 141 ops.
 | `calls.status` | read |  | The call this device is in right now and the last one that ended. |
 | `calls.history` | read | limit, who | Call history, newest first: who, when, audio or video, in or out, how it ended, how long. |
 | `calls.recordings` | read |  | Call recordings on this device (made with both people's agreement). |
-| `calls.start` | write (dryRun) | video, **who** | Ring a friend from this computer's call screen; a person has to be here to talk. Agents never answer or record. |
+| `calls.start` | write (dryRun) | video, **who** | Ask the person at this computer to call a friend: the call screen shows "Call <name>? (audio/video) — Call / Cancel". Nothing rings and no microphone or camera opens until a person clicks Call. Agents never place, answer or record a call by themselves. |
 | `calls.hangup` | write |  | End the current call, or decline one that is ringing. |
 | `chat.list` | read |  | Every conversation with its last message, newest first. |
 | `chat.read` | read | limit, since, **who** | Messages in a conversation, oldest first. |

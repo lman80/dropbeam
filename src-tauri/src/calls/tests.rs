@@ -284,19 +284,23 @@ async fn several_devices_ring_and_the_first_to_answer_wins() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn calling_each_other_at_once_connects_one_call() {
+async fn calling_each_other_at_once_connects_one_call_without_upgrading_to_video() {
     let (a, b) = (Node::new().await, Node::new().await);
     let b_in_a = a.befriend(&b, "Bea");
     let a_in_b = b.befriend(&a, "Al");
+    // A calls with sound only, B with video.
     let ida = super::start(&a.state, &b_in_a, false).await.unwrap()["callId"].as_str().unwrap().to_string();
-    let idb = super::start(&b.state, &a_in_b, false).await.unwrap()["callId"].as_str().unwrap().to_string();
+    let idb = super::start(&b.state, &a_in_b, true).await.unwrap()["callId"].as_str().unwrap().to_string();
     let (r1, r2) = tokio::join!(super::send_offer(&a.state, &ida, SDP), super::send_offer(&b.state, &idb, SDP));
     r1.unwrap(); r2.unwrap();
-    let winner = std::cmp::min(ida.clone(), idb.clone());
-    // The side whose call lost answers the winner automatically.
-    let callee = if winner == ida { &b } else { &a };
+    // The call placed by the smaller endpoint id survives, whatever the call ids.
+    let (winner, callee) = if a.id() < b.id() { (ida.clone(), &b) } else { (idb.clone(), &a) };
+    // The side whose call lost answers the winner automatically...
     let inc = callee.wait_event("call://incoming", |v| v["id"] == winner.as_str()).await;
     assert_eq!(inc["autoAccept"], true);
+    // ...never with more than either of them was calling with: no camera.
+    assert_eq!(inc["video"], false);
+    assert_eq!(super::accept(&callee.state, &winner).unwrap()["video"], false);
     tokio::time::sleep(Duration::from_millis(300)).await;
     // Only the winning call is live on both sides.
     for n in [&a, &b] {
@@ -304,4 +308,107 @@ async fn calling_each_other_at_once_connects_one_call() {
         assert_eq!(live.as_ref().map(|l| l.call.id.clone()), Some(winner.clone()));
     }
     let _ = turn::virtual_ip(true);
+}
+
+/// A friend rings, says `call.glare` on their own call, cancels and rings again
+/// with video: nothing is answered for me.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_glare_never_answers_a_call() {
+    let (a, b) = (Node::new().await, Node::new().await);
+    a.befriend(&b, "Bea");
+    b.befriend(&a, "Al");
+    // A's ids sort first and claim to win; A is a raw client, not the engine.
+    let offer = |id: &str| json!({"kind": "call.offer", "v": 1, "callId": id, "tag": "00000000000000aa", "video": true, "sdp": SDP});
+    let (_c1, mut send, _r1) = super::open_leg(&a.state, &b.id(), &offer("0000-first")).await.unwrap();
+    let inc = b.wait_event("call://incoming", |v| v["id"] == "0000-first").await;
+    assert_eq!(inc["autoAccept"], false);
+    crate::iroh_net::write_frame(&mut send, &json!({"kind": "call.glare"})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(b.state.calls.live.lock().unwrap().as_ref().map(|l| l.call.phase), Some(super::Phase::Ringing), "glare on their own call means nothing");
+    crate::iroh_net::write_frame(&mut send, &json!({"kind": "call.cancel"})).await.unwrap();
+    assert_eq!(b.wait_end().await["end"], "missed");
+    let (_c2, _s2, _r2) = super::open_leg(&a.state, &b.id(), &offer("0000-second")).await.unwrap();
+    let inc = b.wait_event("call://incoming", |v| v["id"] == "0000-second").await;
+    assert_eq!(inc["autoAccept"], false, "it rings like any call");
+    assert!(!b.state.calls.live.lock().unwrap().as_ref().unwrap().auto_accept);
+}
+
+fn live(call: super::signal::Call) -> super::Live {
+    super::Live { call, tag: 1, user: "u".into(), pass: "p".into(), bridge: None, name: "Bea".into(), offer: None,
+        legs: std::collections::HashMap::new(), auto_accept: false, silent: false, glare_wait: None, unsupported: false, rec: Default::default() }
+}
+
+fn calls_as(me: &str, call: super::signal::Call) -> Arc<super::Calls> {
+    let calls = Arc::new(super::Calls::default());
+    calls.me.set(me.into()).unwrap();
+    *calls.live.lock().unwrap() = Some(live(call));
+    calls
+}
+
+#[test]
+fn glare_is_honoured_only_on_my_ringing_call_to_that_device_when_the_rule_says_they_win() {
+    use super::signal::{Call, Ev};
+    let glare = json!({"kind": "call.glare"});
+    let waiting = |c: &Arc<super::Calls>| c.live.lock().unwrap().as_ref().and_then(|l| l.glare_wait.as_ref().map(|(e, _)| e.clone()));
+    // Their call to me (incoming): ignored, even from a device the rule favours.
+    let (inc, _) = Call::incoming("c1", "p", true, "a0", 0);
+    let c = calls_as("m5", inc);
+    super::on_frame(&c, "c1", "a0", glare.clone());
+    assert_eq!(waiting(&c), None);
+    assert!(c.live.lock().unwrap().as_ref().is_some_and(|l| l.call.phase == super::Phase::Ringing && !l.auto_accept));
+    // My call, but the glare comes from a device I'm not calling: ignored.
+    let c = calls_as("m5", Call::outgoing("c2", "p", false, &["a0".into()], 0));
+    super::on_frame(&c, "c2", "a1", glare.clone());
+    assert_eq!(waiting(&c), None);
+    // My call, already answered: ignored.
+    let mut out = Call::outgoing("c3", "p", false, &["a0".into()], 0);
+    out.on(Ev::Answered("a0".into()), 1);
+    let c = calls_as("m5", out);
+    super::on_frame(&c, "c3", "a0", glare.clone());
+    assert_eq!(waiting(&c), None);
+    assert!(c.live.lock().unwrap().is_some());
+    // They claim to win but the rule says my call wins: that device is just out.
+    let c = calls_as("m5", Call::outgoing("c4", "p", false, &["z9".into()], 0));
+    super::on_frame(&c, "c4", "z9", glare.clone());
+    assert!(c.live.lock().unwrap().is_none());
+    assert_eq!(c.status()["last"]["end"], "unavailable");
+    // Genuine: my ringing call to that device, and theirs wins. Mine waits for it.
+    let c = calls_as("m5", Call::outgoing("c5", "p", false, &["a0".into()], 0));
+    super::on_frame(&c, "c5", "a0", glare);
+    assert_eq!(waiting(&c).as_deref(), Some("a0"));
+    assert!(c.live.lock().unwrap().as_ref().is_some_and(|l| l.call.phase == super::Phase::Ringing));
+}
+
+#[test]
+fn taking_back_recording_consent_stops_the_recording() {
+    use super::signal::{Call, Ev};
+    let mut out = Call::outgoing("rc1", "p", false, &["e1".into()], 0);
+    out.on(Ev::Answered("e1".into()), 1);
+    let calls = calls_as("m5", out);
+    {
+        let mut g = calls.live.lock().unwrap();
+        let l = g.as_mut().unwrap();
+        l.rec.note("ask", true);
+        l.rec.note("allow", false);
+    }
+    let dl = std::env::temp_dir().join(format!("dropbeam-rec-revoke-{}", rand::random::<u64>()));
+    let opened = super::record::open(&calls, "rc1", &dl).unwrap();
+    let rec = opened["recId"].as_str().unwrap().to_string();
+    let dir = std::path::PathBuf::from(opened["dir"].as_str().unwrap());
+    super::record::chunk(&calls, &rec, "me", "webm", b"one").unwrap();
+    assert_eq!(calls.status()["call"]["recording"]["meRecording"], true);
+    // Without their yes, the engine writes nothing (even to an open recording).
+    calls.live.lock().unwrap().as_mut().unwrap().rec.they_allow = false;
+    assert!(super::record::chunk(&calls, &rec, "me", "webm", b"nope").is_err());
+    calls.live.lock().unwrap().as_mut().unwrap().rec.they_allow = true;
+    // They take it back: closed at once, `stopped` sent, later bytes refused.
+    super::note_record(&calls, "rc1", &json!({"action": "deny"}), false);
+    let st = calls.status();
+    assert_eq!(st["call"]["recording"]["meRecording"], false);
+    assert_eq!(st["call"]["recording"]["theyAllow"], false);
+    assert!(super::record::chunk(&calls, &rec, "me", "webm", b"two").is_err());
+    assert!(super::record::chunk(&calls, &rec, "them", "webm", b"two").is_err());
+    assert_eq!(std::fs::read(dir.join("Me.webm")).unwrap(), b"one");
+    assert!(dir.join("call.json").exists());
+    let _ = std::fs::remove_dir_all(&dl);
 }
