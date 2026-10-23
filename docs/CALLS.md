@@ -127,7 +127,16 @@ stays open as the call's line. Frames:
   when both agreed (`call.record {action:"share"}` both ways), after the call each side
   sends its own `Me` track to the other through the normal verified file transfer, so
   each ends up with both clean voices.
-- iOS: consent and the badge work; recording on the iPhone itself isn't built yet.
+- iOS: same consent and badge. DropBeam drives the iPhone's echo-cancelling
+  voice-processing audio unit itself (a custom WebRTC audio device on the same unit
+  WebRTC's built-in device uses). A recording gets your voice after echo cancellation
+  (silent while muted) and exactly what plays from the other side. Each voice and the
+  mixed call are encoded on the phone as AAC (`Me.m4a`, `<Name>.m4a`, `Call.m4a`). When
+  recording stops or the call ends, they move into Documents/DropBeam Calls/<date> <name>/
+  next to `call.json`, which shows in the Files app under DropBeam. The engine accepts
+  the files for 10 minutes after the call closed the recording, and only from the app's
+  own temp folder. If both of you agreed to swap tracks, after the call the iPhone sends
+  your `Me.m4a` as a normal file in the chat. Not yet tested on a device.
 
 ## Platforms
 
@@ -135,11 +144,39 @@ stays open as the call's line. Frames:
 |---|---|---|---|---|
 | Audio/video calls | ✅ tested (WKWebView) | ⚠️ builds in CI; WebView2 has WebRTC, not call-tested | ❌ Ubuntu's WebKitGTK ships without WebRTC (checked 2.52 on 24.04: `RTCPeerConnection` is undefined) → "can't take calls yet" | ⚠️ builds + launches in the simulator; not call-tested |
 | Ringing while hidden/in tray | ✅ window comes up + notification | ✅ same code | — | CallKit; VoIP push when backgrounded (owner setup) |
-| Recording | ✅ (desktop code; mic recording needs a real mic) | ⚠️ | — | consent only |
+| Recording | ✅ (desktop code; mic recording needs a real mic) | ⚠️ | — | ⚠️ built, compiles, not run on a device |
 
 Linux shows the call buttons and explains why a call can't start; friends calling a
-Linux device read "<Name>'s device can't take calls yet". Options for later: native
-libwebrtc (LiveKit's `webrtc-sys`, BSD) driven from Rust with the same TURN bridge.
+Linux device read "<Name>'s device can't take calls yet".
+
+### Plan: native calls on Linux (not built yet)
+
+Evaluated 2026-10-23 and deferred — not doable in one night without risking the Linux
+build for everyone:
+
+- **Engine**: LiveKit's `libwebrtc` crate (safe Rust over `webrtc-sys`, Apache-2.0;
+  prebuilt Google libwebrtc downloaded by its build script). Since webrtc-sys 0.3.x it
+  compiles against the libc++ bundled in that artifact and **needs clang ≥ 21**
+  (Ubuntu 24.04 ships 18 → apt.llvm.org on every build machine and CI runner), plus
+  `libglib2.0-dev libclang-dev libjpeg-turbo8-dev`. The download is ~100–200 MB per
+  target.
+- **Shape**: a cargo feature `native-calls` (Linux only, off by default, so CI and the
+  other OSes are untouched until it's proven). A `calls/native.rs` drives
+  `PeerConnectionFactory` with the **same** configuration as the call screens
+  (ICE server = the per-call 127.0.0.1 TURN bridge, relay policy, Opus fmtp from
+  `sdp.rs`) — signaling, consent, recording files and history stay exactly as they are.
+- **Audio**: libwebrtc's own Linux audio device module (PulseAudio/PipeWire-pulse,
+  with its echo canceller), or `NativeAudioSource`/`NativeAudioStream` fed from/to
+  `cpal`. Audio first; video via `NativeVideoSource` from a V4L2 camera (`nokhwa`) and
+  remote frames drawn into the WebKitGTK page as JPEG/RGBA frames over the local range
+  server (`stream.rs`) — slower than a native surface, fine for 720p.
+- **UI**: the existing call screen with a thin "engine" switch in `src/lib/calls.ts`:
+  when `RTCPeerConnection` is missing but `call_status().native` is true, the screen
+  sends button presses to Rust commands instead of driving WebRTC itself.
+- **Steps**: (1) build `libwebrtc` on ass-box with clang-21 behind the feature; (2) an
+  audio-only call Linux ↔ Mac through the bridge (the lab call node is the harness);
+  (3) CI job with clang-21 for the feature; (4) video; (5) turn the feature on for the
+  Linux release.
 
 ### iOS
 
@@ -196,29 +233,75 @@ two devices of one person (first answer wins, the other stops); glare.
 camera/mic, two peer connections each limited to its own bridge, bridges joined by a
 loopback iroh connection.
 
-Live (debug builds; `DROPBEAM_CALL_FAKE_MEDIA=1` gives a synthetic camera/mic carrying
-the sender's clock, so the receiver measures delay; `dropbeam-lab call-node` runs the
-engine headless with a Chrome call screen). One-way delays across machines are the
-average of both directions (cancels clock offset; NTP-synced machines).
+Live (debug builds; `dropbeam-lab call-node` runs the engine headless with a Chrome
+call screen; `DROPBEAM_CALL_FAKE_MEDIA=1` gives the desktop app a synthetic
+camera/mic).
 
-| Run | Path | Setup to media | Media RTT | Video (glass→glass) | Audio (mouth→ear, before the sound card) | Loss | Video |
-|---|---|---|---|---|---|---|---|
-| ass-box, loopback, 2× Chrome | local | 1.0–1.3 s | 3–19 ms | — | — | 0 % | 720p |
-| This Mac, 2 app instances (WKWebView) | local | 0.5 s (answer→media 40 ms) | 1–3 ms | 40–55 ms | jitter buffer grew to ~350 ms ¹ | 0 % | 720p30 H.264 |
-| Mac (Wi-Fi) ↔ ass-box, same home LAN | local | — | 22–45 ms (Wi-Fi ping 9–97 ms) | ~250 ms ² | ~230 ms (jitter buffer ~130 ms) | 0 % | 720p |
-| linux-agent ↔ ass-box (across town) | direct | 1.4 s | 37–47 ms | — ² | ~157 ms (one way, both directions averaged) | ≤0.5 % | 720p one way, 270p other ² |
-| Mac (Wi-Fi) ↔ Korea (minkyung-mac) | direct (hole-punched) | — | 240–345 ms (iroh RTT 230–250) | ~610 ms ² | ~390 ms (jitter buffer 260–410) | ≤7 % | 720p / 360p |
-| linux-agent ↔ ass-box, relay forced | relay | see below | | | | | |
+### Audio delay, measured with speech (round 2)
 
-¹ Synthetic audio in WKWebView (a Web Audio track) — real microphones take WebKit's
-capture path; the video on the same call stayed at ~50 ms. ² ass-box (4 cores) encoding
-720p in software in headless Chrome plus a debug engine was CPU-bound (load 3–4.5);
-video delay grew with it. Same Wi-Fi caveat on the Mac. These are debug builds.
+The first round's audio numbers came from a synthetic Web Audio beep track. That source
+is bursty on its own: on a 1 ms loopback with no loss, the receiver's jitter buffer still
+grew to 350 ms. Those numbers are withdrawn. The harness now feeds a 48 kHz speech WAV
+(`say` → `afconvert`) through Chrome's real capture path
+(`--use-file-for-fake-audio-capture`, with echo cancellation, noise suppression and
+gain control on) and plays the far side through an `<audio>` element like the call
+screen. `calls::lab_tests::webrtc_speech_latency_in_chrome` (`LAB_WAV=…`) puts the
+captured track and the received track into one AudioContext and cross-correlates their
+energy envelopes. That gives capture → receiver output, i.e. mouth-to-ear minus the
+sound card's own buffers, which typically add 10–20 ms on each side.
 
-**Reading**: the bridge adds no measurable delay (media RTT ≈ iroh RTT ≈ ping); delay
-above that is WebRTC's jitter buffer reacting to network jitter (home Wi-Fi), CPU, and
-distance. On a quiet LAN audio is well under 150 ms one way; across town ~150 ms; US ↔
-Korea ~400 ms.
+| Speech, same machine (ass-box, 2× Chrome over loopback iroh) | mouth→ear | jitter buffer |
+|---|---|---|
+| Chrome's own direct path (baseline, no DropBeam) | 43 ms (2 runs) | 30–38 ms |
+| Through the TURN bridges and iroh datagrams | 43–85 ms (8 runs, median ≈ 55) | 30–40 ms |
+
+Concealment appeared only in runs where the box was overloaded (load 5 on 4 cores).
+**LAN target (< 150 ms) is met.**
+
+**Bug found and fixed: the ACK frequency starved low-rate flows.** Across town, arrival
+gaps of 120–200 ms showed up at the receiving bridge (25 in 40 s) while plain ping stayed
+under 63 ms. DropBeam asks peers to acknowledge only every 10th packet (good for bulk
+transfers). A call sends 50–150 packets/s, so it was acknowledged about once per round
+trip, and the congestion window stalled the sender in bursts. The far side's jitter
+buffer grew to 170–240 ms. With ACK frequency off it was 54–83 ms. Fix
+(`iroh_net::ack_frequency`): the requested max ACK delay is capped at 5 ms
+(`DROPBEAM_ACK_DELAY_MS` overrides). A bulk transfer still reaches the 10-packet
+threshold first, so it keeps the reduced ACK rate. After the fix: no gaps > 120 ms, and
+jitter buffer 62–87 ms (one direction) and 63–133 ms (other, over the home uplink).
+
+**Queue bound**: when the congestion window is full, QUIC would queue up to 1 MB of
+datagrams. That is seconds of video, and audio would wait behind it. The bridge now
+drops large (video) packets once ~80 ms of the current send rate is waiting (at least
+8 KB). Small (audio/RTCP) packets always go. WebRTC sees ordinary loss and lowers its
+bitrate.
+
+| Speech run (real capture path, after the fixes) | Path | Media RTT (= iroh RTT ≈ ping) | Jitter buffer | One-way audio ≈ RTT/2 + buffer + ~20 ms | Loss | Video |
+|---|---|---|---|---|---|---|
+| linux-agent ↔ ass-box, across town | direct | 36–40 ms | 62–133 ms | ~100–170 ms | ≤ 0.4 % | 720p |
+| ass-box → Korea (minkyung-mac; speech received in Korea) | direct (hole-punched) | 232–252 ms (ping 216–370, mdev 31) | 223 ms (269 before the queue bound) | ~360 ms | ≤ 5.6 % | 720p |
+
+**Korea path**: media RTT equals iroh's RTT and plain ping (234 vs 238 ms), and the path
+never fell back to relay (`direct` in every sample). Datagram size is fine: max datagram
+1192–1414 bytes, 0–14 packets fragmented in a minute, none dropped for size. The loss
+and jitter are the path's own: ping alone shows max 370 ms and 31 ms deviation, and the
+Korea Mac is on Wi-Fi. WebRTC's jitter buffer follows that jitter. The queue bound cut
+gaps > 120 ms from 19 to 1–5 per minute and the buffer from ~250–270 to ~220 ms.
+Further gains would need a calmer network. The "< 100 ms + one way" target is met
+across town (~19 ms one way + ≤ 100 ms in the best direction), not on this
+trans-Pacific Wi-Fi path.
+
+### Earlier runs (round 1, synthetic media — video numbers still valid)
+
+| Run | Path | Setup | Media RTT | Video (glass→glass) | Loss | Video |
+|---|---|---|---|---|---|---|
+| ass-box, loopback, 2× Chrome | local | 1.0–1.3 s | 3–19 ms | — | 0 % | 720p |
+| This Mac, 2 app instances (WKWebView) | local | 0.5 s | 1–3 ms | 40–55 ms | 0 % | 720p30 H.264 |
+| Mac (Wi-Fi) ↔ ass-box, home LAN | local | — | 22–45 ms | ~250 ms ¹ | 0 % | 720p |
+| linux-agent ↔ ass-box, relay forced | relay | 1.1 s | ~81 ms | ~150 ms | 0 % | 720p |
+| Mac (Wi-Fi) ↔ Korea | direct | — | 240–345 ms | ~610 ms ¹ | ≤ 7 % | 720p / 360p |
+
+¹ CPU-bound headless 720p software encoding on ass-box and Wi-Fi jitter. These ran
+before the ACK-delay and queue fixes.
 
 **Not verified**: a real camera and microphone (macOS permission prompts need a person),
 Windows calls, an iPhone (real device, CallKit, VoIP push), recording with a real

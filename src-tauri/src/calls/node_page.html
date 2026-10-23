@@ -5,14 +5,14 @@
      clock-stamped media (no camera/mic needed) and the delay probe of
      src/lib/callLab.ts. ?call=<friendId>&video=1&secs=60 places a call; without
      ?call it answers whatever rings. -->
-<html><body style="background:#111;color:#eee;font:14px sans-serif"><pre id=log></pre><script>
+<html><body style="background:#111;color:#eee;font:14px sans-serif"><pre id=log></pre><audio id=out autoplay></audio><script>
 const q = new URLSearchParams(location.search)
 const api = (cmd, body) => fetch('/api/' + cmd, { method: 'POST', body: JSON.stringify(body || {}) }).then(r => r.json()).then(j => { if (j && j.error) throw new Error(j.error); return j })
 const say = (...a) => { document.getElementById('log').textContent += a.join(' ') + '\n'; api('report', { log: a.join(' ') }).catch(() => {}) }
 const BLOCK = 40, BITS = 32
 async function media(video) {
   // ?gum=1: the browser's own (fake) capture devices — the real capture path.
-  if (q.get('gum')) return navigator.mediaDevices.getUserMedia({ audio: true, video: video ? { width: 1280, height: 720, frameRate: 30 } : false })
+  if (q.get('gum')) return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: video ? { width: 1280, height: 720, frameRate: 30 } : false })
   return fakeMedia(video)
 }
 function fakeMedia(video) {
@@ -51,7 +51,7 @@ let pc = null, callId = null, last = null
 function makePc(turn) {
   const p = new RTCPeerConnection({ iceServers: [{ urls: turn.urls, username: turn.username, credential: turn.credential }], iceTransportPolicy: 'relay', bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' })
   const remote = new MediaStream(); let probing = false
-  p.ontrack = e => { remote.addTrack(e.track); if (!probing && remote.getAudioTracks().length && remote.getVideoTracks().length) { probing = true; if (q.get('gum')) setInterval(() => stats({}), 5000); else probe(remote, r => stats(r)) } }
+  p.ontrack = e => { remote.addTrack(e.track); if (e.track.kind === 'audio') { const el = document.getElementById('out'); el.srcObject = new MediaStream([e.track]); el.play().catch(() => {}) } if (!probing && remote.getAudioTracks().length && remote.getVideoTracks().length) { probing = true; if (q.get('gum')) setInterval(() => stats({}), 5000); else probe(remote, r => stats(r)) } }
   p.onconnectionstatechange = () => { say('pc', p.connectionState); if (p.connectionState === 'connected') api('media_up', { callId }) }
   return p
 }
@@ -69,7 +69,7 @@ async function stats(probeResult) {
   if (last) { const sec = (now - last.now) / 1000; out.sendKbps = Math.round((sent - last.sent) * 8 / 1000 / sec); out.recvKbps = Math.round((recv - last.recv) * 8 / 1000 / sec)
     const dl = lost - last.lost, dg = got - last.got; out.lossPct = dl + dg ? Math.round(1000 * dl / (dl + dg)) / 10 : 0; if (jbn > last.jbn) out.jbMs = Math.round(1000 * (jbd - last.jbd) / (jbn - last.jbn)) }
   last = { now, sent, recv, lost, got, jbd, jbn }
-  try { const e = await api('stats', { callId }); out.path = e.path && e.path.path; out.irohRttMs = e.path && e.path.rttMs; out.bridge = e.bridge && { maxDatagram: e.bridge.maxDatagram, fragmented: e.bridge.fragmentedOut, dropped: e.bridge.sendDropped } } catch (e) {}
+  try { const e = await api('stats', { callId }); out.path = e.path && e.path.path; out.irohRttMs = e.path && e.path.rttMs; out.bridge = e.bridge && { maxDatagram: e.bridge.maxDatagram, fragmented: e.bridge.fragmentedOut, dropped: e.bridge.sendDropped, maxQueued: e.bridge.maxQueued, queueDropped: e.bridge.queueDropped, gapsFromPeer: e.bridge.gapsFromPeer, maxGapFromPeerMs: e.bridge.maxGapFromPeerMs } } catch (e) {}
   api('report', { metrics: out })
 }
 async function placeCall() {

@@ -2533,9 +2533,22 @@ pub(crate) fn ack_frequency() -> Option<noq_proto::AckFrequencyConfig> {
     };
     let mut c = noq_proto::AckFrequencyConfig::default();
     c.ack_eliciting_threshold(n.into());
+    c.max_ack_delay(Some(Duration::from_millis(ack_delay_ms())));
     Some(c)
 }
 const ACK_THRESHOLD: u32 = 10;
+
+/// Calls (docs/CALLS.md): with only the packet threshold, a low-rate flow — a
+/// call's 50–150 packets/s of media datagrams — was acknowledged roughly once
+/// per round trip, so the congestion window stalled its sender for up to 200 ms
+/// at a time and the far side's jitter buffer grew to match (170–240 ms across
+/// town; 54–83 ms with ACK frequency off). Capping the requested ACK delay keeps
+/// small flows acknowledged within a few ms; a bulk transfer still reaches the
+/// 10-packet threshold first, so it keeps the reduced ACK rate.
+fn ack_delay_ms() -> u64 {
+    std::env::var("DROPBEAM_ACK_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(ACK_DELAY_MS)
+}
+const ACK_DELAY_MS: u64 = 5;
 
 /// The congestion controller every endpoint uses: patched BBRv3 ("bbrfix", the
 /// default) unless DROPBEAM_CC picks another for an A/B test: bbr (stock noq

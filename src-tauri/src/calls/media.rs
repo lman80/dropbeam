@@ -34,6 +34,16 @@ const WHOLE: usize = 22;
 const FRAG: usize = 26;
 const MAX_PENDING: usize = 64;
 const MAX_FRAGS: u8 = 8;
+/// Most media we let wait in the QUIC connection's datagram queue (when its
+/// congestion window is full). QUIC would queue up to 1 MB — seconds of video —
+/// and every audio packet behind it would wait too (the jitter buffer then
+/// grows to match). Past this, video packets are dropped like a router with a
+/// short queue drops them, so WebRTC sees loss and lowers its bitrate; small
+/// (audio/RTCP) packets still go.
+/// The limit is time-based: about 80 ms of the current send rate, at least 8 KB.
+const QUEUE_MS: f64 = 80.0;
+const QUEUE_MIN: usize = 8 * 1024;
+const SMALL: usize = 400;
 
 fn put_addr(v: &mut Vec<u8>, a: SocketAddrV4) {
     v.extend_from_slice(&a.ip().octets());
@@ -140,6 +150,9 @@ pub struct MediaStats {
     pub gaps_from_peer: [u64; 3],
     pub max_gap_from_engine_ms: u64,
     pub max_gap_from_peer_ms: u64,
+    /// Most bytes seen waiting in the datagram queue, and packets dropped there.
+    pub max_queued: usize,
+    pub queue_dropped: u64,
     #[serde(skip)]
     pub last_rx: Option<Instant>,
     #[serde(skip)]
@@ -191,6 +204,10 @@ async fn run(sock: UdpSocket, mut turn: Turn, mut conn_rx: watch::Receiver<Optio
     let mut next_id = 0u16;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut conn: Option<Connection> = conn_rx.borrow().clone();
+    // The datagram queue's size, read while it's empty (first send on a connection).
+    let mut queue_cap: Option<usize> = None;
+    // Send rate (bits/s), smoothed over one-second windows.
+    let (mut rate_bps, mut window_bytes) = (0f64, 0u64);
     loop {
         let reading = conn.clone();
         tokio::select! {
@@ -198,6 +215,7 @@ async fn run(sock: UdpSocket, mut turn: Turn, mut conn_rx: watch::Receiver<Optio
             changed = conn_rx.changed() => {
                 if changed.is_err() { break; }
                 conn = conn_rx.borrow_and_update().clone();
+                queue_cap = None;
             }
             r = sock.recv_from(&mut buf) => {
                 let Ok((n, src)) = r else { continue };
@@ -207,8 +225,15 @@ async fn run(sock: UdpSocket, mut turn: Turn, mut conn_rx: watch::Receiver<Optio
                     Some(Out::Relay { from, to, data }) => {
                         let Some(c) = conn.as_ref() else { continue };
                         let max = c.max_datagram_size().unwrap_or(0);
-                        let parts = encode(tag, from, to, &data, max, &mut next_id);
+                        let space = c.datagram_send_buffer_space();
+                        let cap = *queue_cap.get_or_insert(space);
+                        let queued = cap.saturating_sub(space);
                         let mut s = stats.lock().unwrap_or_else(|p| p.into_inner());
+                        s.max_queued = s.max_queued.max(queued);
+                        let limit = QUEUE_MIN.max((rate_bps / 8.0 * QUEUE_MS / 1000.0) as usize);
+                        if queued > limit && data.len() > SMALL { s.queue_dropped += 1; continue; }
+                        window_bytes += data.len() as u64;
+                        let parts = encode(tag, from, to, &data, max, &mut next_id);
                         s.max_datagram = max;
                         if parts.is_empty() { s.send_dropped += 1; continue; }
                         if parts.len() > 1 { s.fragmented_out += 1; }
@@ -246,6 +271,8 @@ async fn run(sock: UdpSocket, mut turn: Turn, mut conn_rx: watch::Receiver<Optio
             }
             _ = tick.tick() => {
                 let now = Instant::now();
+                rate_bps = if rate_bps == 0.0 { window_bytes as f64 * 8.0 } else { 0.7 * rate_bps + 0.3 * window_bytes as f64 * 8.0 };
+                window_bytes = 0;
                 turn.expire(now);
                 reasm.expire(now);
                 let mut s = stats.lock().unwrap_or_else(|p| p.into_inner());

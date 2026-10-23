@@ -340,7 +340,7 @@ Calls go straight between the two devices over DropBeam's own connection — no 
 
 **Recording** happens only on your device and only if the other person says yes: **Record** asks them, they see *"… wants to record this call"* with **Allow** / **Don't allow**, and both of you see a red *Recording* badge while it runs. You get your voice, their voice and the mixed call as separate files plus a small description in *Downloads → DropBeam Calls*. While recording you can offer to **swap clean voice tracks**: when both agree, after the call each of you sends the other your own track, so both have both sides (handy for AI notes).
 
-> **Available:** macOS · Windows · iOS (iOS: no recording on the iPhone yet; ringing while DropBeam is in the background needs the push relay — docs/CALLS.md). **Linux:** Ubuntu's system web view has no WebRTC, so Linux can't take calls yet; friends calling it see *"…'s device can't take calls yet"*.
+> **Available:** macOS · Windows · iOS (iOS recordings land in Files → DropBeam → DropBeam Calls; ringing while DropBeam is in the background needs the push relay — docs/CALLS.md). **Linux:** Ubuntu's system web view has no WebRTC, so Linux can't take calls yet; friends calling it see *"…'s device can't take calls yet"*.
 
 ---
 
