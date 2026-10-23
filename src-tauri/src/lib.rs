@@ -22,6 +22,7 @@ mod background_host;
 mod elevate;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod headless;
+mod calls;
 mod chat;
 #[cfg(desktop)]
 mod chat_notify;
@@ -1331,7 +1332,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 }
 
 #[cfg(desktop)]
-fn show_main_window(app: &AppHandle) {
+pub(crate) fn show_main_window(app: &AppHandle) {
     // Become a normal app (Dock icon + proper focus) while the window is open.
     set_dock_icon_visible(app, true);
     if let Some(window) = app.get_webview_window("main") {

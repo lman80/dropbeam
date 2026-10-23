@@ -197,6 +197,22 @@ pub struct ChatMessage {
     /// in the bubble. On the wire as `fromAgent`; older builds ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_agent: Option<crate::agent_ctl::AgentTag>,
+    /// A call history line (kind "call"): written by each device for itself,
+    /// never sent to the other person. Older builds show just the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<CallInfo>,
+}
+
+/// What a call history line records (calls/mod.rs).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CallInfo {
+    pub video: bool,
+    /// "hangup", "remote_hangup", "declined", "busy", "no_answer", "missed",
+    /// "canceled", "unavailable" or "failed" (calls::signal::End).
+    pub outcome: String,
+    /// Talk time; 0 when it never connected.
+    pub duration_ms: u64,
 }
 
 /// When a reaction was last added or removed on this user's devices.
@@ -1222,7 +1238,7 @@ mod tests {
             via: None,
             deliveries: vec![],
             link_preview: None,
-            text_rev: 0, reaction_revs: vec![], from_agent: None,
+            text_rev: 0, reaction_revs: vec![], call: None, from_agent: None,
         }
     }
 

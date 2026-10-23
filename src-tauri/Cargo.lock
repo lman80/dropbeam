@@ -141,6 +141,7 @@ dependencies = [
  "block2",
  "bytes",
  "chrono",
+ "crc32fast",
  "curve25519-dalek",
  "dav-server",
  "futures-util",

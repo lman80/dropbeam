@@ -1,0 +1,66 @@
+<!doctype html>
+<!-- Test harness (calls/tests.rs): two RTCPeerConnections in one headless Chrome,
+     each allowed ONLY its own side's 127.0.0.1 TURN bridge (relay policy), so
+     every media packet crosses the iroh connection between the two bridges.
+     Fake camera/mic. Posts getStats numbers back to the test. -->
+<html><body><script>
+const CFG = __CFG__;
+const log = (...a) => fetch('/log', { method: 'POST', body: a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ') });
+function pc(port) {
+  return new RTCPeerConnection({ iceTransportPolicy: 'relay', bundlePolicy: 'max-bundle',
+    iceServers: [{ urls: `turn:127.0.0.1:${port}?transport=udp`, username: CFG.user, credential: CFG.pass }] });
+}
+function gathered(p) {
+  return new Promise(r => { if (p.iceGatheringState === 'complete') r(); p.addEventListener('icegatheringstatechange', () => p.iceGatheringState === 'complete' && r()); setTimeout(r, 5000); });
+}
+async function stats(p) {
+  const out = {};
+  (await p.getStats()).forEach(s => {
+    if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') { out.rttMs = s.currentRoundTripTime * 1000; out.availOut = s.availableOutgoingBitrate; }
+    if (s.type === 'inbound-rtp' && s.kind === 'audio') { out.aLost = s.packetsLost; out.aRecv = s.packetsReceived; out.aJitterMs = s.jitter * 1000; out.aBytes = s.bytesReceived; out.aJbDelayMs = s.jitterBufferEmittedCount ? 1000 * s.jitterBufferDelay / s.jitterBufferEmittedCount : null; out.fec = s.fecPacketsReceived; }
+    if (s.type === 'inbound-rtp' && s.kind === 'video') { out.vLost = s.packetsLost; out.vRecv = s.packetsReceived; out.vBytes = s.bytesReceived; out.w = s.frameWidth; out.h = s.frameHeight; out.fps = s.framesPerSecond; out.vDecoded = s.framesDecoded; out.codec = s.codecId; }
+    if (s.type === 'local-candidate') out.localCand = `${s.candidateType} ${s.address}:${s.port}`;
+  });
+  return out;
+}
+(async () => {
+  try {
+    const t0 = performance.now();
+    log('start', typeof RTCPeerConnection);
+    const media = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 1280, height: 720, frameRate: 30 } });
+    log('media ok');
+    const a = pc(CFG.portA), b = pc(CFG.portB);
+    a.addEventListener('icecandidateerror', e => log('cand error A', e.errorCode, e.errorText, e.url));
+    media.getTracks().forEach(t => a.addTrack(t, media));
+    const mediaB = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 1280, height: 720, frameRate: 30 } });
+    mediaB.getTracks().forEach(t => b.addTrack(t, mediaB));
+    for (const s of a.getSenders()) { const p = s.getParameters(); if (!p.encodings?.length) p.encodings = [{}]; p.encodings[0].maxBitrate = s.track.kind === 'audio' ? 128000 : 2500000; await s.setParameters(p).catch(e => log('setParameters', String(e))); }
+    await a.setLocalDescription(await a.createOffer());
+    await gathered(a);
+    const offer = a.localDescription.sdp;
+    log('offer candidates', offer.split('\n').filter(l => l.startsWith('a=candidate')));
+    await b.setRemoteDescription({ type: 'offer', sdp: offer });
+    await b.setLocalDescription(await b.createAnswer());
+    await gathered(b);
+    log('answer candidates', b.localDescription.sdp.split('\n').filter(l => l.startsWith('a=candidate')));
+    await a.setRemoteDescription({ type: 'answer', sdp: b.localDescription.sdp });
+    await new Promise((res, rej) => {
+      const check = () => { if (a.connectionState === 'connected' && b.connectionState === 'connected') res(); if (a.connectionState === 'failed') rej(new Error('ICE failed')); };
+      a.addEventListener('connectionstatechange', check); b.addEventListener('connectionstatechange', check); check();
+      setTimeout(() => rej(new Error('timeout: ' + a.connectionState + '/' + b.connectionState)), 20000);
+    });
+    const connectMs = performance.now() - t0;
+    const samples = [];
+    for (let i = 0; i < CFG.seconds; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      samples.push({ a: await stats(a), b: await stats(b) });
+    }
+    const first = samples[0], last = samples[samples.length - 1];
+    const secs = samples.length - 1 || 1;
+    const result = { ok: true, connectMs, last, kbpsVideoIntoB: ((last.b.vBytes - first.b.vBytes) * 8 / 1000) / secs, kbpsAudioIntoB: ((last.b.aBytes - first.b.aBytes) * 8 / 1000) / secs, samples };
+    await fetch('/result', { method: 'POST', body: JSON.stringify(result) });
+  } catch (e) {
+    await fetch('/result', { method: 'POST', body: JSON.stringify({ ok: false, error: String(e && e.stack || e) }) });
+  }
+})();
+</script></body></html>

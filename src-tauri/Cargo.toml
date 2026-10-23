@@ -70,6 +70,8 @@ ring = "0.17"
 curve25519-dalek = "5.0.0"
 unicode-normalization = "0.1"
 hex = "0.4"
+# Calls: STUN FINGERPRINT (CRC-32) in the 127.0.0.1 TURN bridge. Already in the tree.
+crc32fast = "1"
 whoami = "1"
 regex = "1"
 notify = "6"
