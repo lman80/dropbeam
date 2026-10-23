@@ -1166,6 +1166,7 @@ pub fn run() {
             mailbox::cmds::mailbox_pending_files,
             mailbox::cmds::mailbox_decide_file,
             mailbox::cmds::push_set_device,
+            calls::wake::push_set_voip_token,
             mailbox::cmds::push_set_previews,
             mailbox::cmds::push_status,
             location_sync::list_synced_folders,

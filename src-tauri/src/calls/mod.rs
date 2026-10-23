@@ -115,6 +115,8 @@ pub struct Calls {
     config: OnceLock<PathBuf>,
     #[cfg(test)]
     pub(crate) events: Mutex<Vec<(String, Value)>>,
+    /// The lab call node (labkit::call_node) gets every event here.
+    sink: Mutex<Option<mpsc::UnboundedSender<(String, Value)>>>,
 }
 
 impl Calls {
@@ -126,8 +128,11 @@ impl Calls {
     fn emit(&self, event: &str, payload: Value) {
         #[cfg(test)]
         self.events.lock().unwrap().push((event.to_string(), payload.clone()));
+        if let Some(tx) = self.sink.lock().unwrap().as_ref() { let _ = tx.send((event.to_string(), payload.clone())); }
         if let Some(app) = self.app.get() { let _ = app.emit(event, payload); }
     }
+
+    pub(crate) fn set_sink(&self, tx: mpsc::UnboundedSender<(String, Value)>) { *self.sink.lock().unwrap() = Some(tx); }
 
     pub fn set_capable(&self, yes: bool) {
         self.capable.store(yes, std::sync::atomic::Ordering::SeqCst);
@@ -222,6 +227,7 @@ impl Calls {
             if c.dir == Dir::In && c.end == Some(End::Missed) {
                 if let Some(app) = self.app.get() {
                     let what = if c.video { "Missed video call" } else { "Missed audio call" };
+                    #[cfg(desktop)]
                     crate::chat_notify::show(app, &l.name, what, &c.person);
                 }
             }
@@ -561,6 +567,7 @@ fn ring_here(calls: &Calls, name: &str, person: &str, video: bool, notify: bool)
     crate::show_main_window(app);
     if !notify { return; }
     let what = if video { "Video call" } else { "Audio call" };
+    #[cfg(desktop)]
     crate::chat_notify::show(app, &format!("{name} is calling"), what, person);
 }
 

@@ -638,3 +638,99 @@ pub fn host_location(ep: &Endpoint, config: &Path, folder: &Path, friend_eid: &s
     tokio::spawn(crate::iroh_net::accept_loop(ep.clone(), state));
     Ok(crate::friends::my_code(host_name, &ep.id().to_string()))
 }
+
+// ── calls lab: a headless call node with a browser call screen ─────────────
+//
+// `dropbeam-lab call-node --dir D --port P [--mode auto|relay]` runs the REAL
+// call engine (calls/mod.rs: signaling, TURN bridge, datagrams) on a production
+// endpoint and serves a small call screen (calls/node_page.html) on 127.0.0.1:P
+// for a (headless) Chrome: the same WebRTC flow as src/lib/calls.ts, with
+// synthetic clock-stamped media and the delay probe. Lets machines whose web
+// view has no WebRTC (Ubuntu's WebKitGTK) take part in cross-machine call tests.
+
+pub async fn call_node(dir: &Path, port: u16, mode: &str) -> Result<()> {
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    std::fs::create_dir_all(dir)?;
+    let ep = if mode == "relay" {
+        crate::iroh_net::watch_local_subnets().await;
+        Endpoint::builder(presets::N0).clear_ip_transports().alpns(vec![ALPN.to_vec()])
+            .secret_key(lab_secret(dir)).bind().await.context("bind relay-only endpoint")?
+    } else {
+        crate::iroh_net::start(dir).await?
+    };
+    let state = Arc::new(crate::iroh_net::IrohState::default());
+    let _ = state.location_config.set(dir.to_path_buf());
+    let _ = state.endpoint.set(ep.clone());
+    tokio::spawn(crate::iroh_net::accept_loop(ep.clone(), state.clone()));
+    let calls = crate::calls::calls_of(&state);
+    calls.set_capable(true);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, serde_json::Value)>();
+    calls.set_sink(tx);
+    let events = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    {
+        let events = events.clone();
+        tokio::spawn(async move {
+            while let Some((name, v)) = rx.recv().await {
+                println!("{}", serde_json::json!({"event": name, "data": v}));
+                events.lock().unwrap().push(serde_json::json!({"name": name, "data": v}));
+            }
+        });
+    }
+    let me = ep.id().to_string();
+    println!("{}", serde_json::json!({"event": "ready", "endpointId": me, "code": crate::friends::my_code("Call node", &me), "port": port}));
+    let l = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    loop {
+        let (mut s, _) = l.accept().await?;
+        let (state, events, dir) = (state.clone(), events.clone(), dir.to_path_buf());
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 65536];
+            let (head_end, len) = loop {
+                let n = s.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 { return; }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
+                    let len = head.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                    break (p + 4, len);
+                }
+            };
+            while buf.len() < head_end + len {
+                let n = s.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 { break; }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let line = String::from_utf8_lossy(&buf[..head_end]).lines().next().unwrap_or("").to_string();
+            let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let body: serde_json::Value = serde_json::from_slice(&buf[head_end..]).unwrap_or(serde_json::Value::Null);
+            let (ctype, out) = if path == "/" || path.starts_with("/?") {
+                ("text/html", include_str!("calls/node_page.html").to_string())
+            } else {
+                let r = call_node_api(&state, &dir, &events, path.trim_start_matches("/api/"), &body).await;
+                ("application/json", match r { Ok(v) => v.to_string(), Err(e) => serde_json::json!({"error": format!("{e:#}")}).to_string() })
+            };
+            let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}", out.len()).as_bytes()).await;
+        });
+    }
+}
+
+async fn call_node_api(state: &std::sync::Arc<crate::iroh_net::IrohState>, dir: &Path, events: &std::sync::Mutex<Vec<serde_json::Value>>,
+    cmd: &str, b: &serde_json::Value) -> Result<serde_json::Value> {
+    use serde_json::json;
+    let s = |k: &str| b[k].as_str().unwrap_or("").to_string();
+    Ok(match cmd {
+        "befriend" => json!({"friendId": crate::friends::upsert_by_endpoint(dir, &s("endpointId"), &s("name")).id}),
+        "events" => { let mut e = events.lock().unwrap(); let out = json!(*e); e.clear(); out }
+        "start" => crate::calls::start(state, &s("friendId"), b["video"].as_bool().unwrap_or(true)).await?,
+        "offer" => { crate::calls::send_offer(state, &s("callId"), &s("sdp")).await?; json!({}) }
+        "accept" => crate::calls::accept(state, &s("callId"))?,
+        "answer" => { crate::calls::answer(state, &s("callId"), &s("sdp"))?; json!({}) }
+        "hangup" => { crate::calls::hangup(state, &s("callId")); json!({}) }
+        "media_up" => { crate::calls::media_up(state, &s("callId")); json!({}) }
+        "stats" => crate::calls::stats(state, &s("callId"))?,
+        "status" => crate::calls::calls_of(state).status(),
+        "report" => { println!("{}", json!({"event": "report", "data": b})); json!({}) }
+        _ => anyhow::bail!("unknown {cmd}"),
+    })
+}

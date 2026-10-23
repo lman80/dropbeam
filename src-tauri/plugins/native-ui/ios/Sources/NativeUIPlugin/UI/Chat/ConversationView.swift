@@ -208,6 +208,10 @@ struct ConversationView: View {
                         .accessibilityLabel("Close search")
                 } else {
                     Menu {
+                        // Calls (docs/CALLS.md): rings all of their devices.
+                        Button("Audio Call", systemImage: "phone") { CallCenter.shared.startCall(friendId: friendID, video: false) }
+                        Button("Video Call", systemImage: "video") { CallCenter.shared.startCall(friendId: friendID, video: true) }
+                        Divider()
                         Button("Search", systemImage: "magnifyingglass") { searching = true }
                         Button("Contact Info", systemImage: "person.crop.circle") { showDetail = true }
                         if reportable {
@@ -362,6 +366,9 @@ struct ConversationView: View {
             if message.deleted == true {
                 Text(message.fromMe ? "You unsent a message." : "\(friend.displayName) unsent a message.")
                     .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity).padding(.vertical, 8)
+            } else if message.kind == "call" {
+                // A call in the thread (written by this device): tap to call back.
+                CallLinePill(message: message, friendID: friendID).padding(.vertical, 6)
             } else {
                 HStack(alignment: .bottom, spacing: 0) {
                     if message.fromMe { Spacer(minLength: 0) }

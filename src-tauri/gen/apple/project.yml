@@ -76,7 +76,11 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: com.ashtonmiller.dropbeam.invite
             CFBundleURLSchemes: [dropbeam]
-        NSCameraUsageDescription: DropBeam uses the camera only to scan QR codes for adding friends, linking your devices and joining shared folders.
+        NSCameraUsageDescription: DropBeam uses the camera for video calls with your friends and to scan QR codes for adding friends, linking your devices and joining shared folders.
+        NSMicrophoneUsageDescription: DropBeam uses the microphone for audio and video calls with your friends. Calls go straight between your devices.
+        # Calls: a VoIP push (PushKit) wakes DropBeam to ring through CallKit; `audio`
+        # keeps a call's sound going when the screen locks or you switch apps.
+        UIBackgroundModes: [voip, audio]
         NSPhotoLibraryAddUsageDescription: DropBeam saves photos and videos you choose to keep to your photo library.
         # Received files land in the app's Documents dir; these two make that
         # directory visible in the Files app (On My iPhone -> DropBeam).
@@ -129,7 +133,17 @@ targets:
       - sdk: SystemConfiguration.framework
       - sdk: UIKit.framework
       - sdk: WebKit.framework
+      # Calls: Google's WebRTC (stasel/WebRTC M155, BSD-3-Clause), fetched by
+      # plugins/native-ui/ios/fetch-webrtc.sh (the first build phase below).
+      - framework: ../../plugins/native-ui/ios/Frameworks/WebRTC.xcframework
+        embed: true
+      - sdk: CallKit.framework
+      - sdk: PushKit.framework
+      - sdk: AVFoundation.framework
     preBuildScripts:
+      - script: sh "${SRCROOT}/../../plugins/native-ui/ios/fetch-webrtc.sh"
+        name: Fetch WebRTC
+        basedOnDependencyAnalysis: false
       - script: npm run -- tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
         name: Build Rust Code
         basedOnDependencyAnalysis: false

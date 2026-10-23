@@ -25,6 +25,8 @@ struct RootView: View {
     var body: some View {
         tabs.tint(.beam)
         .overlay { MediaPreparationOverlay() }
+        // Calls: the in-app ring, the call screen and "Call ended" over every tab.
+        .overlay { CallOverlay().environmentObject(bridge) }
         .safeAreaInset(edge: .top) {
             if bridge.networkAvailable == false {
                 Label("Offline — transfers resume when you reconnect", systemImage: "wifi.slash")

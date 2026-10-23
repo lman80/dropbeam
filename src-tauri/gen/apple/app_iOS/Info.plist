@@ -47,7 +47,14 @@
 		<string>_dropbeam._udp</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>DropBeam uses the camera only to scan QR codes for adding friends, linking your devices and joining shared folders.</string>
+	<string>DropBeam uses the camera for video calls with your friends and to scan QR codes for adding friends, linking your devices and joining shared folders.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>DropBeam uses the microphone for audio and video calls with your friends. Calls go straight between your devices.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>voip</string>
+		<string>audio</string>
+	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

@@ -419,6 +419,7 @@ pub const EXCLUDED: &[(&str, &str)] = &[
     ("push_unregister_all", "iOS native shell plumbing"),
     ("network_shutdown", "iOS native shell plumbing"),
     ("push_set_device", "iOS native shell hands over its notification token"),
+    ("push_set_voip_token", "iOS native shell plumbing (PushKit VoIP token for ringing calls)"),
     ("reveal_path", "shows a file in Finder/Explorer on screen"),
     ("open_path", "opens a file on screen"),
     ("open_url", "opens a browser on screen"),
