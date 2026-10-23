@@ -1356,19 +1356,21 @@ pub fn spawn_delivery(config: PathBuf, net: Arc<crate::iroh_net::IrohState>) {
     tauri::async_runtime::spawn(async move {
         let mut backoff: HashMap<String, (u32, Instant)> = HashMap::new();
         let mut last_count: HashMap<String, usize> = HashMap::new();
-        let mut last_gc = Instant::now() - Duration::from_secs(3600);
+        // None = never: `Instant::now() - 1h` panics in the first hour after a
+        // Windows restart (Instant counts from boot there).
+        let mut last_gc: Option<Instant> = None;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(15)) => {},
                 _ = delivery_wake().notified() => {},
             }
-            if last_gc.elapsed() > Duration::from_secs(3600) {
+            if last_gc.is_none_or(|t| t.elapsed() > Duration::from_secs(3600)) {
                 let cfg = config.clone();
                 let n = tokio::task::spawn_blocking(move || gc(&cfg)).await.unwrap_or(0);
                 if n > 0 {
                     log::info!("transfer-server: expired {n} item(s)");
                 }
-                last_gc = Instant::now();
+                last_gc = Some(Instant::now());
             }
             let Some(ep) = net.get().cloned() else { continue };
             let cfg = config.clone();

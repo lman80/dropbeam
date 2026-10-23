@@ -6159,7 +6159,7 @@ fn send_friend_inner(
                     .map(|(path, name, size, mtime)| crate::mailbox::client::DepositFile { path: path.clone(), name: name.clone(), size: *size, mtime: *mtime })
                     .collect();
                 let label = Arc::new(Mutex::new(String::new()));
-                let last_emit = Mutex::new(Instant::now() - Duration::from_secs(1));
+                let last_emit = Mutex::new(Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now));
                 let upload_started = Instant::now();
                 let (app2, id2, names2, fname2, label2) = (app.clone(), id.clone(), names.clone(), friend_name.clone(), label.clone());
                 let progress = move |done: u64, all: u64| {
@@ -7602,23 +7602,24 @@ pub async fn probe_conn(ep: &Endpoint, endpoint_id: &str) -> Option<crate::model
     // window (main, menu-bar popover…) probes every friend every 30 s.
     let gate = {
         let mut gates = PROBE_GATES.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
-        gates.retain(|_, g| Arc::strong_count(g) > 1 || g.try_lock().is_ok_and(|v| v.0.elapsed() < PROBE_REUSE));
+        gates.retain(|_, g| Arc::strong_count(g) > 1 || g.try_lock().is_ok_and(|v| v.0.is_some_and(|t| t.elapsed() < PROBE_REUSE)));
         gates.entry(endpoint_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new((Instant::now() - PROBE_REUSE, None))))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new((None, None))))
             .clone()
     };
     let mut slot = gate.lock().await;
-    if slot.0.elapsed() < PROBE_REUSE {
+    if slot.0.is_some_and(|t| t.elapsed() < PROBE_REUSE) {
         return slot.1.clone();
     }
     let detail = probe_conn_dial(ep, endpoint_id).await;
-    *slot = (Instant::now(), detail.clone());
+    *slot = (Some(Instant::now()), detail.clone());
     detail
 }
 
 /// How long a probe answer is reused for other callers.
 const PROBE_REUSE: Duration = Duration::from_secs(20);
-type ProbeGate = Arc<tokio::sync::Mutex<(Instant, Option<crate::models::ConnDetail>)>>;
+/// (when probed — None = never, since `now - PROBE_REUSE` can panic right after boot; answer)
+type ProbeGate = Arc<tokio::sync::Mutex<(Option<Instant>, Option<crate::models::ConnDetail>)>>;
 static PROBE_GATES: std::sync::OnceLock<Mutex<HashMap<String, ProbeGate>>> = std::sync::OnceLock::new();
 
 /// A live connection is only proof of life while datagrams keep arriving (keep-

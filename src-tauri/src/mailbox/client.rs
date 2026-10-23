@@ -2289,11 +2289,12 @@ pub fn spawn(net: Arc<IrohState>) {
             let dl = crate::iroh_net::receive_dir(&net, &config);
             let _ = tokio::task::spawn_blocking(move || sweep_leftovers(&config, &dl)).await;
         }
-        let mut last_fetch = Instant::now() - Duration::from_secs(3600);
+        // None = never (not `now - 1h`: that panics soon after a Windows restart).
+        let mut last_fetch: Option<Instant> = None;
         loop {
             let Ok(config) = crate::iroh_net::location_config(&net) else { break };
-            if FETCH_NOW.swap(false, Ordering::SeqCst) || last_fetch.elapsed() > Duration::from_secs(1800) {
-                last_fetch = Instant::now();
+            if FETCH_NOW.swap(false, Ordering::SeqCst) || last_fetch.is_none_or(|t| t.elapsed() > Duration::from_secs(1800)) {
+                last_fetch = Some(Instant::now());
                 fetch_all(&net, &config).await;
             }
             retry_cancels(&net, &config).await;

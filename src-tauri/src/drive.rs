@@ -436,7 +436,7 @@ impl Tree {
     }
     /// Upload a staged file now (end of a WebDAV PUT).
     pub async fn commit(self: &Arc<Self>, path: &str) {
-        if let Some(s) = lock(&self.staged).get_mut(path) { s.last_write = Instant::now() - COMMIT_IDLE; }
+        if let Some(s) = lock(&self.staged).get_mut(path) { s.last_write = Instant::now().checked_sub(COMMIT_IDLE).unwrap_or(s.last_write); }
         self.tick().await;
     }
     /// Every second: upload files idle for COMMIT_IDLE, forget the ones the
