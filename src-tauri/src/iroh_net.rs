@@ -2581,6 +2581,11 @@ pub(crate) fn transport_config() -> iroh::endpoint::QuicTransportConfig {
     tcfg = tcfg.max_remote_nat_traversal_addresses(32u8);
     tcfg = tcfg.stream_receive_window(stream_window.into());
     tcfg = tcfg.send_window(env_bytes("DROPBEAM_SEND_WINDOW", SEND_WINDOW));
+    // Lab A/B only: how long a silent direct path lives before iroh abandons it
+    // (iroh default 15 s, its maximum).
+    if let Some(ms) = std::env::var("DROPBEAM_PATH_IDLE_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        tcfg = tcfg.default_path_max_idle_timeout(Duration::from_millis(ms));
+    }
     tcfg.build()
 }
 const STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
@@ -2642,12 +2647,14 @@ pub fn set_lab_path_filter(mode: u8) {
 }
 
 fn lab_path_hidden(tuple: &iroh::endpoint::transports::FourTuple) -> bool {
-    let mode = LAB_PATH_FILTER.load(Ordering::Relaxed);
-    if mode == 0 { return false; }
     match tuple.remote() {
-        iroh::endpoint::transports::Addr::Ip(sa) => is_cgnat(sa.ip()) != (mode == 2),
+        iroh::endpoint::transports::Addr::Ip(sa) => lab_hides(LAB_PATH_FILTER.load(Ordering::Relaxed), sa.ip()),
         _ => false,
     }
+}
+
+fn lab_hides(mode: u8, remote: std::net::IpAddr) -> bool {
+    mode != 0 && is_cgnat(remote) != (mode == 2)
 }
 
 impl DirectPathSelector {
@@ -13460,6 +13467,19 @@ mod path_preference_tests {
         assert!(!should_switch_path(Some(lan), public, SETTLED));
         let lan2 = path_preference_key(false, true, false, ms(57));
         assert!(!should_switch_path(Some(lan), lan2, SETTLED));
+    }
+
+    #[test]
+    fn lab_path_filter_hides_one_family() {
+        let ts: std::net::IpAddr = "100.79.126.13".parse().unwrap();
+        let public: std::net::IpAddr = "116.46.243.235".parse().unwrap();
+        let lan: std::net::IpAddr = "192.168.1.108".parse().unwrap();
+        for ip in [ts, public, lan] {
+            assert!(!lab_hides(0, ip), "off = the app: nothing hidden");
+        }
+        assert!(lab_hides(1, ts) && !lab_hides(1, public) && !lab_hides(1, lan), "public mode hides only overlay paths");
+        assert!(!lab_hides(2, ts) && lab_hides(2, public) && lab_hides(2, lan), "overlay mode keeps only overlay paths");
+        assert_eq!(LAB_PATH_FILTER.load(Ordering::Relaxed), 0, "the app never sets the lab filter");
     }
 
     #[test]
