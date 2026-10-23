@@ -18,7 +18,7 @@ use windows::Wdk::{Foundation::OBJECT_ATTRIBUTES, Storage::FileSystem::{NtCreate
 use windows::Win32::{Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, ERROR_NO_MORE_FILES},
     System::IO::IO_STATUS_BLOCK, Storage::FileSystem::{GetFileInformationByHandle, GetFileInformationByHandleEx, SetFileInformationByHandle,
     BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FILE_ATTRIBUTE_TAG_INFO, FILE_FULL_DIR_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_INFO,
-    FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_NONE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FileIdInfo, FileAttributeTagInfo,
+    FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, GetFinalPathNameByHandleW, GETFINALPATHNAMEBYHANDLE_FLAGS, FILE_NAME_NORMALIZED, VOLUME_NAME_NONE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FileIdInfo, FileAttributeTagInfo,
     FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileBasicInfo, FileDispositionInfo, FileDispositionInfoEx,
     FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE, DELETE, SYNCHRONIZE,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_TRAVERSE, FILE_READ_ATTRIBUTES,
@@ -69,7 +69,7 @@ fn hidden(name: &OsStr) -> u32 {
 fn real_name(f: &fs::File) -> Option<OsString> {
     let mut buf = vec![0u16; 1024];
     for _ in 0..2 {
-        let n = unsafe { GetFinalPathNameByHandleW(handle(f), &mut buf, FILE_NAME_NORMALIZED | VOLUME_NAME_NONE) } as usize;
+        let n = unsafe { GetFinalPathNameByHandleW(handle(f), &mut buf, GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_NONE.0)) } as usize;
         if n == 0 || n > 1 << 16 { return None; }
         if n < buf.len() {
             let all = &buf[..n];
