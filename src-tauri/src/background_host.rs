@@ -170,12 +170,14 @@ struct TaskInfo {
 /// What `status_script` printed, judged against this app's exe and config.
 pub fn parse_status(json: &str, exe: &str, config: &Path) -> BackgroundHostStatus {
     let t: TaskInfo = serde_json::from_str(json.trim().trim_start_matches('\u{feff}')).unwrap_or_default();
-    let same = |a: &str, b: &str| a.trim().trim_matches('"').eq_ignore_ascii_case(b.trim());
+    let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    // The program path may be stored quoted (Task Scheduler accepts both).
+    let exe_same = |a: &str, b: &str| same(a.trim().trim_matches('"'), b);
     BackgroundHostStatus {
         supported: true,
         enabled: t.installed && t.enabled,
         running: t.installed && t.state.eq_ignore_ascii_case("Running"),
-        current: t.installed && same(&t.execute, exe) && same(&t.arguments, &task_arguments(config)),
+        current: t.installed && exe_same(&t.execute, exe) && same(&t.arguments, &task_arguments(config)),
         command: None,
     }
 }
