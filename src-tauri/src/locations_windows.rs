@@ -18,7 +18,7 @@ use windows::Wdk::{Foundation::OBJECT_ATTRIBUTES, Storage::FileSystem::{NtCreate
 use windows::Win32::{Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, ERROR_NO_MORE_FILES},
     System::IO::IO_STATUS_BLOCK, Storage::FileSystem::{GetFileInformationByHandle, GetFileInformationByHandleEx, SetFileInformationByHandle,
     BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FILE_ATTRIBUTE_TAG_INFO, FILE_FULL_DIR_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_INFO,
-    FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, FILE_NAME_INFO, FileNameInfo, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FileIdInfo, FileAttributeTagInfo,
+    FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_NONE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FileIdInfo, FileAttributeTagInfo,
     FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileBasicInfo, FileDispositionInfo, FileDispositionInfoEx,
     FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE, DELETE, SYNCHRONIZE,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_TRAVERSE, FILE_READ_ATTRIBUTES,
@@ -63,22 +63,19 @@ fn hidden(name: &OsStr) -> u32 {
     if reserved(name) { FILE_ATTRIBUTE_HIDDEN.0 } else { FILE_ATTRIBUTE_NORMAL.0 }
 }
 /// The name the object behind `f` really has (its last path component) — the
-/// long name even when it was opened by its 8.3 short name. None if the file
-/// system won't say.
+/// long name even when it was opened by its 8.3 short name (FileNameInfo would
+/// echo the name it was opened by; the normalized final path expands short
+/// names). None if the file system won't say.
 fn real_name(f: &fs::File) -> Option<OsString> {
-    let mut cap = 1024usize;
+    let mut buf = vec![0u16; 1024];
     for _ in 0..2 {
-        let mut buf = vec![0u64; (std::mem::size_of::<FILE_NAME_INFO>() + cap).div_ceil(8)];
-        let size = (buf.len() * 8) as u32;
-        let got = unsafe { GetFileInformationByHandleEx(handle(f), FileNameInfo, buf.as_mut_ptr().cast(), size) };
-        let info = buf.as_ptr().cast::<FILE_NAME_INFO>();
-        let len = unsafe { (*info).FileNameLength } as usize;
-        if got.is_ok() && len <= size as usize {
-            let all = unsafe { std::slice::from_raw_parts(std::ptr::addr_of!((*info).FileName).cast::<u16>(), len / 2) };
+        let n = unsafe { GetFinalPathNameByHandleW(handle(f), &mut buf, FILE_NAME_NORMALIZED | VOLUME_NAME_NONE) } as usize;
+        if n == 0 || n > 1 << 16 { return None; }
+        if n < buf.len() {
+            let all = &buf[..n];
             return Some(OsString::from_wide(all.rsplit(|&c| c == '\\' as u16).next().unwrap_or(all)));
         }
-        if len <= cap || len > 1 << 17 { return None; }
-        cap = len;
+        buf = vec![0u16; n + 1];
     }
     None
 }
