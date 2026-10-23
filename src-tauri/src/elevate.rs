@@ -18,6 +18,8 @@
 //! checks them strictly, does only that job and exits: 0 = done, 2 = arguments
 //! refused, anything else = the HRESULT of what Windows refused.
 
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::path::PathBuf;
 
 pub const TASK_FLAG: &str = "--background-task";

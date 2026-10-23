@@ -127,7 +127,7 @@ jobs:
           schtasks /Query /TN "DropBeam Background" /XML | tr -d "\000" > task.xml
           cat task.xml
           grep -q "<LogonType>S4U</LogonType>" task.xml
-          grep -q "<BootTrigger>" task.xml
+          grep -q "<BootTrigger" task.xml
           grep -q "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" task.xml
           grep -q "DropBeam.exe</Command>" task.xml
           grep -q -- "--server --config .*dropbeam ci config" task.xml

@@ -15,6 +15,9 @@
 //! background copy uses the same identity and Locations as the window even if
 //! the S4U session's environment differs from a signed-in one.
 
+// The task helpers are pure (tested everywhere) but only called on Windows.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use serde::Serialize;
 use std::path::Path;
 
