@@ -488,6 +488,52 @@ pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
+/// The CLI's side, before it connects: the socket's folder must already be
+/// ours alone (a real folder, owned by this user, 0700) — otherwise someone
+/// else could have put their own "DropBeam" there to read what agents send.
+#[cfg(unix)]
+pub(crate) fn check_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let m = std::fs::symlink_metadata(dir)?;
+    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } || m.permissions().mode() & 0o777 != 0o700 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            format!("{} isn't a private folder of this user (owner only, 0700), so the DropBeam there isn't trusted", dir.display())));
+    }
+    Ok(())
+}
+
+/// The CLI's side, after it connects: the app answering is running as us.
+#[cfg(unix)]
+pub(crate) fn check_peer(s: &tokio::net::UnixStream) -> std::io::Result<()> {
+    if s.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the program answering on the agent socket runs as another user"));
+    }
+    Ok(())
+}
+
+/// The CLI's side on Windows: the pipe's server process runs as this user.
+#[cfg(windows)]
+pub(crate) fn check_pipe_server(pipe: &tokio::net::windows::named_pipe::NamedPipeClient) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = windows::Win32::Foundation::HANDLE(pipe.as_raw_handle());
+    if !win::server_is_me(handle) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the program answering on the agent pipe runs as another user"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+static PIPE_FILE: std::sync::OnceLock<(PathBuf, String)> = std::sync::OnceLock::new();
+
+/// On quit: drop the file naming our pipe (only if it still names ours), so a
+/// later program can't be mistaken for us by a stale name.
+pub fn shutdown() {
+    #[cfg(windows)]
+    if let Some((file, name)) = PIPE_FILE.get() {
+        if std::fs::read_to_string(file).is_ok_and(|n| n.trim() == name) { let _ = std::fs::remove_file(file); }
+    }
+}
+
 #[cfg(unix)]
 async fn listen(app: AppHandle, config: PathBuf) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -517,13 +563,29 @@ mod win {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW};
     use windows::Win32::Security::{GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER};
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
 
     /// The signed-in user's SID ("S-1-5-21-…").
-    pub fn user_sid() -> anyhow::Result<String> {
+    pub fn user_sid() -> anyhow::Result<String> { process_sid(unsafe { GetCurrentProcess() }) }
+
+    /// Whether the process serving `pipe` runs as this user.
+    pub fn server_is_me(pipe: HANDLE) -> bool {
+        unsafe {
+            let mut pid = 0u32;
+            if GetNamedPipeServerProcessId(pipe, &mut pid).is_err() { return false; }
+            let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return false };
+            let theirs = process_sid(process);
+            let _ = CloseHandle(process);
+            matches!((theirs, user_sid()), (Ok(a), Ok(b)) if a == b)
+        }
+    }
+
+    /// The user SID of a process's token.
+    fn process_sid(process: HANDLE) -> anyhow::Result<String> {
         unsafe {
             let mut token = HANDLE::default();
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+            OpenProcessToken(process, TOKEN_QUERY, &mut token)?;
             let mut len = 0u32;
             let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
             // u64 storage keeps TOKEN_USER's pointer field aligned.
@@ -563,6 +625,7 @@ async fn listen(app: AppHandle, config: PathBuf) -> anyhow::Result<()> {
     };
     let mut server = create(true)?;
     std::fs::write(pipe_name_file(&config), &name)?;
+    let _ = PIPE_FILE.set((pipe_name_file(&config), name.clone()));
     log::info!("agents: control pipe ready");
     loop {
         server.connect().await?;
@@ -845,8 +908,15 @@ mod tests {
         let sd = socket_dir(&d);
         std::fs::create_dir_all(&sd).unwrap();
         std::fs::set_permissions(&sd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The CLI won't trust a folder others can enter, or a symlink to ours.
+        assert_eq!(check_private_dir(&sd).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
         private_dir(&sd).unwrap();
         assert_eq!(std::fs::metadata(&sd).unwrap().permissions().mode() & 0o777, 0o700, "an existing folder is tightened");
+        check_private_dir(&sd).unwrap();
+        let link = d.join("agent-link");
+        std::os::unix::fs::symlink(&sd, &link).unwrap();
+        assert!(check_private_dir(&link).is_err(), "a symlink isn't trusted");
+        assert_eq!(check_private_dir(&d.join("missing")).unwrap_err().kind(), std::io::ErrorKind::NotFound);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let path = socket_path(&d);
@@ -856,8 +926,27 @@ mod tests {
             let client = tokio::spawn(async move { tokio::net::UnixStream::connect(&path).await.unwrap() });
             let (s, _) = listener.accept().await.unwrap();
             assert_eq!(s.peer_cred().unwrap().uid(), unsafe { libc::geteuid() });
-            drop(client.await.unwrap());
+            let c = client.await.unwrap();
+            check_peer(&c).unwrap();
+            drop(c);
         });
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// The CLI checks the pipe's server process runs as this user (it does,
+    /// here), with the same owner-only pipe the app makes.
+    #[cfg(windows)]
+    #[test]
+    fn pipe_server_is_checked() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let name = format!(r"\\.\pipe\dropbeam-agent-test-{}", uuid::Uuid::new_v4().simple());
+            let sa = Box::into_raw(win::owner_only(&win::user_sid().unwrap()).unwrap());
+            let server = unsafe { ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create_with_security_attributes_raw(&name, sa as *mut std::ffi::c_void) }.unwrap();
+            let client = ClientOptions::new().open(&name).unwrap();
+            server.connect().await.unwrap();
+            check_pipe_server(&client).unwrap();
+        });
     }
 }

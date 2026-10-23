@@ -85,8 +85,16 @@ starts with a 48-hex-digit per-run token; the Host header must be
   for the app's own webview origins.
 - `/<token>/dav/…` — the drive over WebDAV (below).
 
-The webview CSP allows `http://127.0.0.1:*` for images, media, fetch and frames
-(PDF). iOS: `NSAllowsLocalNetworking` so AVPlayer may use plain HTTP to 127.0.0.1.
+The webview CSP allows `http://127.0.0.1:*` for images, media, fetch and frames.
+`frame-src` is needed only for the PDF preview (an `<iframe>` on the range
+server; nothing else is framed). The port is random per run (`bind :0`), so the
+CSP can't name it; a fixed range would collide with other programs. PDF
+responses deliberately do **not** carry `Content-Security-Policy: sandbox`: the
+webviews' built-in PDF viewers are plugins, and a sandboxed document can't run
+plugins (no sandbox token lifts that), so the preview would go blank. A PDF is
+shown on the range server's origin (`http://127.0.0.1:P`), not the app's, so it
+can't reach the app's IPC; it is same-origin with other range-server URLs, which
+need the per-run token. iOS: `NSAllowsLocalNetworking` so AVPlayer may use plain HTTP to 127.0.0.1.
 
 ## The drive (`src-tauri/src/drive.rs`)
 
@@ -143,11 +151,30 @@ housekeeping files (`.DS_Store`, `._*`, `~$*`, `Thumbs.db`, `desktop.ini`,
 `drive_mount`, `drive_unmount`, `drive_refresh`, `drive_settings_set`,
 `drive_open {friendId?, locationId?, relPath?}`, `drive_fix_windows`.
 
+## Security
+
+- **Through the mount (macOS):** every file and folder is reported as owned by
+  the signed-in user with owner-only modes (folders 0700/0500, files
+  0600/0400), and `~/DropBeam Drives` is created 0700 (an older 0755 one is
+  tightened at mount). The macOS NFS client checks mode bits itself (only
+  `access(2)` asks the server), so other users on the Mac can't list or open
+  anything through the mount.
+- **The raw NFS port is not protected.** NFSv3 as nfsserve 0.11 implements it
+  has no authentication: AUTH_UNIX credentials are whatever the caller claims,
+  ACCESS answers "yes" to everyone, and file handles are (server start time,
+  file id). Any process on this computer — including another user's — that
+  speaks NFS to the `127.0.0.1` port can read, write, rename and delete in
+  every shared Location this device can reach, as this user. An unguessable
+  export path was considered and not done: nfsserve's MOUNT `EXPORT` call lists
+  the export, and the mount source (`127.0.0.1:/<path>`) plus port are visible
+  to every local user in `mount` output, so it would hide nothing. Nothing off
+  this computer can reach the port (it listens on 127.0.0.1 only). The
+  HTTP/WebDAV server (Linux/Windows drive, previews) is not affected: every URL
+  needs the per-run token. Same exposure as hf-mount; single-user Macs are the
+  target. Turn the drive off on a shared Mac.
+
 ## Limits and known gaps
 
-- Any local process on the same computer can talk to the 127.0.0.1 NFS port
-  (NFS has no token); the HTTP/WebDAV server needs the per-run token. Same
-  exposure as hf-mount; single-user machines are the target.
 - Commit is idle-based: a program that pauses more than 2 s in the middle of
   writing one file causes an extra (verified) upload of the partial file,
   replaced by the complete one afterwards.

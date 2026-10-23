@@ -18,7 +18,7 @@ use windows::Wdk::{Foundation::OBJECT_ATTRIBUTES, Storage::FileSystem::{NtCreate
 use windows::Win32::{Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, ERROR_NO_MORE_FILES},
     System::IO::IO_STATUS_BLOCK, Storage::FileSystem::{GetFileInformationByHandle, GetFileInformationByHandleEx, SetFileInformationByHandle,
     BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FILE_ATTRIBUTE_TAG_INFO, FILE_FULL_DIR_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_INFO,
-    FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FileIdInfo, FileAttributeTagInfo,
+    FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, GetFinalPathNameByHandleW, GETFINALPATHNAMEBYHANDLE_FLAGS, FILE_NAME_NORMALIZED, VOLUME_NAME_NONE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FileIdInfo, FileAttributeTagInfo,
     FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileBasicInfo, FileDispositionInfo, FileDispositionInfoEx,
     FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE, DELETE, SYNCHRONIZE,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_TRAVERSE, FILE_READ_ATTRIBUTES,
@@ -57,9 +57,34 @@ const PROTECTED: u32 = FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM.0;
 /// Hidden+system entries are the OS's own ($RECYCLE.BIN, System Volume
 /// Information, desktop.ini): Explorer hides them and friends never see them.
 pub(super) fn protected_entry(attributes: u32) -> bool { attributes & PROTECTED == PROTECTED }
+fn reserved(name: &OsStr) -> bool { name.to_string_lossy().to_ascii_lowercase().starts_with(".dropbeam-") }
 /// Control data (.dropbeam-*) is created hidden, like a dotfile on Unix.
 fn hidden(name: &OsStr) -> u32 {
-    if name.to_string_lossy().to_ascii_lowercase().starts_with(".dropbeam-") { FILE_ATTRIBUTE_HIDDEN.0 } else { FILE_ATTRIBUTE_NORMAL.0 }
+    if reserved(name) { FILE_ATTRIBUTE_HIDDEN.0 } else { FILE_ATTRIBUTE_NORMAL.0 }
+}
+/// The name the object behind `f` really has (its last path component) — the
+/// long name even when it was opened by its 8.3 short name (FileNameInfo would
+/// echo the name it was opened by; the normalized final path expands short
+/// names). None if the file system won't say.
+fn real_name(f: &fs::File) -> Option<OsString> {
+    let mut buf = vec![0u16; 1024];
+    for _ in 0..2 {
+        let n = unsafe { GetFinalPathNameByHandleW(handle(f), &mut buf, GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_NONE.0)) } as usize;
+        if n == 0 || n > 1 << 16 { return None; }
+        if n < buf.len() {
+            let all = &buf[..n];
+            return Some(OsString::from_wide(all.rsplit(|&c| c == '\\' as u16).next().unwrap_or(all)));
+        }
+        buf = vec![0u16; n + 1];
+    }
+    None
+}
+/// "DROPBE~1", "DROPB~12.JSO": the shape of an 8.3 short name (only used when
+/// the real name can't be read).
+pub(super) fn short_alias(name: &str) -> bool {
+    let (base, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+    let Some((_, digits)) = base.rsplit_once('~') else { return false };
+    base.len() <= 8 && ext.len() <= 3 && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// NtCreateFile relative to `parent` (an empty name reopens `parent` itself as a
@@ -82,7 +107,14 @@ fn nt_open(parent: &fs::File, name: &OsStr, access: u32, disposition: NTCREATEFI
         FILE_FLAGS_AND_ATTRIBUTES(attributes), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, disposition,
         NTCREATEFILE_CREATE_OPTIONS(options | FILE_SYNCHRONOUS_IO_NONALERT.0 | FILE_OPEN_REPARSE_POINT.0), None, 0) };
     if status.0 < 0 { return Err(nt_err(status)); }
-    Ok(unsafe { fs::File::from_raw_handle(out.0) })
+    let f = unsafe { fs::File::from_raw_handle(out.0) };
+    // NT also resolves 8.3 short names ("DROPBE~1"): unless control data was
+    // asked for by its own name, what opened must not be control data.
+    if disposition == FILE_OPEN && !name.is_empty() && !reserved(name) {
+        let alias = match real_name(&f) { Some(real) => reserved(&real), None => short_alias(&name.to_string_lossy()) };
+        if alias { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Reserved location path")); }
+    }
+    Ok(f)
 }
 /// The Unix `child` checks: no reparse point, same volume as the parent, and
 /// no protected OS entry.

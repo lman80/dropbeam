@@ -3177,4 +3177,44 @@ mod tests {
         assert!(outside.join("secret").exists());
     }
 
+    /// An 8.3 short name ("DROPBE~1") is another way to reach `.dropbeam-*`
+    /// control data: refused at every open, whatever the name looks like.
+    #[cfg(windows)]
+    #[test]
+    fn windows_short_names_never_reach_control_data() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        for (name, alias) in [("DROPBE~1", true), ("DROPB~12.JSO", true), ("DROPBE~12.JSO", false), ("a~1.txt", true), ("PROGRA~", false), ("report~v2.txt", false), ("averylongname~1", false)] {
+            assert_eq!(win::short_alias(name), alias, "{name}");
+        }
+        let f = Fixture::new(); let root = Root::open(&f.root).unwrap();
+        fs::write(f.root.join("c.txt"), b"secret").unwrap();
+        let trash = root.trash("c.txt").unwrap();
+        let dir = f.root.join(".dropbeam-trash");
+        let short = |p: &Path| -> String {
+            let wide: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+            let mut out = vec![0u16; 1024];
+            let n = unsafe { windows::Win32::Storage::FileSystem::GetShortPathNameW(windows::core::PCWSTR(wide.as_ptr()), Some(&mut out)) } as usize;
+            std::ffi::OsString::from_wide(&out[..n]).to_string_lossy().rsplit('\\').next().unwrap_or("").to_owned()
+        };
+        let mut alias = short(&dir);
+        if alias.eq_ignore_ascii_case(".dropbeam-trash") || alias.is_empty() {
+            // 8.3 names are off on this volume: give it one (CI runs as admin).
+            let _ = std::process::Command::new("fsutil").args(["file", "setshortname"]).arg(&dir).arg("DROPBE~1").output();
+            alias = short(&dir);
+        }
+        if alias.eq_ignore_ascii_case(".dropbeam-trash") || alias.is_empty() {
+            eprintln!("skipping: no 8.3 short names on this volume");
+            return;
+        }
+        let inner = trash.trim_start_matches(".dropbeam-trash/");
+        assert!(root.resolve(&format!("{alias}/{inner}")).is_err(), "{alias}");
+        assert!(root.stat_entry(&alias).unwrap().is_none(), "{alias}");
+        assert!(root.stat_entry(&format!("{alias}/{inner}")).unwrap().is_none());
+        assert!(root.rename_item(&format!("{alias}/{inner}"), "out.txt").is_err());
+        assert!(root.trash(&alias).is_err());
+        assert!(!f.root.join("out.txt").exists());
+        // The real long name still works for the app's own use.
+        assert_eq!(fs::read(f.root.join(&trash)).unwrap(), b"secret");
+    }
+
 }

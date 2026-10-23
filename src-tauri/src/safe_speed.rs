@@ -398,6 +398,18 @@ pub(crate) fn locality_is_local(conn: &iroh::endpoint::Connection) -> bool {
     matches!(crate::iroh_net::locality_of(conn), crate::models::Locality::Local)
 }
 
+static TESTS_RUNNING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+/// A peer's one running speed test (freed on drop).
+struct TestSlot(String);
+impl TestSlot {
+    fn take(who: &str) -> Option<TestSlot> {
+        TESTS_RUNNING.lock().unwrap_or_else(|p| p.into_inner()).insert(who.to_owned()).then(|| TestSlot(who.to_owned()))
+    }
+}
+impl Drop for TestSlot {
+    fn drop(&mut self) { TESTS_RUNNING.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0); }
+}
+
 /// Serve a friend's (or own device's) speed test: read and throw away what
 /// they send, then say how much arrived. Strangers are refused.
 pub(crate) async fn serve_test(config: &std::path::Path, who: &str, send: &mut iroh::endpoint::SendStream, recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<()> {
@@ -407,6 +419,12 @@ pub(crate) async fn serve_test(config: &std::path::Path, who: &str, send: &mut i
         let _ = send.finish();
         return Ok(());
     }
+    // One test at a time per peer: each may take a minute and up to TEST_MAX_BYTES.
+    let Some(_running) = TestSlot::take(who) else {
+        write_frame(send, &serde_json::json!({ "kind": "speed-test", "ok": false, "error": "A speed test from this device is already running" })).await?;
+        let _ = send.finish();
+        return Ok(());
+    };
     write_frame(send, &serde_json::json!({ "kind": "speed-test", "ok": true })).await?;
     let start = Instant::now();
     let mut got = 0u64;
@@ -548,6 +566,17 @@ async fn run_inner(app: &tauri::AppHandle, state: &crate::iroh_net::IrohState, t
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One speed test at a time per peer; another peer isn't held up.
+    #[test]
+    fn one_speed_test_per_peer() {
+        let who = format!("peer-{}", uuid::Uuid::new_v4());
+        let first = TestSlot::take(&who).unwrap();
+        assert!(TestSlot::take(&who).is_none());
+        assert!(TestSlot::take(&format!("{who}-b")).is_some());
+        drop(first);
+        assert!(TestSlot::take(&who).is_some());
+    }
 
     fn ms(n: u64) -> Option<Duration> {
         Some(Duration::from_millis(n))

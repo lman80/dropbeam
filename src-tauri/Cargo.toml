@@ -140,7 +140,8 @@ windows-core = "0.62"
 # the `dropbeam` command attaches to its terminal; the agent pipe's owner-only ACL.
 # `Win32_System_JobObjects`, `Win32_System_Registry` (SHELLEXECUTEINFOW): the Windows
 # background host — its engine child dies with the supervisor; one elevated (UAC) step.
-windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_DataExchange", "Win32_System_Power", "Win32_Security", "Win32_System_IO", "Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Registry"] }
+# `Win32_System_Pipes`: the `dropbeam` command checks the pipe server runs as you.
+windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_DataExchange", "Win32_System_Power", "Win32_Security", "Win32_System_IO", "Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Pipes"] }
 # Clickable chat notifications (#67): a WinRT toast with an Activated handler —
 # the same crate notify-rust uses under the plugin.
 tauri-winrt-notification = "0.7"

@@ -137,15 +137,26 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> Duplex for T {}
 fn config_dir() -> PathBuf { crate::headless::default_config_dir() }
 
 async fn connect_once(config: &Path) -> std::io::Result<Box<dyn Duplex>> {
+    // Trust only an endpoint this user made and an app running as this user.
     #[cfg(unix)]
-    { Ok(Box::new(tokio::net::UnixStream::connect(crate::agent_ctl::socket_path(config)).await?)) }
+    {
+        if let Err(e) = crate::agent_ctl::check_private_dir(&crate::agent_ctl::socket_dir(config)) {
+            // Not there yet = not running (start it); there but not ours = refuse.
+            return Err(if e.kind() == std::io::ErrorKind::NotFound { e } else { std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()) });
+        }
+        let s = tokio::net::UnixStream::connect(crate::agent_ctl::socket_path(config)).await?;
+        crate::agent_ctl::check_peer(&s)?;
+        Ok(Box::new(s))
+    }
     #[cfg(windows)]
     {
         use tokio::net::windows::named_pipe::ClientOptions;
         let name = std::fs::read_to_string(crate::agent_ctl::pipe_name_file(config))?;
+        let name = name.trim();
+        if !name.starts_with(r"\\.\pipe\dropbeam-agent-") { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the agent pipe name isn't DropBeam's")); }
         for _ in 0..50 {
-            match ClientOptions::new().open(name.trim()) {
-                Ok(c) => return Ok(Box::new(c)),
+            match ClientOptions::new().open(name) {
+                Ok(c) => { crate::agent_ctl::check_pipe_server(&c)?; return Ok(Box::new(c)) }
                 Err(e) if e.raw_os_error() == Some(231) => tokio::time::sleep(Duration::from_millis(50)).await,
                 Err(e) => return Err(e),
             }
@@ -181,13 +192,22 @@ fn start_app() -> Result<Option<std::process::Child>, String> {
 }
 
 async fn connect(config: &Path, may_start: bool, quiet: bool) -> Result<Box<dyn Duplex>, String> {
-    if let Ok(c) = connect_once(config).await { return Ok(c); }
+    let untrusted = |e: std::io::Error| format!("Refusing to talk to that DropBeam: {e}.");
+    match connect_once(config).await {
+        Ok(c) => return Ok(c),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Err(untrusted(e)),
+        Err(_) => {}
+    }
     if !may_start { return Err("DropBeam isn't running (start it, or leave out --no-start).".into()); }
     if !quiet { eprintln!("Starting DropBeam…"); }
     let mut child = start_app()?;
     for _ in 0..240 {
         tokio::time::sleep(Duration::from_millis(250)).await;
-        if let Ok(c) = connect_once(config).await { return Ok(c); }
+        match connect_once(config).await {
+            Ok(c) => return Ok(c),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Err(untrusted(e)),
+            Err(_) => {}
+        }
         if let Some(Ok(Some(status))) = child.as_mut().map(|c| c.try_wait()) {
             return Err(format!("DropBeam stopped right after starting ({status}). Open it once normally to see why."));
         }
