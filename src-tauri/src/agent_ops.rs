@@ -255,7 +255,7 @@ fn catalog() -> Vec<OpSpec> {
         op("locations.hostedStatus", Read, "Whether one of this device's Locations is reachable, how much space is left, who used it last.")
             .req("id", S, "Location id.").cmds(&["hosted_location_status"]).build(),
         op("locations.save", Write, "Share a folder as a Location, or change one (same object the Locations settings save).")
-            .req("location", Obj, "{id, name, path, friend_ids, rights:{read,upload,manage}, byte_cap}").cmds(&["save_location"]).build(),
+            .req("location", Obj, "{id, name, path, friendIds:[friend id], rights:{upload, manage}, byteCap} — to change one, start from locations.hosted and keep its marker and device").cmds(&["save_location"]).build(),
         op("locations.unshare", Destructive, "Stop sharing one of this device's Locations (the folder itself stays).")
             .req("id", S, "Location id.").build(),
         op("locations.activity", Read, "Recent changes people made in this device's Locations.").cmds(&["location_activity"]).build(),
@@ -784,6 +784,11 @@ pub async fn run(app: &AppHandle, name: &str, i: &Value, ctx: &Ctx) -> R {
         "locations.hosted" => ok(commands::list_locations(app.state()).await.map_err(failed)?),
         "locations.hostedStatus" => ok(commands::hosted_location_status(app.state(), s(i, "id")?).await.map_err(failed)?),
         "locations.save" => {
+            // A misspelt field (friend_ids) would otherwise be dropped silently and share with no one.
+            const KNOWN: [&str; 9] = ["id", "name", "path", "friendIds", "rights", "byteCap", "device", "marker", "safePublish"];
+            if let Some(k) = i["location"].as_object().and_then(|o| o.keys().find(|k| !KNOWN.contains(&k.as_str()))) {
+                return Err(bad(format!("location: unknown field \"{k}\" (fields: {})", KNOWN.join(", "))));
+            }
             let l: crate::locations::Location = serde_json::from_value(i["location"].clone()).map_err(|e| bad(format!("location: {e}")))?;
             ok(commands::save_location(app.clone(), app.state(), app.state(), Some(l), None).await.map_err(failed)?)
         }
