@@ -86,6 +86,11 @@ const PROBE_RTT_INTERVAL_SEC: u64 = 5;
 /// equivalent to BBR.LossThresh: A constant specifying the maximum tolerated per-round-trip packet
 /// loss rate when probing for bandwidth (the default is 2%).
 const LOSS_THRESH: f64 = 0.02;
+/// DropBeam patch: a loss round whose RTT stayed within max(min_rtt / 4, this) of min_rtt
+/// had no queue — see [`Bbr3Config::random_loss_tolerance`].
+const RANDOM_LOSS_RTT_SLACK: Duration = Duration::from_millis(5);
+/// DropBeam patch: above this loss fraction a round is treated as congestion regardless.
+const RANDOM_LOSS_MAX: f64 = 0.15;
 
 /// equivalent to BBR.Beta: A constant specifying the default multiplicative decrease to make upon
 /// each round trip during which the connection detects packet loss (the value is 0.7).
@@ -582,6 +587,11 @@ pub struct Bbr3 {
     max_ack_delay: Duration,
     /// DropBeam patch switch (see [`Bbr3Config::dropbeam_fixes`]).
     dropbeam_fixes: bool,
+    /// DropBeam patch switch (see [`Bbr3Config::random_loss_tolerance`]).
+    random_loss_tolerance: bool,
+    /// DropBeam patch: the largest RTT sample of the current loss round, the "did this
+    /// round's loss come with a queue?" signal for `random_loss_tolerance`.
+    loss_round_max_rtt: Duration,
 }
 
 impl Bbr3 {
@@ -710,6 +720,8 @@ impl Bbr3 {
             ack_eliciting_threshold: 1,
             max_ack_delay: Duration::from_millis(25),
             dropbeam_fixes: config.dropbeam_fixes,
+            random_loss_tolerance: config.random_loss_tolerance,
+            loss_round_max_rtt: Duration::ZERO,
         }
     }
 
@@ -737,6 +749,7 @@ impl Bbr3 {
                 .copied()
                 .fold(f64::NAN, f64::max);
             self.inflight_latest = Ord::max(self.inflight_latest, rate_sample.delivered);
+            self.loss_round_max_rtt = self.loss_round_max_rtt.max(rate_sample.rtt);
 
             if rate_sample.prior_delivered >= self.loss_round_delivered {
                 self.loss_round_delivered = self.delivered;
@@ -753,6 +766,7 @@ impl Bbr3 {
         }
         self.adapt_lower_bounds_from_congestion();
         self.loss_in_round = false;
+        self.loss_round_max_rtt = Duration::ZERO;
     }
 
     /// equivalent to BBRUpdateMaxBw <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.5>
@@ -792,12 +806,25 @@ impl Bbr3 {
             | BbrState::ProbeBw(ProbeBwSubstate::Up)
             | BbrState::Startup => {}
             _ => {
-                if self.loss_in_round {
+                if self.loss_in_round && !self.loss_looks_random() {
                     self.init_lower_bounds();
                     self.loss_lower_bounds();
                 }
             }
         }
+    }
+
+    /// DropBeam patch: see [`Bbr3Config::random_loss_tolerance`].
+    fn loss_looks_random(&self) -> bool {
+        if !self.random_loss_tolerance || self.min_rtt == Duration::from_secs(u64::MAX) {
+            return false;
+        }
+        let slack = Ord::max(self.min_rtt / 4, RANDOM_LOSS_RTT_SLACK);
+        let no_queue = self.loss_round_max_rtt <= self.min_rtt + slack;
+        let moderate = self
+            .rs
+            .is_some_and(|rs| (rs.lost as f64) <= rs.tx_in_flight as f64 * RANDOM_LOSS_MAX);
+        no_queue && moderate
     }
 
     /// equivalent to BBRInitLowerBounds <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.3-8>
@@ -2055,6 +2082,7 @@ pub struct Bbr3Config {
     initial_window: u64,
     probe_rng_seed: Option<[u8; 16]>,
     dropbeam_fixes: bool,
+    random_loss_tolerance: bool,
     startup_pacing_gain: Option<f64>,
     default_pacing_gain: Option<f64>,
     probe_bw_down_pacing_gain: Option<f64>,
@@ -2075,6 +2103,20 @@ impl Bbr3Config {
         self
     }
 
+    /// DropBeam patch: don't cut the short-term model (`bw_shortterm` /
+    /// `inflight_shortterm`, the BETA = 0.7 step of BBRLossLowerBounds) for a round whose
+    /// loss came WITHOUT a queue — every RTT sample of the round within
+    /// `RANDOM_LOSS_RTT_SLACK` of min_rtt, and the latest sample's loss under
+    /// `RANDOM_LOSS_MAX`. Such loss is non-congestive (a lossy Wi-Fi/radio hop): cutting
+    /// for it, round after round between bandwidth probes, decays the sending rate
+    /// geometrically toward (1 - loss)^rounds — measured 2026-10-23 on a Korea uplink with
+    /// ~8% random loss: ~5 of 8 Mbit/s. Congestion still shows as a queue (RTT growth) and
+    /// is still cut for; probing's loss checks (`is_inflight_too_high`) are untouched.
+    pub fn random_loss_tolerance(&mut self, value: bool) -> &mut Self {
+        self.random_loss_tolerance = value;
+        self
+    }
+
     /// Default limit on the amount of outstanding data in bytes.
     ///
     /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
@@ -2092,6 +2134,7 @@ impl Default for Bbr3Config {
             initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
             probe_rng_seed: None,
             dropbeam_fixes: false,
+            random_loss_tolerance: false,
             startup_pacing_gain: None,
             default_pacing_gain: None,
             probe_bw_down_pacing_gain: None,
@@ -2274,6 +2317,7 @@ mod test {
             initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
             probe_rng_seed: Some(seed),
             dropbeam_fixes: false,
+            random_loss_tolerance: false,
             startup_pacing_gain: None,
             default_pacing_gain: None,
             probe_bw_down_pacing_gain: None,
@@ -3545,6 +3589,7 @@ mod test {
         let config = Bbr3Config {
             probe_rng_seed: Some([6; 16]),
             dropbeam_fixes: false,
+            random_loss_tolerance: false,
             ..Bbr3Config::default()
         };
         let mut sim = Sim::new(config, MSS, BW, RTT_NS);
@@ -4703,6 +4748,7 @@ mod test {
         let config = Bbr3Config {
             probe_rng_seed: Some(seed),
             dropbeam_fixes: false,
+            random_loss_tolerance: false,
             ..Bbr3Config::default()
         };
         let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
@@ -5002,6 +5048,7 @@ mod test {
         let config = Bbr3Config {
             probe_rng_seed: Some(seed),
             dropbeam_fixes: false,
+            random_loss_tolerance: false,
             ..Bbr3Config::default()
         };
         let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
@@ -5263,6 +5310,7 @@ mod test {
         let config = Bbr3Config {
             probe_rng_seed: Some(seed),
             dropbeam_fixes: false,
+            random_loss_tolerance: false,
             ..Bbr3Config::default()
         };
         let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
@@ -5495,6 +5543,7 @@ mod test {
         let config = Bbr3Config {
             probe_rng_seed: Some(seed),
             dropbeam_fixes: false,
+            random_loss_tolerance: false,
             ..Bbr3Config::default()
         };
         let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
@@ -5730,6 +5779,7 @@ mod test {
         let config = Bbr3Config {
             probe_rng_seed: Some(seed),
             dropbeam_fixes: false,
+            random_loss_tolerance: false,
             ..Bbr3Config::default()
         };
         let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
@@ -6011,6 +6061,7 @@ mod test {
         let config = Bbr3Config {
             probe_rng_seed: Some(seed),
             dropbeam_fixes: false,
+            random_loss_tolerance: false,
             ..Bbr3Config::default()
         };
         let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
@@ -6569,6 +6620,7 @@ mod test {
         let config = Bbr3Config {
             probe_rng_seed: Some(seed),
             dropbeam_fixes: false,
+            random_loss_tolerance: false,
             ..Bbr3Config::default()
         };
         let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
@@ -6816,6 +6868,7 @@ mod test {
         let config = Bbr3Config {
             probe_rng_seed: Some([6; 16]),
             dropbeam_fixes: false,
+            random_loss_tolerance: false,
             ..Bbr3Config::default()
         };
         let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);

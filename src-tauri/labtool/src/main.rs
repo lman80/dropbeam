@@ -9,7 +9,7 @@
 //!     prints `{"event":"ready","addr":"lab..."}` then one JSON line per
 //!     completed inbound transfer (files, rel paths, sha256s, bytes, ms).
 //!
-//! Sender:    dropbeam-lab send --to <labADDR> [--mode auto|direct|relay]
+//! Sender:    dropbeam-lab send --to <labADDR> [--mode auto|direct|relay|public|overlay]
 //!                [--suite quick|full|big] [--parallel on|off] [--dir <corpus>]
 //!     builds the corpus, runs each case over a fresh connection, prints one
 //!     JSON line per case with the local (expected) sha256s + throughput.
@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "usage:\n  dropbeam-lab serve [--dest <dir>] [--state <dir>]\n  dropbeam-lab send --to <labADDR> [--mode auto|direct|relay] [--suite quick|full|big|edge|many|mixed] [--only <case>] [--parallel on|off] [--profile] [--dir <corpus>]\n  dropbeam-lab results --to <labADDR>\n  dropbeam-lab info --to <labADDR>\n  dropbeam-lab push-update --to <labADDR> --bin <path>"
+                "usage:\n  dropbeam-lab serve [--dest <dir>] [--state <dir>]\n  dropbeam-lab send --to <labADDR> [--mode auto|direct|relay|public|overlay] [--suite quick|full|big|edge|many|mixed] [--only <case>] [--parallel on|off] [--profile] [--dir <corpus>]\n  dropbeam-lab results --to <labADDR>\n  dropbeam-lab info --to <labADDR>\n  dropbeam-lab push-update --to <labADDR> --bin <path>"
             );
             std::process::exit(2);
         }

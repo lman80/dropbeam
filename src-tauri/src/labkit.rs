@@ -100,6 +100,7 @@ pub async fn lab_endpoint_persistent(accept: bool, state_dir: &Path) -> Result<E
 /// rides the public relay, the path a user behind a hostile NAT gets.
 pub async fn lab_endpoint_for(mode: &str) -> Result<Endpoint> {
     crate::iroh_net::watch_local_subnets().await;
+    crate::iroh_net::set_lab_path_filter(match mode { "public" => 1, "overlay" => 2, _ => 0 });
     if mode != "relay" { return lab_endpoint(false).await; }
     Endpoint::builder(presets::N0)
         .clear_ip_transports()
@@ -162,9 +163,17 @@ pub fn decode_addr(s: &str) -> Result<EndpointAddr> {
 
 /// Restrict a peer addr to one path family so a run PROVABLY exercises that path.
 /// `mode`: "direct" (IP only), "relay" (relay only), anything else = auto (full set).
+fn is_overlay_ip(ip: std::net::IpAddr) -> bool {
+    matches!(ip, std::net::IpAddr::V4(v4) if u32::from(v4) & 0xffc0_0000 == 0x6440_0000)
+}
+
 pub fn filter_addr(addr: EndpointAddr, mode: &str) -> EndpointAddr {
     let keep = |a: &TransportAddr| match mode {
         "direct" => matches!(a, TransportAddr::Ip(_)),
+        // public/overlay: IP addrs without / with only Tailscale-style 100.64/10
+        // ones (pair with `set_lab_path_filter`, done by `lab_endpoint_for`).
+        "public" => matches!(a, TransportAddr::Ip(sa) if !is_overlay_ip(sa.ip())),
+        "overlay" => matches!(a, TransportAddr::Ip(sa) if is_overlay_ip(sa.ip())),
         "relay" => matches!(a, TransportAddr::Relay(_)),
         _ => true,
     };

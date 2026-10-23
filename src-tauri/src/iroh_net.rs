@@ -2511,8 +2511,15 @@ pub(crate) fn bbr_config(stock: bool) -> noq_proto::congestion::Bbr3Config {
     let mut c = noq_proto::congestion::Bbr3Config::default();
     c.initial_window(iw);
     c.dropbeam_fixes(!stock);
+    let rlt = match std::env::var("DROPBEAM_BBR_RLT").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => RANDOM_LOSS_TOLERANCE,
+    };
+    c.random_loss_tolerance(!stock && rlt);
     c
 }
+const RANDOM_LOSS_TOLERANCE: bool = false;
 const INITIAL_WINDOW: u64 = 128 * 1024;
 
 /// Ask the peer to ACK every 11th packet (QUIC ack-frequency extension; the
@@ -2632,6 +2639,24 @@ fn is_overlay_routed(local: Option<std::net::IpAddr>, remote: std::net::IpAddr, 
     local.is_some_and(is_cgnat) && !is_cgnat(remote) && !remote_lan
 }
 
+/// dropbeam-lab only (never set by the app): hide one family of IP paths from
+/// the selector so a run provably measures it. 0 = off, 1 = public only (no
+/// overlay/Tailscale 100.64/10 paths), 2 = overlay only. Relay stays available.
+static LAB_PATH_FILTER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_lab_path_filter(mode: u8) {
+    LAB_PATH_FILTER.store(mode, Ordering::Relaxed);
+}
+
+fn lab_path_hidden(tuple: &iroh::endpoint::transports::FourTuple) -> bool {
+    let mode = LAB_PATH_FILTER.load(Ordering::Relaxed);
+    if mode == 0 { return false; }
+    match tuple.remote() {
+        iroh::endpoint::transports::Addr::Ip(sa) => is_cgnat(sa.ip()) != (mode == 2),
+        _ => false,
+    }
+}
+
 impl DirectPathSelector {
     fn decide(&self, ctx: &iroh::endpoint::transports::PathSelectionContext<'_>, now: Instant) -> Option<iroh::endpoint::transports::FourTuple> {
         use iroh::endpoint::transports::{AddrKind, FourTuple};
@@ -2643,6 +2668,7 @@ impl DirectPathSelector {
         for path in ctx.paths() {
             let Some(stats) = path.stats() else { continue; };
             let tuple = path.network_path();
+            if lab_path_hidden(tuple) { continue; }
             let entry = memo.entry(tuple.clone()).or_insert(PathMemo { min_rtt: stats.rtt, last_seen: now, selected_at: None });
             entry.min_rtt = entry.min_rtt.min(stats.rtt);
             entry.last_seen = now;
