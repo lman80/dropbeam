@@ -73,8 +73,13 @@ jobs:
         run: npm run build
 
       # Single-threaded: several engine tests bind real sockets / share globals.
+      # On Windows (the runner is an administrator) DROPBEAM_CI_TASK_TEST also
+      # registers, reads, runs and removes the real startup task through Task
+      # Scheduler COM, and round-trips a scratch HKCU\Environment value.
       - name: Unit tests
         working-directory: src-tauri
+        env:
+          DROPBEAM_CI_TASK_TEST: ${{ runner.os == 'Windows' && '1' || '' }}
         run: cargo test --lib -- --test-threads=1
 
       # The `dropbeam` command line lives in the app binary (cli.rs): it must run
@@ -97,6 +102,40 @@ jobs:
             set +e; cmd //c 'target\debug\dropbeam.cmd status --no-start'; code=$?; set -e
             test "$code" = 1
           fi
+
+      # Windows: the internal elevated jobs (elevate.rs) through main.rs, run
+      # directly (the runner is already elevated): strict argument checks, then
+      # the real startup task registered by DropBeam.exe itself — checked with
+      # schtasks here in CI only — and removed again.
+      - name: Elevated jobs smoke test (Windows)
+        if: runner.os == 'Windows'
+        working-directory: src-tauri
+        shell: bash
+        env:
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          bin=target/debug/DropBeam.exe
+          for bad in "--background-task" "--background-task install" "--fix-webdav extra" "--background-task remove now"; do
+            set +e; $bin $bad; code=$?; set -e
+            echo "$bad -> $code"; test "$code" = 2
+          done
+          cfg="$(cygpath -w "$RUNNER_TEMP")\\dropbeam ci config"
+          mkdir -p "$(cygpath -u "$cfg")"
+          set +e; $bin --background-task register --config "$cfg" --user "$USERNAME" --extra; code=$?; set -e; test "$code" = 2
+          set +e; $bin --background-task register --config "C:\\nope\\missing" --user "$USERNAME"; code=$?; set -e; test "$code" = 2
+          $bin --background-task register --config "$cfg" --user "$USERDOMAIN\\$USERNAME"
+          schtasks /Query /TN "DropBeam Background" /XML | tr -d "\000" > task.xml
+          cat task.xml
+          grep -q "<LogonType>S4U</LogonType>" task.xml
+          grep -q "<BootTrigger" task.xml
+          grep -q "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" task.xml
+          grep -q "DropBeam.exe</Command>" task.xml
+          grep -q -- "--server --config .*dropbeam ci config" task.xml
+          $bin --background-task remove
+          set +e; schtasks /Query /TN "DropBeam Background" > /dev/null 2>&1; code=$?; set -e; test "$code" != 0
+          $bin --background-task remove
+          # WebClient isn't installed on Windows Server: only check the job runs.
+          set +e; $bin --fix-webdav; echo "fix-webdav -> $?"; set -e
 
       # Warnings are listed, errors fail the job.
       - name: Clippy

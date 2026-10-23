@@ -7,8 +7,10 @@
 //!   without admin rights by `mount_nfs` at `~/DropBeam Drives`.
 //! - Linux: WebDAV on the stream server (127.0.0.1, per-run token), mounted
 //!   with `gio mount` so it shows in Files.
-//! - Windows: the same WebDAV mapped to a drive letter with `net use`
-//!   (WebClient), with a one-click fix for a stopped service / 50 MB limit.
+//! - Windows: the same WebDAV mapped to a drive letter with WNetAddConnection2W
+//!   (WebClient), with a one-click fix for a stopped service / 50 MB limit
+//!   (registry + Service Control Manager, elevated by re-launching DropBeam
+//!   itself — elevate.rs; no script hosts or system tools are started).
 //!
 //! Writes never touch the host directly. A file created or changed through the
 //! drive is written to a private staging file here; once it has been idle for
@@ -851,11 +853,10 @@ impl Drive {
         let unc = windows_unc(server.port, &server.token);
         let letter = tokio::task::spawn_blocking(free_letter).await?.context("No free drive letter")?;
         let (l, u) = (letter.clone(), unc.clone());
-        let out = tokio::time::timeout(Duration::from_secs(60), tokio::task::spawn_blocking(move || {
-            hidden("net").args(["use", &l, &u, "/persistent:no"]).output()
-        })).await.context("Mapping the drive took too long")???;
-        if !out.status.success() {
-            let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let mapped = tokio::time::timeout(Duration::from_secs(60), tokio::task::spawn_blocking(move || win::map(&l, &u)))
+            .await.context("Mapping the drive took too long")??;
+        if let Err(e) = mapped {
+            let why = e.message().trim().trim_end_matches('.').to_string();
             let hint = windows_fix_needed().map(|f| format!(" {f}")).unwrap_or_default();
             anyhow::bail!("Windows couldn’t map the drive: {why}.{hint}");
         }
@@ -943,10 +944,9 @@ fn recover_stale() {
         }
     }
     #[cfg(windows)] {
-        let Ok(out) = hidden("net").arg("use").output() else { return; };
-        for letter in stale_net_letters(&String::from_utf8_lossy(&out.stdout)) {
+        for (letter, _) in win::mapped_letters().into_iter().filter(|(_, remote)| ours_unc(remote)) {
             log::info!("drive: removing a mapping left by an earlier run");
-            let _ = hidden("net").args(["use", &letter, "/delete", "/y"]).status();
+            let _ = win::unmap(&letter);
         }
     }
 }
@@ -955,10 +955,10 @@ fn recover_stale() {
 fn stale_dav_uris(listing: &str) -> Vec<String> {
     listing.split_whitespace().filter(|w| w.starts_with("dav://127.0.0.1:") && w.contains("/dav")).map(str::to_string).collect()
 }
-/// `net use` rows mapping a drive letter to our localhost WebDAV share.
+/// A drive letter's remote name that is our localhost WebDAV share.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn stale_net_letters(listing: &str) -> Vec<String> {
-    listing.lines().filter(|l| l.contains("\\\\127.0.0.1@")).filter_map(|l| l.split_whitespace().find(|w| w.len() == 2 && w.ends_with(':')).map(str::to_string)).collect()
+fn ours_unc(remote: &str) -> bool {
+    remote.starts_with("\\\\127.0.0.1@") && remote.to_ascii_lowercase().ends_with("\\dav")
 }
 #[cfg_attr(not(windows), allow(dead_code))]
 fn windows_unc(port: u16, token: &str) -> String { format!("\\\\127.0.0.1@{port}\\{token}\\dav") }
@@ -976,8 +976,8 @@ async fn unmount_os(m: &Mounted) -> Result<()> {
     }
     #[cfg(windows)] {
         let letter = m.uri.clone();
-        let out = tokio::task::spawn_blocking(move || hidden("net").args(["use", &letter, "/delete", "/y"]).output()).await??;
-        anyhow::ensure!(out.status.success(), "The drive is in use. Close files opened from it and try again.");
+        let out = tokio::task::spawn_blocking(move || win::unmap(&letter)).await?;
+        anyhow::ensure!(out.is_ok(), "The drive is in use. Close files opened from it and try again.");
         Ok(())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))] { let _ = m; Ok(()) }
@@ -993,12 +993,90 @@ pub fn shutdown_blocking() {
     while !done.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(5) { std::thread::sleep(Duration::from_millis(50)); }
 }
 
+/// Drive letters, WebClient and its limit through the Win32 API (no `net use`,
+/// `sc` or `reg`: see elevate.rs for why DropBeam starts no system tools).
 #[cfg(windows)]
-fn hidden(program: &str) -> std::process::Command {
-    use std::os::windows::process::CommandExt;
-    let mut c = std::process::Command::new(program);
-    c.creation_flags(0x0800_0000);
-    c
+mod win {
+    use crate::elevate::win::wide;
+    use windows::core::{w, PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, WIN32_ERROR};
+    use windows::Win32::NetworkManagement::WNet::{WNetAddConnection2W, WNetCancelConnection2W, WNetGetConnectionW, NETRESOURCEW, NET_CONNECT_FLAGS, RESOURCETYPE_DISK};
+    use windows::Win32::System::Registry::{RegGetValueW, RegSetKeyValueW, HKEY_LOCAL_MACHINE, REG_DWORD, RRF_RT_REG_DWORD};
+    use windows::Win32::System::Services::*;
+
+    pub const PARAMETERS: PCWSTR = w!(r"SYSTEM\CurrentControlSet\Services\WebClient\Parameters");
+    pub const LIMIT: PCWSTR = w!("FileSizeLimitInBytes");
+
+    /// Map `letter` (`X:`) to `unc` for this session only (not remembered).
+    pub fn map(letter: &str, unc: &str) -> windows::core::Result<()> {
+        let (mut l, mut u) = (wide(letter), wide(unc));
+        let res = NETRESOURCEW { dwType: RESOURCETYPE_DISK, lpLocalName: PWSTR(l.as_mut_ptr()), lpRemoteName: PWSTR(u.as_mut_ptr()), ..Default::default() };
+        unsafe { WNetAddConnection2W(&res, PCWSTR::null(), PCWSTR::null(), NET_CONNECT_FLAGS(0)) }.ok()
+    }
+    /// Remove the mapping even if files are open (as `net use X: /delete /y` did).
+    pub fn unmap(letter: &str) -> windows::core::Result<()> {
+        let l = wide(letter);
+        unsafe { WNetCancelConnection2W(PCWSTR(l.as_ptr()), NET_CONNECT_FLAGS(0), true) }.ok()
+    }
+    /// Every mapped letter and what it points at (also ones whose server is gone).
+    pub fn mapped_letters() -> Vec<(String, String)> {
+        const UNAVAILABLE: WIN32_ERROR = WIN32_ERROR(1201); // ERROR_CONNECTION_UNAVAIL
+        ('A'..='Z').filter_map(|c| {
+            let letter = format!("{c}:");
+            let l = wide(&letter);
+            let mut buf = vec![0u16; 1024];
+            let mut len = buf.len() as u32;
+            let r = unsafe { WNetGetConnectionW(PCWSTR(l.as_ptr()), Some(PWSTR(buf.as_mut_ptr())), &mut len) };
+            (r.0 == 0 || r == UNAVAILABLE).then(|| (letter, String::from_utf16_lossy(&buf[..buf.iter().position(|&x| x == 0).unwrap_or(0)])))
+        }).collect()
+    }
+
+    struct Sc(SC_HANDLE);
+    impl Drop for Sc {
+        fn drop(&mut self) { let _ = unsafe { CloseServiceHandle(self.0) }; }
+    }
+    fn webclient(access: u32) -> windows::core::Result<Sc> {
+        let scm = Sc(unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }?);
+        Ok(Sc(unsafe { OpenServiceW(scm.0, w!("WebClient"), access) }?))
+    }
+    /// WebClient's start type (an error when it isn't installed).
+    pub fn start_type() -> windows::core::Result<SERVICE_START_TYPE> {
+        let svc = webclient(SERVICE_QUERY_CONFIG)?;
+        let mut need = 0u32;
+        let _ = unsafe { QueryServiceConfigW(svc.0, None, 0, &mut need) };
+        let mut buf = vec![0u64; (need as usize).div_ceil(8).max(8)];
+        let size = (buf.len() * 8) as u32;
+        unsafe { QueryServiceConfigW(svc.0, Some(buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW), size, &mut need) }?;
+        Ok(unsafe { (*(buf.as_ptr() as *const QUERY_SERVICE_CONFIGW)).dwStartType })
+    }
+    /// FileSizeLimitInBytes (Windows' default, 50 MB, when it isn't set).
+    pub fn limit() -> u64 {
+        let (mut v, mut size) = (0u32, 4u32);
+        let r = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, PARAMETERS, LIMIT, RRF_RT_REG_DWORD, None, Some(&mut v as *mut u32 as *mut _), Some(&mut size)) };
+        if r.0 == 0 { v as u64 } else { 50_000_000 }
+    }
+    /// Administrator only (elevate.rs): limit to the 4 GB maximum, start
+    /// automatically, restart so the new limit applies.
+    pub fn fix() -> windows::core::Result<()> {
+        let max = u32::MAX;
+        unsafe { RegSetKeyValueW(HKEY_LOCAL_MACHINE, PARAMETERS, LIMIT, REG_DWORD.0, Some(&max as *const u32 as *const _), 4) }.ok()?;
+        let svc = webclient(SERVICE_CHANGE_CONFIG | SERVICE_START | SERVICE_STOP | SERVICE_QUERY_STATUS)?;
+        unsafe {
+            ChangeServiceConfigW(svc.0, ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE), SERVICE_AUTO_START, SERVICE_ERROR(SERVICE_NO_CHANGE),
+                PCWSTR::null(), PCWSTR::null(), None, PCWSTR::null(), PCWSTR::null(), PCWSTR::null(), PCWSTR::null())?;
+            let mut st = SERVICE_STATUS::default();
+            if ControlService(svc.0, SERVICE_CONTROL_STOP, &mut st).is_ok() {
+                for _ in 0..80 {
+                    if QueryServiceStatus(svc.0, &mut st).is_err() || st.dwCurrentState == SERVICE_STOPPED { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+            match StartServiceW(svc.0, None) {
+                Err(e) if e.code() != ERROR_SERVICE_ALREADY_RUNNING.to_hresult() => Err(e),
+                _ => Ok(()),
+            }
+        }
+    }
 }
 #[cfg(windows)]
 fn free_letter() -> Option<String> {
@@ -1008,25 +1086,23 @@ fn free_letter() -> Option<String> {
 /// files over 50 MB. Returns what's wrong in words, or None when it's fine.
 #[cfg(windows)]
 pub fn windows_fix_needed() -> Option<String> {
-    let service = hidden("sc").args(["qc", "WebClient"]).output().ok()?;
-    let text = String::from_utf8_lossy(&service.stdout).to_string();
-    if !service.status.success() || text.is_empty() { return Some("The Windows WebDAV client (WebClient) isn’t installed. Turn on “WebDAV Redirector” in Windows Features.".into()); }
-    if text.contains("DISABLED") { return Some("The Windows WebDAV client (WebClient) is turned off.".into()); }
-    let limit = hidden("reg").args(["query", r"HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters", "/v", "FileSizeLimitInBytes"]).output().ok()?;
-    let value = String::from_utf8_lossy(&limit.stdout).split_whitespace().last().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(50_000_000);
-    (value < 4_000_000_000).then(|| "Windows limits files on this kind of drive to 50 MB.".into())
+    match win::start_type() {
+        Err(_) => return Some("The Windows WebDAV client (WebClient) isn’t installed. Turn on “WebDAV Redirector” in Windows Features.".into()),
+        Ok(t) if t == windows::Win32::System::Services::SERVICE_DISABLED => return Some("The Windows WebDAV client (WebClient) is turned off.".into()),
+        Ok(_) => {}
+    }
+    (win::limit() < 4_000_000_000).then(|| "Windows limits files on this kind of drive to 50 MB.".into())
 }
 #[cfg(not(windows))]
 pub fn windows_fix_needed() -> Option<String> { None }
+/// The `--fix-webdav` job itself (elevate.rs; needs administrator rights).
+#[cfg(windows)]
+pub fn webdav_fix_native() -> windows::core::Result<()> { win::fix() }
 /// One elevated step (Windows asks for permission): start WebClient
 /// automatically and raise its file size limit to the 4 GB maximum.
 #[cfg(windows)]
 pub fn windows_fix() -> Result<()> {
-    let script = r"Set-Service WebClient -StartupType Automatic; Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WebClient\Parameters' -Name FileSizeLimitInBytes -Value 4294967295 -Type DWord; Restart-Service WebClient -Force";
-    let outer = format!("Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','{}'", script.replace('\'', "''"));
-    let status = hidden("powershell").args(["-NoProfile", "-Command", &outer]).status()?;
-    anyhow::ensure!(status.success(), "Windows didn’t allow the change");
-    Ok(())
+    crate::elevate::win::run(&crate::elevate::Job::FixWebdav, "Windows").map_err(anyhow::Error::msg)
 }
 #[cfg(not(windows))]
 pub fn windows_fix() -> Result<()> { anyhow::bail!("Only needed on Windows") }
@@ -1305,8 +1381,8 @@ mod tests {
         assert_eq!(display_name("NAS", &["nas".into()]), "NAS (2)");
         assert!(local_only("._movie.mp4") && local_only(".DS_Store") && local_only("~$report.docx") && !local_only("report.docx"));
         assert_eq!(stale_dav_uris("Mount(0): 127.0.0.1 -> dav://127.0.0.1:41234/abc/dav/\n  Type: GDaemonMount"), vec!["dav://127.0.0.1:41234/abc/dav/"]);
-        let net = "OK           Z:        \\\\127.0.0.1@51234\\abc\\dav   Web Client Network\nOK  Y: \\\\nas\\share  Microsoft Windows Network";
-        assert_eq!(stale_net_letters(net), vec!["Z:"]);
+        assert!(ours_unc("\\\\127.0.0.1@51234\\abc\\dav") && ours_unc(&windows_unc(5000, "tok")));
+        assert!(!ours_unc("\\\\nas\\share") && !ours_unc("\\\\127.0.0.1@51234\\abc\\other") && !ours_unc("\\\\127.0.0.10@1\\x\\dav"));
         assert_eq!(windows_unc(5000, "tok"), "\\\\127.0.0.1@5000\\tok\\dav");
     }
 }

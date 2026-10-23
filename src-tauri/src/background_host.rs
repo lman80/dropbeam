@@ -4,8 +4,10 @@
 //!
 //! - Windows: a Scheduled Task `DropBeam Background` (at startup, runs as the
 //!   current user with logon type S4U — no password stored — limited rights,
-//!   no time limit, restarts if it fails). Turning it on or off asks Windows
-//!   for permission once (UAC); reading it doesn't.
+//!   no time limit, restarts if it fails), made through the Task Scheduler COM
+//!   API. Turning it on or off asks Windows for permission once (UAC): DropBeam
+//!   re-launches itself elevated for that one step (elevate.rs) — never a
+//!   script host, which antivirus treats as malware. Reading it doesn't.
 //! - Linux: the .deb's systemd unit; the app only shows the command.
 //! - macOS: not offered.
 //!
@@ -13,11 +15,15 @@
 //! background copy uses the same identity and Locations as the window even if
 //! the S4U session's environment differs from a signed-in one.
 
-use serde::{Deserialize, Serialize};
+// The task helpers are pure (tested everywhere) but only called on Windows.
+#![cfg_attr(not(windows), allow(dead_code))]
+
+use serde::Serialize;
 use std::path::Path;
 
 pub const TASK_NAME: &str = "DropBeam Background";
 pub const LINUX_COMMAND: &str = "sudo systemctl enable --now dropbeam-server@$USER";
+const DESCRIPTION: &str = "Keeps DropBeam sharing your Locations and holding messages when no one is signed in. Turn it off in DropBeam settings.";
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -32,22 +38,6 @@ pub struct BackgroundHostStatus {
     pub current: bool,
     /// Linux: the command that turns it on instead (no switch there).
     pub command: Option<String>,
-}
-
-/// A PowerShell single-quoted string literal. PowerShell also ends a
-/// single-quoted string at the typographic quotes ‘ ’ ‚ ‛, so every one of
-/// them is doubled too — nothing in the value can close the literal.
-pub fn ps_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
-            out.push(c);
-        }
-        out.push(c);
-    }
-    out.push('\'');
-    out
 }
 
 /// One argument quoted for a Windows command line (CommandLineToArgvW /
@@ -79,7 +69,7 @@ pub fn win_arg(s: &str) -> String {
 }
 
 /// Refuse values that have no business in a path or account name (quotes,
-/// control characters) before they go anywhere near a script.
+/// control characters — XML can't even carry most of those).
 fn checked<'a>(what: &str, s: &'a str) -> Result<&'a str, String> {
     if s.trim().is_empty() || s.chars().any(|c| c == '"' || c.is_control()) {
         return Err(format!("DropBeam can't set this up: its {what} has characters Windows doesn't allow here."));
@@ -92,91 +82,67 @@ pub fn task_arguments(config: &Path) -> String {
     format!("--server --config {}", win_arg(&config.to_string_lossy()))
 }
 
-/// The elevated script that (re)creates the task and starts it right away
-/// (it waits while the app holds the engine, then takes over when it closes).
-pub fn register_script(exe: &str, config: &Path, user: &str, err_file: &Path) -> Result<String, String> {
+/// Text for an XML element or attribute value.
+pub fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The task definition (Task Scheduler 1.2 schema): at startup, as `user`
+/// with S4U and limited rights, no time limit, on batteries too, restart
+/// every minute if it fails, one copy at a time, normal-ish priority.
+pub fn task_xml(exe: &str, config: &Path, user: &str) -> Result<String, String> {
     let exe = checked("program path", exe)?;
     let config_s = config.to_string_lossy();
     checked("settings folder", &config_s)?;
     let user = checked("account name", user)?;
-    let name = ps_quote(TASK_NAME);
     Ok(format!(
-        "$ErrorActionPreference = 'Stop'\n\
-         try {{\n\
-         $old = Get-ScheduledTask -TaskPath '\\' -TaskName {name} -ErrorAction SilentlyContinue\n\
-         if ($old) {{ Stop-ScheduledTask -InputObject $old -ErrorAction SilentlyContinue }}\n\
-         $action = New-ScheduledTaskAction -Execute {exe} -Argument {args}\n\
-         $trigger = New-ScheduledTaskTrigger -AtStartup\n\
-         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd -StartWhenAvailable \
-         -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -Priority 4\n\
-         $principal = New-ScheduledTaskPrincipal -UserId {user} -LogonType S4U -RunLevel Limited\n\
-         Register-ScheduledTask -TaskPath '\\' -TaskName {name} -Action $action -Trigger $trigger -Settings $settings -Principal $principal \
-         -Description 'Keeps DropBeam sharing your Locations and holding messages when no one is signed in. Turn it off in DropBeam settings.' -Force | Out-Null\n\
-         Start-ScheduledTask -TaskPath '\\' -TaskName {name}\n\
-         exit 0\n\
-         }} catch {{ [IO.File]::WriteAllText({err}, $_.Exception.Message); exit 1 }}\n",
-        exe = ps_quote(exe),
-        args = ps_quote(&task_arguments(config)),
-        user = ps_quote(user),
-        err = ps_quote(&err_file.to_string_lossy()),
+        "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\
+<RegistrationInfo><Description>{desc}</Description></RegistrationInfo>\
+<Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>\
+<Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>S4U</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\
+<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\
+<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable>\
+<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><AllowStartOnDemand>true</AllowStartOnDemand>\
+<Enabled>true</Enabled><Hidden>false</Hidden><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>4</Priority>\
+<RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings>\
+<Actions Context=\"Author\"><Exec><Command>{exe}</Command><Arguments>{args}</Arguments></Exec></Actions></Task>",
+        desc = xml_escape(DESCRIPTION),
+        user = xml_escape(user),
+        exe = xml_escape(exe),
+        args = xml_escape(&task_arguments(config)),
     ))
 }
 
-/// The elevated script that stops and removes the task (fine if it's gone).
-pub fn unregister_script(err_file: &Path) -> String {
-    let name = ps_quote(TASK_NAME);
-    format!(
-        "$ErrorActionPreference = 'Stop'\n\
-         try {{\n\
-         $t = Get-ScheduledTask -TaskPath '\\' -TaskName {name} -ErrorAction SilentlyContinue\n\
-         if ($t) {{ Stop-ScheduledTask -InputObject $t -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskPath '\\' -TaskName {name} -Confirm:$false }}\n\
-         exit 0\n\
-         }} catch {{ [IO.File]::WriteAllText({err}, $_.Exception.Message); exit 1 }}\n",
-        err = ps_quote(&err_file.to_string_lossy()),
-    )
+/// What Task Scheduler has under TASK_NAME.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskInfo {
+    pub installed: bool,
+    pub enabled: bool,
+    pub running: bool,
+    pub execute: String,
+    pub arguments: String,
 }
 
-/// Read-only (no elevation): the task as one JSON line on stdout, in UTF-8.
-pub fn status_script() -> String {
-    let name = ps_quote(TASK_NAME);
-    format!(
-        "$ErrorActionPreference = 'SilentlyContinue'\n\
-         [Console]::OutputEncoding = [Text.Encoding]::UTF8\n\
-         $t = Get-ScheduledTask -TaskPath '\\' -TaskName {name}\n\
-         if ($t) {{ [pscustomobject]@{{ installed = $true; enabled = [bool]$t.Settings.Enabled; state = [string]$t.State; \
-         execute = [string]$t.Actions[0].Execute; arguments = [string]$t.Actions[0].Arguments }} | ConvertTo-Json -Compress }} \
-         else {{ '{{\"installed\":false}}' }}\n"
-    )
-}
-
-/// `powershell -EncodedCommand` takes base64 of the UTF-16LE script: no
-/// command-line quoting is involved at all.
-pub fn encode_command(script: &str) -> String {
-    use base64::Engine as _;
-    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct TaskInfo {
-    installed: bool,
-    enabled: bool,
-    state: String,
-    execute: String,
-    arguments: String,
-}
-
-/// What `status_script` printed, judged against this app's exe and config.
-pub fn parse_status(json: &str, exe: &str, config: &Path) -> BackgroundHostStatus {
-    let t: TaskInfo = serde_json::from_str(json.trim().trim_start_matches('\u{feff}')).unwrap_or_default();
+/// `t` judged against this app's exe and config.
+pub fn judge(t: &TaskInfo, exe: &str, config: &Path) -> BackgroundHostStatus {
     let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
     // The program path may be stored quoted (Task Scheduler accepts both).
     let exe_same = |a: &str, b: &str| same(a.trim().trim_matches('"'), b);
     BackgroundHostStatus {
         supported: true,
         enabled: t.installed && t.enabled,
-        running: t.installed && t.state.eq_ignore_ascii_case("Running"),
+        running: t.installed && t.running,
         current: t.installed && exe_same(&t.execute, exe) && same(&t.arguments, &task_arguments(config)),
         command: None,
     }
@@ -185,17 +151,16 @@ pub fn parse_status(json: &str, exe: &str, config: &Path) -> BackgroundHostStatu
 // ── Windows ─────────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
-mod win {
+pub(crate) mod win {
     use super::*;
-    use std::os::windows::process::CommandExt;
+    use crate::elevate::win::Com;
+    use windows::core::{Interface, BSTR, HRESULT};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::System::TaskScheduler::{IExecAction, IRegisteredTask, ITaskFolder, ITaskService, TaskScheduler, TASK_CREATE_OR_UPDATE, TASK_LOGON_S4U, TASK_STATE_RUNNING};
+    use windows::Win32::System::Variant::VARIANT;
 
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    /// Windows PowerShell by full path (never whatever `powershell` is on PATH).
-    fn powershell() -> String {
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-        format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe")
-    }
+    /// HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND): no such task.
+    const NOT_FOUND: HRESULT = HRESULT(0x8007_0002_u32 as i32);
 
     pub fn exe() -> Result<String, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -204,94 +169,108 @@ mod win {
         Ok(s.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or(s))
     }
 
-    fn user() -> Result<String, String> {
-        let name = std::env::var("USERNAME").map_err(|_| "Couldn't tell which Windows account this is.".to_string())?;
-        Ok(match std::env::var("USERDOMAIN") {
-            Ok(d) if !d.is_empty() => format!(r"{d}\{name}"),
-            _ => name,
-        })
+    /// The root task folder on this computer (caller holds COM).
+    fn root() -> windows::core::Result<ITaskFolder> {
+        unsafe {
+            let svc: ITaskService = CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)?;
+            let none = VARIANT::default();
+            svc.Connect(&none, &none, &none, &none)?;
+            svc.GetFolder(&BSTR::from(r"\"))
+        }
+    }
+
+    fn task(root: &ITaskFolder) -> windows::core::Result<Option<IRegisteredTask>> {
+        match unsafe { root.GetTask(&BSTR::from(TASK_NAME)) } {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if e.code() == NOT_FOUND => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Read-only (no elevation).
+    pub fn info() -> windows::core::Result<TaskInfo> {
+        let _com = Com::init();
+        let Some(t) = task(&root()?)? else { return Ok(TaskInfo::default()) };
+        unsafe {
+            let (mut execute, mut arguments) = (BSTR::new(), BSTR::new());
+            let actions = t.Definition()?.Actions()?;
+            let mut count = 0i32;
+            actions.Count(&mut count)?;
+            if count >= 1 {
+                if let Ok(exec) = actions.get_Item(1)?.cast::<IExecAction>() {
+                    exec.Path(&mut execute)?;
+                    exec.Arguments(&mut arguments)?;
+                }
+            }
+            Ok(TaskInfo {
+                installed: true,
+                enabled: t.Enabled()?.as_bool(),
+                running: t.State()? == TASK_STATE_RUNNING,
+                execute: execute.to_string(),
+                arguments: arguments.to_string(),
+            })
+        }
+    }
+
+    /// (Re)create the task for this exe and start it right away (it waits
+    /// while the app holds the engine, then takes over when it closes).
+    /// Needs administrator rights (elevate.rs).
+    pub fn register(config: &Path, user: &str) -> windows::core::Result<()> {
+        let invalid = |m: String| windows::core::Error::new(windows::Win32::Foundation::E_INVALIDARG, m);
+        let xml = task_xml(&exe().map_err(invalid)?, config, user).map_err(invalid)?;
+        let _com = Com::init();
+        let root = root()?;
+        if let Some(old) = task(&root)? {
+            let _ = unsafe { old.Stop(0) };
+        }
+        let none = VARIANT::default();
+        let t = unsafe { root.RegisterTask(&BSTR::from(TASK_NAME), &BSTR::from(xml), TASK_CREATE_OR_UPDATE.0, &VARIANT::from(user), &none, TASK_LOGON_S4U, &none) }?;
+        unsafe { t.Run(&none) }?;
+        Ok(())
+    }
+
+    /// Stop and delete the task (fine if it's gone). Needs administrator rights.
+    pub fn remove() -> windows::core::Result<()> {
+        let _com = Com::init();
+        let root = root()?;
+        if let Some(t) = task(&root)? {
+            let _ = unsafe { t.Stop(0) };
+            match unsafe { root.DeleteTask(&BSTR::from(TASK_NAME), 0) } {
+                Err(e) if e.code() != NOT_FOUND => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the task now (no elevation: the task's own user may run it).
+    pub fn run_now() -> windows::core::Result<()> {
+        let _com = Com::init();
+        let Some(t) = task(&root()?)? else { return Ok(()) };
+        unsafe { t.Run(&VARIANT::default()) }.map(|_| ())
     }
 
     pub fn status(config: &Path) -> Result<BackgroundHostStatus, String> {
-        let out = std::process::Command::new(powershell())
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &encode_command(&status_script())])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("Couldn't check Windows Task Scheduler: {e}"))?;
-        Ok(parse_status(&String::from_utf8_lossy(&out.stdout), &exe()?, config))
-    }
-
-    /// Run `script` in an elevated, hidden Windows PowerShell — one UAC prompt —
-    /// and wait for it. The script reports failures through `err_file`.
-    fn run_elevated(script: &str, err_file: &Path) -> Result<(), String> {
-        use windows::core::{w, PCWSTR};
-        use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED};
-        use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
-        use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
-
-        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-        let file = wide(&powershell());
-        let params = wide(&format!(
-            "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {}",
-            encode_command(script)
-        ));
-        let _ = std::fs::remove_file(err_file);
-        let mut info = SHELLEXECUTEINFOW {
-            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
-            lpVerb: w!("runas"),
-            lpFile: PCWSTR(file.as_ptr()),
-            lpParameters: PCWSTR(params.as_ptr()),
-            nShow: 0, // SW_HIDE
-            ..Default::default()
-        };
-        if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
-            return Err(if e.code() == ERROR_CANCELLED.to_hresult() {
-                "Windows didn't get permission, so nothing changed.".into()
-            } else {
-                format!("Windows couldn't ask for permission: {}", e.message())
-            });
-        }
-        if info.hProcess.is_invalid() {
-            return Err("Windows didn't start the change.".into());
-        }
-        let mut code = 1u32;
-        unsafe {
-            WaitForSingleObject(info.hProcess, INFINITE);
-            let _ = GetExitCodeProcess(info.hProcess, &mut code);
-            let _ = CloseHandle(info.hProcess);
-        }
-        let detail = std::fs::read_to_string(err_file).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        let _ = std::fs::remove_file(err_file);
-        if code == 0 {
-            return Ok(());
-        }
-        Err(match detail {
-            Some(d) => format!("Windows Task Scheduler said: {d}"),
-            None => "Windows Task Scheduler didn't make the change.".into(),
-        })
+        let t = info().map_err(|e| format!("Couldn't check Windows Task Scheduler: {}", e.message()))?;
+        Ok(judge(&t, &exe()?, config))
     }
 
     pub fn set(enabled: bool, config: &Path) -> Result<(), String> {
-        let err_file = std::env::temp_dir().join(format!("dropbeam-bg-{}.txt", uuid::Uuid::new_v4()));
-        let script = if enabled {
-            register_script(&exe()?, config, &user()?, &err_file)?
+        use crate::elevate::Job;
+        let job = if enabled {
+            Job::RegisterTask { config: config.to_path_buf(), user: crate::elevate::win::current_account()? }
         } else {
-            unregister_script(&err_file)
+            Job::RemoveTask
         };
-        run_elevated(&script, &err_file)
+        crate::elevate::win::run(&job, "Windows Task Scheduler")
     }
 
     /// At app start: if the task is on but not running (e.g. an update ended
-    /// it), start it again so it's there when the window closes. No elevation:
-    /// the task's own user may run it.
+    /// it), start it again so it's there when the window closes.
     pub fn ensure_started(config: &Path) {
         if let Ok(s) = status(config) {
             if s.enabled && s.current && !s.running {
-                let _ = std::process::Command::new("schtasks")
-                    .args(["/Run", "/TN", TASK_NAME])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .output();
+                let _ = run_now();
             }
         }
     }
@@ -358,7 +337,7 @@ mod tests {
     use std::path::PathBuf;
 
     /// CommandLineToArgvW, enough of it to check `win_arg` round-trips.
-    fn parse_win_args(cmd: &str) -> Vec<String> {
+    pub(crate) fn parse_win_args(cmd: &str) -> Vec<String> {
         let (mut args, mut cur, mut quoted, mut any) = (vec![], String::new(), false, false);
         let chars: Vec<char> = cmd.chars().collect();
         let mut i = 0;
@@ -397,64 +376,80 @@ mod tests {
         }
         let a = task_arguments(&PathBuf::from(r"C:\Users\Ann Lee\AppData\Roaming\com.dropbeam.app"));
         assert_eq!(a, r#"--server --config "C:\Users\Ann Lee\AppData\Roaming\com.dropbeam.app""#);
+        // The elevated helper's command line comes back as exactly its arguments.
+        let job = crate::elevate::Job::RegisterTask { config: PathBuf::from(r"C:\Users\O'Neil Ä\AppData\Roaming\com.dropbeam.app\"), user: r"PC\O'Neil Ä".into() };
+        let mut argv = vec!["DropBeam.exe".to_owned()];
+        argv.extend(parse_win_args(&crate::elevate::command_line(&job)));
+        assert_eq!(crate::elevate::parse(&argv), Ok(job));
     }
 
     #[test]
-    fn powershell_literals_cannot_be_closed() {
-        assert_eq!(ps_quote(r"C:\Program Files\DropBeam\DropBeam.exe"), r"'C:\Program Files\DropBeam\DropBeam.exe'");
-        assert_eq!(ps_quote("O'Brien"), "'O''Brien'");
-        assert_eq!(ps_quote("a\u{2019}; calc; \u{2018}"), "'a\u{2019}\u{2019}; calc; \u{2018}\u{2018}'");
-        assert_eq!(ps_quote("$(calc) `n"), "'$(calc) `n'");
-        // Every quote char inside is doubled, so the literal only ends at the last char.
-        for s in ["'", "''", "x'; Remove-Item C:\\ -Recurse; '", "\u{201A}\u{201B}"] {
-            let q = ps_quote(s);
-            let inner: Vec<char> = q.chars().skip(1).collect::<Vec<_>>()[..q.chars().count() - 2].to_vec();
-            let mut i = 0;
-            while i < inner.len() {
-                if matches!(inner[i], '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
-                    assert!(i + 1 < inner.len() && inner[i + 1] == inner[i], "unescaped quote in {q}");
-                    i += 2;
-                } else { i += 1; }
-            }
+    fn xml_values_cannot_break_out() {
+        assert_eq!(xml_escape(r#"<a href="x">&'</a>"#), "&lt;a href=&quot;x&quot;&gt;&amp;&apos;&lt;/a&gt;");
+        let config = PathBuf::from(r"C:\Users\Ann & <Lee>\AppData\Roaming\com.dropbeam.app");
+        let x = task_xml(r"C:\Users\Ann & <Lee>\AppData\Local\DropBeam\DropBeam.exe", &config, r"PC\O'Neil</UserId><x>").unwrap();
+        assert!(x.contains(r"<Command>C:\Users\Ann &amp; &lt;Lee&gt;\AppData\Local\DropBeam\DropBeam.exe</Command>"), "{x}");
+        assert!(x.contains(r"<Arguments>--server --config &quot;C:\Users\Ann &amp; &lt;Lee&gt;\AppData\Roaming\com.dropbeam.app&quot;</Arguments>"), "{x}");
+        assert!(x.contains(r"<UserId>PC\O&apos;Neil&lt;/UserId&gt;&lt;x&gt;</UserId><LogonType>S4U</LogonType><RunLevel>LeastPrivilege</RunLevel>"), "{x}");
+        assert!(x.contains("<BootTrigger>") && x.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>") && x.contains("<Priority>4</Priority>"));
+        assert!(x.contains("<DisallowStartIfOnBatteries>false</") && x.contains("<StopIfGoingOnBatteries>false</") && x.contains("<Count>999</Count>"));
+        assert!(x.contains("<MultipleInstancesPolicy>IgnoreNew</"));
+        // Every element opened is closed in order: nothing in a value made a tag.
+        let tags: Vec<&str> = x.split('<').skip(1).map(|t| t.split(['>', ' ']).next().unwrap()).collect();
+        let mut stack = vec![];
+        for t in tags {
+            if let Some(close) = t.strip_prefix('/') { assert_eq!(stack.pop(), Some(close), "{x}"); } else { stack.push(t); }
         }
-    }
-
-    #[test]
-    fn register_script_quotes_everything_and_refuses_bad_values() {
-        let config = PathBuf::from(r"C:\Users\O'Neil\AppData\Roaming\com.dropbeam.app");
-        let s = register_script(r"C:\Users\O'Neil\AppData\Local\DropBeam\DropBeam.exe", &config, r"PC\O'Neil", &PathBuf::from(r"C:\t\e.txt")).unwrap();
-        assert!(s.contains(r"-Execute 'C:\Users\O''Neil\AppData\Local\DropBeam\DropBeam.exe'"), "{s}");
-        assert!(s.contains(r#"-Argument '--server --config C:\Users\O''Neil\AppData\Roaming\com.dropbeam.app'"#), "{s}");
-        assert!(s.contains(r"-UserId 'PC\O''Neil' -LogonType S4U -RunLevel Limited"), "{s}");
-        assert!(s.contains("-TaskName 'DropBeam Background'") && s.contains("-AtStartup") && s.contains("[TimeSpan]::Zero"));
-        assert!(s.contains("-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries") && s.contains("-RestartCount"));
-        for bad in ["C:\\a\"b.exe", "C:\\a\nb.exe", "", "  "] {
-            assert!(register_script(bad, &config, "PC\\u", &PathBuf::from("e")).is_err(), "{bad:?}");
+        assert!(stack.is_empty());
+        for bad in ["C:\\a\"b.exe", "C:\\a\nb.exe", "", "  ", "C:\\a\u{1}b.exe"] {
+            assert!(task_xml(bad, &config, "PC\\u").is_err(), "{bad:?}");
         }
-        assert!(register_script("C:\\d.exe", &config, "PC\\u\r\nx", &PathBuf::from("e")).is_err());
-        assert!(unregister_script(&PathBuf::from("e")).contains("Unregister-ScheduledTask -TaskPath '\\' -TaskName 'DropBeam Background' -Confirm:$false"));
-    }
-
-    #[test]
-    fn encoded_command_is_utf16le_base64() {
-        use base64::Engine as _;
-        let raw = base64::engine::general_purpose::STANDARD.decode(encode_command("Ä'x")).unwrap();
-        assert_eq!(raw, vec![0xC4, 0, b'\'', 0, b'x', 0]);
+        assert!(task_xml("C:\\d.exe", &config, "PC\\u\r\nx").is_err());
+        assert!(task_xml("C:\\d.exe", &PathBuf::from("C:\\a\"b"), "PC\\u").is_err());
     }
 
     #[test]
     fn status_compares_exe_and_config() {
         let config = PathBuf::from(r"C:\Users\Ann Lee\AppData\Roaming\com.dropbeam.app");
         let exe = r"C:\Users\Ann Lee\AppData\Local\DropBeam\DropBeam.exe";
-        let json = serde_json::json!({"installed": true, "enabled": true, "state": "Running",
-            "execute": exe.to_uppercase(), "arguments": task_arguments(&config)}).to_string();
-        let s = parse_status(&format!("\u{feff}{json}\r\n"), exe, &config);
-        assert_eq!(s, BackgroundHostStatus { supported: true, enabled: true, running: true, current: true, command: None });
-        let moved = parse_status(&json, r"D:\Apps\DropBeam.exe", &config);
+        let t = TaskInfo { installed: true, enabled: true, running: true, execute: format!("\"{}\"", exe.to_uppercase()), arguments: task_arguments(&config) };
+        assert_eq!(judge(&t, exe, &config), BackgroundHostStatus { supported: true, enabled: true, running: true, current: true, command: None });
+        let moved = judge(&t, r"D:\Apps\DropBeam.exe", &config);
         assert!(moved.enabled && !moved.current);
-        let ready = parse_status(&json.replace("Running", "Ready").replace("\"enabled\":true", "\"enabled\":false"), exe, &config);
+        let ready = judge(&TaskInfo { enabled: false, running: false, ..t.clone() }, exe, &config);
         assert!(!ready.enabled && !ready.running && ready.current);
-        assert_eq!(parse_status(r#"{"installed":false}"#, exe, &config), BackgroundHostStatus { supported: true, ..Default::default() });
-        assert_eq!(parse_status("garbage", exe, &config), BackgroundHostStatus { supported: true, ..Default::default() });
+        assert_eq!(judge(&TaskInfo::default(), exe, &config), BackgroundHostStatus { supported: true, ..Default::default() });
+        assert_eq!(judge(&TaskInfo { installed: false, ..t }, exe, &config), BackgroundHostStatus { supported: true, ..Default::default() });
+    }
+
+    /// CI only (windows-latest runs as an administrator): really register the
+    /// task through the native path, read it back, run it, remove it. The
+    /// action is this test binary, which just exits on `--server`.
+    #[cfg(windows)]
+    #[test]
+    fn ci_task_scheduler_round_trip() {
+        if std::env::var("DROPBEAM_CI_TASK_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(crate::elevate::win::is_elevated(), "the CI runner should be elevated");
+        let config = std::env::temp_dir().join(format!("dropbeam ci task {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&config).unwrap();
+        let user = crate::elevate::win::current_account().unwrap();
+        assert!(crate::elevate::valid_account(&user).is_ok(), "{user}");
+        let _ = win::remove();
+        // In-process (already elevated), exactly as the app does it.
+        set(true, &config).unwrap();
+        let t = win::info().unwrap();
+        assert!(t.installed && t.enabled, "{t:?}");
+        let s = status(&config).unwrap();
+        assert!(s.supported && s.enabled && s.current, "{s:?} {t:?}");
+        win::run_now().unwrap();
+        // Another config folder isn't "current".
+        assert!(!status(&config.join("other")).unwrap().current);
+        set(false, &config).unwrap();
+        assert_eq!(win::info().unwrap(), TaskInfo::default());
+        assert_eq!(status(&config).unwrap(), BackgroundHostStatus { supported: true, ..Default::default() });
+        set(false, &config).unwrap(); // already gone is fine
+        let _ = std::fs::remove_dir_all(&config);
     }
 }

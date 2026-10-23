@@ -99,14 +99,20 @@ fn registered_autostart_command(app_name: &str) -> Option<String> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let out = std::process::Command::new("reg")
-            .args(["query", r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "/v", app_name])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .ok()?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+        let name: Vec<u16> = app_name.encode_utf16().chain([0]).collect();
+        let key = w!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run");
+        let mut size = 0u32;
+        if unsafe { RegGetValueW(HKEY_CURRENT_USER, key, PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, None, Some(&mut size)) }.0 != 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; size as usize / 2 + 1];
+        let mut size = (buf.len() * 2) as u32;
+        if unsafe { RegGetValueW(HKEY_CURRENT_USER, key, PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as *mut _), Some(&mut size)) }.0 != 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]))
     }
 }
 

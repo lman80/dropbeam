@@ -26,7 +26,7 @@ DropBeam, scan the QR, the agent does the rest).
    - macOS: links `/usr/local/bin/dropbeam` to the app (asks for your password once if that
      folder isn't writable; if you cancel, it uses `~/.local/bin/dropbeam`).
    - Windows: writes `%LOCALAPPDATA%\DropBeam\bin\dropbeam.cmd` and adds that folder to your
-     user PATH. Open a new terminal afterwards.
+     user PATH (written to the registry directly, no PowerShell). Open a new terminal afterwards.
    - Linux: the `.deb` / `.rpm` install `/usr/bin/dropbeam`. AppImage and other installs: the
      button links `~/.local/bin/dropbeam`.
    - Without installing: run the app's own program file with `cli` first, e.g.

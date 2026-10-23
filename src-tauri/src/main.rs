@@ -5,6 +5,11 @@ fn main() {
   #[cfg(not(any(target_os = "ios", target_os = "android")))]
   {
     let args: Vec<String> = std::env::args().collect();
+    // Windows: the one administrator step DropBeam re-launched itself for
+    // (elevate.rs) — before anything else, and nothing else in that process.
+    if let Some(code) = app_lib::elevated_job(&args) {
+      std::process::exit(code);
+    }
     // `dropbeam …` / `DropBeam cli …`: the command line, before any window code.
     if let Some(cli) = app_lib::cli_args(&args) {
       std::process::exit(app_lib::run_cli(&cli));
