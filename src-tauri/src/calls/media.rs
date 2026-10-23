@@ -133,8 +133,17 @@ pub struct MediaStats {
     /// ms since the last packet from the other side (None = nothing yet).
     pub last_rx_ms: Option<u64>,
     pub turn: super::turn::TurnCounters,
+    /// Gaps between consecutive packets (ms), to tell where burstiness comes
+    /// from: from the WebRTC engine into the bridge (`gaps_from_engine`) vs
+    /// arriving from the other side (`gaps_from_peer`). Buckets: >30, >60, >120 ms.
+    pub gaps_from_engine: [u64; 3],
+    pub gaps_from_peer: [u64; 3],
+    pub max_gap_from_engine_ms: u64,
+    pub max_gap_from_peer_ms: u64,
     #[serde(skip)]
     pub last_rx: Option<Instant>,
+    #[serde(skip)]
+    pub last_tx: Option<Instant>,
 }
 
 /// A running bridge. Dropping it stops the task.
@@ -205,6 +214,9 @@ async fn run(sock: UdpSocket, mut turn: Turn, mut conn_rx: watch::Receiver<Optio
                         if parts.len() > 1 { s.fragmented_out += 1; }
                         s.packets_out += 1;
                         s.bytes_out += data.len() as u64;
+                        let now = Instant::now();
+                        if let Some(prev) = s.last_tx { let g = now.duration_since(prev).as_millis() as u64; let s = &mut *s; note_gap(&mut s.gaps_from_engine, &mut s.max_gap_from_engine_ms, g); }
+                        s.last_tx = Some(now);
                         for p in parts {
                             if c.send_datagram(p).is_err() { s.send_dropped += 1; }
                         }
@@ -224,6 +236,7 @@ async fn run(sock: UdpSocket, mut turn: Turn, mut conn_rx: watch::Receiver<Optio
                         let mut s = stats.lock().unwrap_or_else(|p| p.into_inner());
                         s.packets_in += 1;
                         s.bytes_in += payload.len() as u64;
+                        if let Some(prev) = s.last_rx { let g = now.duration_since(prev).as_millis() as u64; let s = &mut *s; note_gap(&mut s.gaps_from_peer, &mut s.max_gap_from_peer_ms, g); }
                         s.last_rx = Some(now);
                     }
                     if let Some((client, pkt)) = turn.on_remote(from, to, &payload, now) {
@@ -241,6 +254,13 @@ async fn run(sock: UdpSocket, mut turn: Turn, mut conn_rx: watch::Receiver<Optio
             }
         }
     }
+}
+
+fn note_gap(b: &mut [u64; 3], max: &mut u64, g: u64) {
+    if g > 30 { b[0] += 1; }
+    if g > 60 { b[1] += 1; }
+    if g > 120 { b[2] += 1; }
+    *max = (*max).max(g);
 }
 
 /// For tests: the client side of a TURN server on a real socket.

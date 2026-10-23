@@ -1,0 +1,73 @@
+<!doctype html>
+<!-- Speech latency harness (calls/lab_tests.rs): Chrome captures a speech WAV
+     through its real capture path (--use-file-for-fake-audio-capture), sends it
+     A→B through the call path under test, and B plays it through an <audio>
+     element like the call screen does. Both the captured track and the received
+     track feed ONE AudioContext (same clock, same render quanta); the delay is
+     the lag that best aligns their energy envelopes (cross-correlation, 5.3 ms
+     steps) — capture-to-receiver-output, i.e. mouth-to-ear minus the sound
+     card's own buffers. getStats adds jitter-buffer and playout numbers. -->
+<html><body><audio id=out autoplay></audio><script>
+const CFG = __CFG__;
+const log = (...a) => fetch('/log', { method: 'POST', body: a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ') });
+function pc(port) {
+  const cfg = { bundlePolicy: 'max-bundle' }
+  if (port) Object.assign(cfg, { iceTransportPolicy: 'relay', iceServers: [{ urls: `turn:127.0.0.1:${port}?transport=udp`, username: CFG.user, credential: CFG.pass }] })
+  return new RTCPeerConnection(cfg)
+}
+const gathered = p => new Promise(r => { if (p.iceGatheringState === 'complete') r(); p.addEventListener('icegatheringstatechange', () => p.iceGatheringState === 'complete' && r()); setTimeout(r, 5000) })
+async function inbound(p) { let o = null; (await p.getStats()).forEach(s => { if (s.type === 'inbound-rtp' && s.kind === 'audio') o = s; if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') rtt = s.currentRoundTripTime }); return o }
+let rtt = null;
+(async () => {
+  try {
+    const media = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false })
+    const a = pc(CFG.bridge ? CFG.portA : 0), b = pc(CFG.bridge ? CFG.portB : 0)
+    if (!CFG.bridge) { a.onicecandidate = e => e.candidate && b.addIceCandidate(e.candidate); b.onicecandidate = e => e.candidate && a.addIceCandidate(e.candidate) }
+    media.getTracks().forEach(t => a.addTrack(t, media))
+    b.addTransceiver('audio', { direction: 'recvonly' })
+    let remote = null
+    b.ontrack = e => { remote = new MediaStream([e.track]); document.getElementById('out').srcObject = remote }
+    await a.setLocalDescription(await a.createOffer()); if (CFG.bridge) await gathered(a)
+    await b.setRemoteDescription(a.localDescription)
+    await b.setLocalDescription(await b.createAnswer()); if (CFG.bridge) await gathered(b)
+    await a.setRemoteDescription(b.localDescription)
+    await new Promise((res, rej) => { const t = setInterval(() => { if (b.connectionState === 'connected' && remote) { clearInterval(t); res() } }, 50); setTimeout(() => rej(new Error('connect timeout ' + b.connectionState)), 20000) })
+    const ctx = new AudioContext({ sampleRate: 48000 })
+    const merge = ctx.createChannelMerger(2)
+    ctx.createMediaStreamSource(media).connect(merge, 0, 0)
+    ctx.createMediaStreamSource(remote).connect(merge, 0, 1)
+    const proc = ctx.createScriptProcessor(256, 2, 1)
+    const L = [], R = []
+    proc.onaudioprocess = e => { const x = e.inputBuffer.getChannelData(0), y = e.inputBuffer.getChannelData(1); let s = 0, t = 0
+      for (let i = 0; i < x.length; i++) { s += x[i] * x[i]; t += y[i] * y[i] } L.push(Math.log10(1e-9 + s / x.length)); R.push(Math.log10(1e-9 + t / y.length)) }
+    merge.connect(proc); proc.connect(ctx.destination)
+    const samples = []
+    let prev = null
+    for (let i = 0; i < CFG.seconds; i++) {
+      await new Promise(r => setTimeout(r, 1000))
+      const s = await inbound(b); if (!s) continue
+      if (prev) samples.push({
+        jbMs: (s.jitterBufferEmittedCount - prev.jitterBufferEmittedCount) ? 1000 * (s.jitterBufferDelay - prev.jitterBufferDelay) / (s.jitterBufferEmittedCount - prev.jitterBufferEmittedCount) : null,
+        jbTargetMs: (s.jitterBufferEmittedCount - prev.jitterBufferEmittedCount) ? 1000 * (s.jitterBufferTargetDelay - prev.jitterBufferTargetDelay) / (s.jitterBufferEmittedCount - prev.jitterBufferEmittedCount) : null,
+        jitterMs: 1000 * s.jitter, lost: s.packetsLost, concealed: s.concealedSamples - prev.concealedSamples,
+        rttMs: rtt == null ? null : 1000 * rtt })
+      prev = s
+    }
+    // Best lag of B's envelope behind A's, 0..1000 ms, over the last ~15 s.
+    const n = Math.min(L.length, R.length), from = Math.max(0, n - Math.round(15 * 48000 / 256)), step = 256 / 48
+    let best = { lag: -1, c: -Infinity }
+    const mean = (arr, a0, a1) => { let s = 0; for (let i = a0; i < a1; i++) s += arr[i]; return s / (a1 - a0) }
+    for (let lag = 0; lag < 1000 / step; lag++) {
+      const a0 = from, a1 = n - lag; if (a1 - a0 < 200) break
+      const ma = mean(L, a0, a1), mb = mean(R, a0 + lag, a1 + lag); let c = 0, va = 0, vb = 0
+      for (let i = a0; i < a1; i++) { const p = L[i] - ma, q = R[i + lag] - mb; c += p * q; va += p * p; vb += q * q }
+      c /= Math.sqrt(va * vb) || 1
+      if (c > best.c) best = { lag, c }
+    }
+    const med = k => { const v = samples.map(s => s[k]).filter(x => x != null).sort((x, y) => x - y); return v.length ? Math.round(v[Math.floor(v.length / 2)]) : null }
+    const result = { ok: true, bridge: CFG.bridge, mouthToEarMs: Math.round(best.lag * step), correlation: +best.c.toFixed(3),
+      jbMs: med('jbMs'), jbTargetMs: med('jbTargetMs'), jitterMs: med('jitterMs'), rttMs: med('rttMs'), concealed: samples.reduce((x, s) => x + s.concealed, 0), jbSeries: samples.map(s => Math.round(s.jbMs)) }
+    await fetch('/result', { method: 'POST', body: JSON.stringify(result) })
+  } catch (e) { await fetch('/result', { method: 'POST', body: JSON.stringify({ ok: false, error: String(e && e.stack || e) }) }) }
+})()
+</script></body></html>

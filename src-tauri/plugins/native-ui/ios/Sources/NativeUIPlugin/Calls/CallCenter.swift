@@ -75,6 +75,15 @@ final class CallCenter: NSObject, ObservableObject {
     @Published private(set) var speaker = false
     /// CallKit couldn't show the ring (simulator, or a CallKit refusal): ring in the app.
     @Published private(set) var ringInApp = false
+    /// Recording this call on the iPhone (after the other side allowed it).
+    @Published private(set) var recordingNow = false
+    /// The folder of the last finished recording (Documents/DropBeam Calls/…).
+    @Published var savedTo: String?
+    /// I offered to swap clean voice tracks after the call.
+    @Published private(set) var swapOffered = false
+    private var recorder: CallRecorder?
+    private var recording: (recId: String, dir: String)?
+    private var recordingCall: String?
 
     private var engine: CallEngine?
     private var callId: String?
@@ -219,6 +228,7 @@ final class CallCenter: NSObject, ObservableObject {
                 // Our own hang-up already went through a CXEndCallAction; reporting again is harmless.
                 provider.reportCall(with: uuid, endedAt: Date(), reason: reason)
             }
+            if recordingCall == c.id { stopRecording(after: c) }
             teardown()
             ringInApp = false
             call = nil
@@ -227,6 +237,12 @@ final class CallCenter: NSObject, ObservableObject {
         }
         if let current = call, current.id != c.id, current.phase != "ended" { return }
         call = c
+        // They allowed my request: record (the engine refuses otherwise).
+        if let r = c.recording, r.askedByMe, r.theyAllow, !r.meRecording, recorder == nil, c.phase == "active", callId == c.id {
+            startRecording()
+        }
+        // They took it back mid-way.
+        if let r = c.recording, recorder != nil, !r.theyAllow, recordingCall == c.id { stopRecording() }
         if c.phase != "ringing" { ringInApp = false }
         if !c.incoming, let uuid = uuids[c.id] {
             if c.phase == "connecting" { provider.reportOutgoingCall(with: uuid, startedConnectingAt: Date()) }
@@ -384,6 +400,7 @@ final class CallCenter: NSObject, ObservableObject {
     private func applyMute(_ on: Bool) {
         muted = on
         engine?.setMuted(on)
+        recorder?.meMuted = on
         signalMedia()
     }
 
@@ -422,6 +439,72 @@ final class CallCenter: NSObject, ObservableObject {
     func answerRecordRequest(_ allow: Bool) {
         guard let id = callId else { return }
         Task { try? await bridge.action("callSignal", ["callId": id, "frame": ["kind": "call.record", "action": allow ? "allow" : "deny"]]) }
+    }
+
+    // ── recording (on this iPhone, only with their yes — calls/record.rs) ──
+
+    private struct RecOpen: Decodable { let recId: String; let dir: String }
+
+    /// Record: ask the other side first; recording starts when they allow it.
+    func askToRecord() {
+        guard let id = callId else { return }
+        Task { do { try await bridge.action("callSignal", ["callId": id, "frame": ["kind": "call.record", "action": "ask"]]) } catch { bridge.errorMessage = error.localizedDescription } }
+    }
+
+    /// Offer to swap clean voice tracks after the call (both must agree).
+    func offerTrackSwap() {
+        guard let id = callId else { return }
+        swapOffered = true
+        Task { try? await bridge.action("callSignal", ["callId": id, "frame": ["kind": "call.record", "action": "share"]]) }
+    }
+
+    private func startRecording() {
+        guard let id = callId, recorder == nil else { return }
+        let rec: CallRecorder
+        do { rec = try CallRecorder() } catch { bridge.errorMessage = "Couldn’t start recording: \(error.localizedDescription)"; return }
+        rec.meMuted = muted
+        recorder = rec
+        recordingCall = id
+        recordingNow = true
+        Task {
+            do {
+                let opened: RecOpen = try await bridge.call("callRecordOpen", ["callId": id])
+                recording = (opened.recId, opened.dir)
+                CallAudioDevice.shared.tap = rec
+            } catch {
+                recorder = nil
+                recordingNow = false
+                rec.discard()
+                bridge.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    /// Stop: finish the files and hand them to the engine. Also right after the
+    /// call ended (the engine accepts the files for a while after it closed the
+    /// recording). Then, if both agreed, send my clean track to them.
+    func stopRecording(after ended: CallSnapshot? = nil) {
+        guard let rec = recorder else { return }
+        CallAudioDevice.shared.tap = nil
+        recorder = nil
+        recordingNow = false
+        let opened = recording
+        recording = nil
+        recordingCall = nil
+        Task {
+            let files = await rec.finish()
+            guard let opened else { rec.discard(); return }
+            for (track, url) in files {
+                do { try await bridge.action("callRecordImport", ["recId": opened.recId, "track": track.rawValue, "ext": "m4a", "path": url.path]) }
+                catch { bridge.errorMessage = "Couldn’t save the recording: \(error.localizedDescription)" }
+            }
+            try? await bridge.action("callRecordClose", ["recId": opened.recId])
+            savedTo = opened.dir
+            if let c = ended, c.recording?.iShare == true, c.recording?.theyShare == true, files[.me] != nil {
+                let mine = URL(fileURLWithPath: opened.dir).appendingPathComponent("Me.m4a").path
+                try? await bridge.action("callShareTrack", ["friendId": c.person, "path": mine])
+            }
+        }
     }
 
     // ── quality ──
@@ -473,6 +556,7 @@ final class CallCenter: NSObject, ObservableObject {
         cameraOn = false
         remoteMuted = false
         remoteCamera = false
+        swapOffered = false
         quality = nil
         if speaker { toggleSpeaker() }
         if !uuidsInUse { deactivateAudioWithoutCallKit() }
@@ -505,10 +589,12 @@ final class CallCenter: NSObject, ObservableObject {
         try? session.setActive(true)
         session.unlockForConfiguration()
         session.isAudioEnabled = true
+        CallAudioDevice.shared.setSessionActive(true)
     }
     private func deactivateAudioWithoutCallKit() {
         guard manualAudio else { return }
         manualAudio = false
+        CallAudioDevice.shared.setSessionActive(false)
         let session = RTCAudioSession.sharedInstance()
         session.isAudioEnabled = false
         session.lockForConfiguration()
@@ -584,10 +670,12 @@ extension CallCenter: CXProviderDelegate {
         let rtc = RTCAudioSession.sharedInstance()
         rtc.audioSessionDidActivate(audioSession)
         rtc.isAudioEnabled = true
+        CallAudioDevice.shared.setSessionActive(true)
     }
 
     nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
         let rtc = RTCAudioSession.sharedInstance()
+        CallAudioDevice.shared.setSessionActive(false)
         rtc.isAudioEnabled = false
         rtc.audioSessionDidDeactivate(audioSession)
     }

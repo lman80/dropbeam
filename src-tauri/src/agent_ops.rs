@@ -409,6 +409,7 @@ pub const EXCLUDED: &[(&str, &str)] = &[
     ("call_record_open", "recording needs both people's yes on their call screens; agents never start one"),
     ("call_record_chunk", "recording plumbing"),
     ("call_record_close", "recording plumbing"),
+    ("call_record_import", "recording plumbing"),
     ("pick_files", "native file picker on screen; agents pass paths"),
     ("pick_directory", "native folder picker on screen; agents pass paths"),
     ("pick_photos", "iOS photo picker on screen"),

@@ -447,6 +447,12 @@ const handlers: BridgeHandlers = {
   },
   callStatus: () => invoke('call_status'),
   callStats: a => invoke('call_stats', { callId: string(a, 'callId') }),
+  // Recording on the iPhone (calls/record.rs): opened only after the other side allowed it.
+  callRecordOpen: a => invoke('call_record_open', { callId: string(a, 'callId') }),
+  callRecordImport: a => invoke('call_record_import', { recId: string(a, 'recId'), track: string(a, 'track'), ext: string(a, 'ext'), path: string(a, 'path') }),
+  callRecordClose: a => invoke('call_record_close', { recId: string(a, 'recId') }),
+  // Both agreed to swap clean tracks: my voice goes to them as a normal verified file in the chat.
+  callShareTrack: a => st().shareFilesInChat(string(a, 'friendId'), [string(a, 'path')], 'My side of our call (clean voice track)'),
   pushSetVoipToken: a => invoke('push_set_voip_token', { token: typeof a.token === 'string' ? a.token : '', env: a.env === 'sandbox' ? 'sandbox' : 'prod' }),
   folderInviteFriend: async a => {
     await api.inviteFriendToFolder(folderLink(a).id, string(a, 'friendId'))

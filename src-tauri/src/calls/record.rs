@@ -62,6 +62,7 @@ impl Consent {
 }
 
 struct Recording {
+    rec_id: String,
     call_id: String,
     dir: PathBuf,
     files: HashMap<String, (String, std::fs::File)>,
@@ -72,6 +73,24 @@ struct Recording {
 }
 
 static RECS: Mutex<Option<HashMap<String, Recording>>> = Mutex::new(None);
+/// Recordings finished in the last while (rec id → folder, name): the iPhone
+/// encodes each track to a file and hands it over when it stops — which can be
+/// just after the call (and so the recording) ended.
+static RECENT: Mutex<Option<HashMap<String, (PathBuf, String, u64)>>> = Mutex::new(None);
+const RECENT_MS: u64 = 10 * 60 * 1000;
+
+fn remember_recent(rec_id: &str, dir: &Path, name: &str) {
+    let mut g = RECENT.lock().unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    let now = super::now_ms();
+    m.retain(|_, (_, _, at)| now.saturating_sub(*at) < RECENT_MS);
+    m.insert(rec_id.to_string(), (dir.to_path_buf(), name.to_string(), now));
+}
+
+fn track_file(track: &str, name: &str, ext: &str) -> String {
+    let label = match track { "me" => "Me".to_string(), "them" => safe_name(name), _ => "Call".to_string() };
+    format!("{label}.{ext}")
+}
 
 fn with<R>(f: impl FnOnce(&mut HashMap<String, Recording>) -> R) -> R {
     let mut g = RECS.lock().unwrap_or_else(|p| p.into_inner());
@@ -106,7 +125,7 @@ pub fn open(calls: &Arc<Calls>, id: &str, download: &Path) -> Result<Value> {
     while dir.exists() { dir = base.join(format!("{stamp} {} ({n})", safe_name(&name))); n += 1; }
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let rec_id = uuid::Uuid::new_v4().to_string();
-    with(|r| r.insert(rec_id.clone(), Recording { call_id: id.into(), dir: dir.clone(), files: HashMap::new(), started_ms: super::now_ms(), name, video, outgoing }));
+    with(|r| r.insert(rec_id.clone(), Recording { rec_id: rec_id.clone(), call_id: id.into(), dir: dir.clone(), files: HashMap::new(), started_ms: super::now_ms(), name, video, outgoing }));
     super::record_notice(calls, id, "started");
     Ok(json!({ "recId": rec_id, "dir": dir }))
 }
@@ -115,11 +134,20 @@ pub fn open(calls: &Arc<Calls>, id: &str, download: &Path) -> Result<Value> {
 pub fn chunk(rec_id: &str, track: &str, ext: &str, bytes: &[u8]) -> Result<()> {
     anyhow::ensure!(matches!(track, "me" | "them" | "mixed"), "Unknown track.");
     anyhow::ensure!(matches!(ext, "webm" | "mp4" | "m4a" | "ogg"), "Unknown format.");
+    let late = with(|r| !r.contains_key(rec_id));
+    if late {
+        // The call ended and closed the recording a moment before the screen's
+        // last chunks arrived: append them to the same files (for 10 minutes).
+        let (dir, name, _) = RECENT.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+            .and_then(|m| m.get(rec_id)).cloned().context("This recording has stopped.")?;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(track_file(track, &name, ext)))?;
+        f.write_all(bytes)?;
+        return Ok(());
+    }
     with(|r| {
         let rec = r.get_mut(rec_id).context("This recording has stopped.")?;
         if !rec.files.contains_key(track) {
-            let label = match track { "me" => "Me".to_string(), "them" => safe_name(&rec.name), _ => "Call".to_string() };
-            let file = format!("{label}.{ext}");
+            let file = track_file(track, &rec.name, ext);
             let f = std::fs::OpenOptions::new().create_new(true).write(true).open(rec.dir.join(&file))?;
             rec.files.insert(track.to_string(), (file, f));
         }
@@ -131,8 +159,60 @@ pub fn chunk(rec_id: &str, track: &str, ext: &str, bytes: &[u8]) -> Result<()> {
 
 /// Finish: flush the files and write call.json. Returns the folder.
 pub fn close(calls: Option<&Arc<Calls>>, rec_id: &str) -> Result<Value> {
-    let rec = with(|r| r.remove(rec_id)).context("This recording has stopped.")?;
+    let Some(rec) = with(|r| r.remove(rec_id)) else {
+        // Already closed with the call: its folder is still the answer.
+        let g = RECENT.lock().unwrap_or_else(|p| p.into_inner());
+        let (dir, _, _) = g.as_ref().and_then(|m| m.get(rec_id)).cloned().context("This recording has stopped.")?;
+        return Ok(json!({ "dir": dir }));
+    };
+    remember_recent(rec_id, &rec.dir, &rec.name);
     finish(calls, rec)
+}
+
+/// The iPhone's finished track file (AAC, written on the device): moved into
+/// the recording's folder and listed in call.json — also shortly after the
+/// recording was closed with the call. Only files the app wrote to its own temp
+/// folder (`dropbeam-call-…`) are taken.
+pub fn import_file(rec_id: &str, track: &str, ext: &str, src: &Path) -> Result<Value> {
+    anyhow::ensure!(matches!(track, "me" | "them" | "mixed"), "Unknown track.");
+    anyhow::ensure!(matches!(ext, "m4a" | "webm" | "mp4" | "ogg" | "wav"), "Unknown format.");
+    let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    let src = std::fs::canonicalize(src).context("The recorded file is missing.")?;
+    let ok_name = src.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("dropbeam-call-"));
+    anyhow::ensure!(src.starts_with(&tmp) && ok_name && std::fs::symlink_metadata(&src)?.is_file(), "Not a recorded call file.");
+    // Open recording: the engine still owns call.json; register the file there.
+    let open = with(|r| r.get(rec_id).map(|x| (x.dir.clone(), x.name.clone())));
+    let (dir, name, open) = match open {
+        Some((d, n)) => (d, n, true),
+        None => {
+            let g = RECENT.lock().unwrap_or_else(|p| p.into_inner());
+            let (d, n, _) = g.as_ref().and_then(|m| m.get(rec_id)).cloned().context("This recording has stopped.")?;
+            (d, n, false)
+        }
+    };
+    let file = track_file(track, &name, ext);
+    let dest = dir.join(&file);
+    anyhow::ensure!(!dest.exists(), "That track is already saved.");
+    if std::fs::rename(&src, &dest).is_err() {
+        std::fs::copy(&src, &dest)?;
+        let _ = std::fs::remove_file(&src);
+    }
+    if open {
+        with(|r| {
+            if let Some(rec) = r.get_mut(rec_id) {
+                if let Ok(f) = std::fs::OpenOptions::new().append(true).open(&dest) { rec.files.insert(track.to_string(), (file.clone(), f)); }
+            }
+        });
+    } else {
+        // Closed already: add the track to call.json.
+        let meta_path = dir.join("call.json");
+        if let Ok(mut meta) = std::fs::read(&meta_path).map_err(anyhow::Error::from).and_then(|b| Ok(serde_json::from_slice::<Value>(&b)?)) {
+            let who = match track { "me" => "me".to_string(), "them" => name.clone(), _ => "both".to_string() };
+            meta["tracks"][track] = json!({ "file": file, "who": who });
+            crate::settings::write_atomic(&meta_path, &serde_json::to_vec_pretty(&meta)?)?;
+        }
+    }
+    Ok(json!({ "dir": dir, "file": dest }))
 }
 
 fn finish(calls: Option<&Arc<Calls>>, rec: Recording) -> Result<Value> {
@@ -152,13 +232,18 @@ fn finish(calls: Option<&Arc<Calls>>, rec: Recording) -> Result<Value> {
     Ok(json!({ "dir": rec.dir, "meta": meta }))
 }
 
+fn rec_id_of(r: &Recording) -> String { r.rec_id.clone() }
+
 /// The call ended: close whatever is still recording for it.
 pub fn close_for_call(id: &str) {
     let open: Vec<Recording> = with(|r| {
         let keys: Vec<String> = r.iter().filter(|(_, x)| x.call_id == id).map(|(k, _)| k.clone()).collect();
         keys.into_iter().filter_map(|k| r.remove(&k)).collect()
     });
-    for rec in open { let _ = finish(None, rec); }
+    for rec in open {
+        remember_recent(&rec_id_of(&rec), &rec.dir, &rec.name);
+        let _ = finish(None, rec);
+    }
 }
 
 /// Saved recordings, newest first.
@@ -196,6 +281,39 @@ mod tests {
         assert!(c.them_recording);
         c.note("stopped", false);
         assert!(!c.them_recording);
+    }
+
+    #[test]
+    fn a_finished_track_file_joins_the_recording_even_after_it_closed() {
+        let tmp = std::env::temp_dir();
+        let dir = tmp.join(format!("dropbeam-rec-test-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec_id = format!("r{}", rand::random::<u32>());
+        with(|r| r.insert(rec_id.clone(), Recording { rec_id: rec_id.clone(), call_id: "c".into(), dir: dir.clone(), files: HashMap::new(),
+            started_ms: 1, name: "Bea".into(), video: false, outgoing: true }));
+        // Open: imported, then listed when the recording closes.
+        let me = tmp.join(format!("dropbeam-call-{}-me.m4a", rand::random::<u32>()));
+        std::fs::write(&me, b"aac").unwrap();
+        import_file(&rec_id, "me", "m4a", &me).unwrap();
+        assert!(!me.exists());
+        close(None, &rec_id).unwrap();
+        let meta: Value = serde_json::from_slice(&std::fs::read(dir.join("call.json")).unwrap()).unwrap();
+        assert_eq!(meta["tracks"]["me"]["file"], "Me.m4a");
+        // Closed: still accepted for a while, and call.json learns it.
+        let them = tmp.join(format!("dropbeam-call-{}-them.m4a", rand::random::<u32>()));
+        std::fs::write(&them, b"aac").unwrap();
+        import_file(&rec_id, "them", "m4a", &them).unwrap();
+        let meta: Value = serde_json::from_slice(&std::fs::read(dir.join("call.json")).unwrap()).unwrap();
+        assert_eq!(meta["tracks"]["them"]["file"], "Bea.m4a");
+        assert_eq!(std::fs::read(dir.join("Bea.m4a")).unwrap(), b"aac");
+        // Only the app's own temp recordings are taken.
+        let other = tmp.join(format!("notes-{}.m4a", rand::random::<u32>()));
+        std::fs::write(&other, b"x").unwrap();
+        assert!(import_file(&rec_id, "mixed", "m4a", &other).is_err());
+        assert!(import_file(&rec_id, "mixed", "m4a", Path::new("/etc/hosts")).is_err());
+        assert!(import_file("nope", "mixed", "m4a", &other).is_err());
+        let _ = std::fs::remove_file(&other);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

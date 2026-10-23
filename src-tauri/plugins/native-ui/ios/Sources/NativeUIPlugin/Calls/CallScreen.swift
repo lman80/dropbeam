@@ -131,6 +131,7 @@ struct InCallView: View {
         let r = call.recording ?? .init()
         if r.meRecording && r.themRecording { return "You’re both recording" }
         if r.themRecording { return "\(call.name) is recording" }
+        if r.meRecording || calls.recordingNow { return "Recording on this iPhone" }
         return nil
     }
     private var pathWords: String? {
@@ -187,7 +188,19 @@ struct InCallView: View {
                     .foregroundStyle(.white).padding(14).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
                     .padding(.horizontal, 20).padding(.top, 8)
                 }
+                if let r = call.recording, r.askedByMe && !r.theyAllow && !calls.recordingNow {
+                    Text("Waiting for \(call.name) to allow recording…").font(.subheadline).foregroundStyle(.white)
+                        .padding(12).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14)).padding(.top, 8)
+                }
                 Spacer()
+                if calls.recordingNow && !calls.swapOffered {
+                    HStack(spacing: 10) {
+                        Text("After the call, swap clean voice tracks so you both have both sides?").font(.footnote)
+                        Button(call.recording?.theyShare == true ? "\(call.name) said yes — Swap" : "Offer to swap") { calls.offerTrackSwap() }
+                            .buttonStyle(.bordered).tint(.white)
+                    }
+                    .foregroundStyle(.white).padding(10).background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 14)).padding(.horizontal, 16)
+                }
                 if let local = calls.localVideo, calls.cameraOn {
                     HStack { Spacer(); RTCVideo(track: local).frame(width: 110, height: 160).clipShape(RoundedRectangle(cornerRadius: 12)).padding(.trailing, 16) }
                 }
@@ -198,6 +211,15 @@ struct InCallView: View {
                         CallControl(icon: "arrow.triangle.2.circlepath.camera", label: "Flip") { calls.switchCamera() }
                     }
                     CallControl(icon: calls.speaker ? "speaker.wave.3.fill" : "speaker.fill", label: "Speaker", on: calls.speaker) { calls.toggleSpeaker() }
+                    if call.phase == "active" {
+                        let r = call.recording ?? .init()
+                        if calls.recordingNow {
+                            CallControl(icon: "stop.circle.fill", label: "Stop", on: true) { calls.stopRecording() }
+                        } else {
+                            CallControl(icon: "record.circle", label: "Record") { calls.askToRecord() }
+                                .disabled(r.askedByMe && !r.theyAllow)
+                        }
+                    }
                     Button { calls.hangup() } label: { Image(systemName: "phone.down.fill") }
                         .buttonStyle(CallRoundStyle(tint: .red, size: 58)).accessibilityLabel("End call")
                 }.padding(.bottom, 24)
@@ -233,6 +255,9 @@ struct CallEndedCard: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(call.name).font(.subheadline.weight(.semibold)).lineLimit(1)
                     Text(words).font(.caption).foregroundStyle(.secondary)
+                    if calls.savedTo != nil {
+                        Text("Recording saved in Files → DropBeam → DropBeam Calls").font(.caption2).foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
                 Button { calls.last = nil; calls.startCall(friendId: call.person, video: call.video) } label: {
@@ -245,8 +270,8 @@ struct CallEndedCard: View {
         }
         .transition(.move(edge: .top).combined(with: .opacity))
         .task(id: call.id) {
-            try? await Task.sleep(for: .seconds(4))
-            if calls.last?.id == call.id { calls.last = nil }
+            try? await Task.sleep(for: .seconds(calls.savedTo != nil ? 10 : 4))
+            if calls.last?.id == call.id { calls.last = nil; calls.savedTo = nil }
         }
     }
 }

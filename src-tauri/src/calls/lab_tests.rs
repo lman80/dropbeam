@@ -61,7 +61,12 @@ pub(crate) async fn harness(page: String) -> (u16, tokio::sync::mpsc::Receiver<(
 }
 
 pub(crate) fn spawn_chrome(url: &str, profile: &std::path::Path) -> tokio::process::Child {
+    spawn_chrome_with(url, profile, &[])
+}
+
+pub(crate) fn spawn_chrome_with(url: &str, profile: &std::path::Path, extra: &[String]) -> tokio::process::Child {
     tokio::process::Command::new(chrome())
+        .args(extra)
         .args(["--headless=new", "--no-first-run", "--password-store=basic", "--use-mock-keychain", "--no-default-browser-check", "--use-fake-device-for-media-stream",
             "--use-fake-ui-for-media-stream", "--autoplay-policy=no-user-gesture-required",
             &format!("--user-data-dir={}", profile.display()), url])
@@ -110,4 +115,52 @@ async fn webrtc_call_over_iroh_bridge_in_chrome() {
     println!("RESULT {}", serde_json::to_string_pretty(&short).unwrap());
     assert_eq!(v["ok"], true, "{result}");
     assert!(bridge_a.snapshot().packets_out > 100 && bridge_b.snapshot().packets_in > 100);
+}
+
+/// Speech mouth-to-ear: Chrome's real capture path fed a speech WAV
+/// (LAB_WAV=/path/48k.wav), A→B through the bridges over loopback iroh
+/// (LAB_BRIDGE=0: Chrome's own direct path, the baseline). Prints the
+/// cross-correlated capture→receiver-output delay and the jitter buffer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn webrtc_speech_latency_in_chrome() {
+    let wav = std::env::var("LAB_WAV").expect("LAB_WAV=/path/to/speech.wav (48 kHz mono)");
+    let bridge = std::env::var("LAB_BRIDGE").map(|v| v != "0").unwrap_or(true);
+    let a = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate()).alpns(vec![ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+    let b = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate()).alpns(vec![ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+    let b_addr = b.addr();
+    let b2 = b.clone();
+    let accept = tokio::spawn(async move { b2.accept().await.unwrap().await.unwrap() });
+    let conn_a = a.connect(b_addr, ALPN).await.unwrap();
+    let conn_b = accept.await.unwrap();
+    let tag = rand::random::<u64>();
+    let (user, pass) = ("lab-user", "lab-pass");
+    let bridge_a = Bridge::start(user, pass, true, tag).await.unwrap();
+    let bridge_b = Bridge::start(user, pass, false, tag).await.unwrap();
+    bridge_a.attach(conn_a.clone());
+    bridge_b.attach(conn_b.clone());
+    let seconds = std::env::var("LAB_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(25u32);
+    let cfg = serde_json::json!({"portA": bridge_a.port, "portB": bridge_b.port, "user": user, "pass": pass, "seconds": seconds, "bridge": bridge});
+    let page = include_str!("lab_speech.html").replace("__CFG__", &cfg.to_string());
+    let (port, mut rx) = harness(page).await;
+    let profile = std::env::temp_dir().join(format!("dropbeam-call-lab-{}", rand::random::<u32>()));
+    let mut child = spawn_chrome_with(&format!("http://127.0.0.1:{port}/"), &profile, &[format!("--use-file-for-fake-audio-capture={wav}")]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60 + seconds as u64);
+    let result = loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some((path, body))) if path == "/result" => break body,
+            Ok(Some((_, body))) => println!("page: {body}"),
+            _ => panic!("no result from Chrome"),
+        }
+    };
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&profile);
+    println!("RESULT {result}");
+    let sb = bridge_b.snapshot();
+    println!("bridge B gaps from peer: {:?} max {} ms; packets in {}", sb.gaps_from_peer, sb.max_gap_from_peer_ms, sb.packets_in);
+    println!("bridge A: {:?}", bridge_a.snapshot());
+    let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(v["ok"], true, "{result}");
 }

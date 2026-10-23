@@ -87,6 +87,13 @@ pub fn call_record_chunk(request: tauri::ipc::Request<'_>) -> Result<(), String>
     super::record::chunk(&h("x-rec-id"), &h("x-track"), &h("x-ext"), bytes).map_err(e)
 }
 
+/// iOS: a finished track file the phone encoded (in its temp folder) joins the
+/// recording's folder.
+#[tauri::command]
+pub fn call_record_import(rec_id: String, track: String, ext: String, path: String) -> Result<Value, String> {
+    super::record::import_file(&rec_id, &track, &ext, std::path::Path::new(&path)).map_err(e)
+}
+
 #[tauri::command]
 pub fn call_record_close(iroh: Iroh<'_>, rec_id: String) -> Result<Value, String> {
     super::record::close(Some(&super::calls_of(&iroh)), &rec_id).map_err(e)

@@ -19,7 +19,9 @@ struct CallTurn: Decodable, Equatable {
 final class CallEngine: NSObject, RTCPeerConnectionDelegate {
     static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
-        return RTCPeerConnectionFactory(encoderFactory: RTCDefaultVideoEncoderFactory(), decoderFactory: RTCDefaultVideoDecoderFactory())
+        // Our own audio device (the same voice-processing unit WebRTC's would use),
+        // so a recording can hear both voices (CallAudioDevice).
+        return RTCPeerConnectionFactory(encoderFactory: RTCDefaultVideoEncoderFactory(), decoderFactory: RTCDefaultVideoDecoderFactory(), audioDevice: CallAudioDevice.shared)
     }()
 
     private(set) var pc: RTCPeerConnection?

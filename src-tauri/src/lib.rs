@@ -1028,6 +1028,7 @@ pub fn run() {
             calls::commands::call_record_open,
             calls::commands::call_record_chunk,
             calls::commands::call_record_close,
+            calls::commands::call_record_import,
             calls::commands::call_recordings,
             calls::commands::call_history,
             commands::cancel_transfer,
