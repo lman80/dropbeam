@@ -101,27 +101,17 @@ pub async fn lab_endpoint_persistent(accept: bool, state_dir: &Path) -> Result<E
 pub async fn lab_endpoint_for(mode: &str) -> Result<Endpoint> {
     crate::iroh_net::watch_local_subnets().await;
     if mode != "relay" { return lab_endpoint(false).await; }
-    let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
-    tcfg = tcfg.congestion_controller_factory(crate::iroh_net::congestion_factory());
-    tcfg = tcfg.ack_frequency_config(crate::iroh_net::ack_frequency());
-    tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
-    tcfg = tcfg.send_window(8 * 1024 * 1024);
     Endpoint::builder(presets::N0)
         .clear_ip_transports()
         .path_selector(std::sync::Arc::new(crate::iroh_net::DirectPathSelector::default()))
-        .transport_config(tcfg.build())
+        .transport_config(crate::iroh_net::transport_config())
         .bind().await.context("bind relay-only lab endpoint")
 }
 
 async fn lab_endpoint_inner(accept: bool, state_dir: Option<&Path>) -> Result<Endpoint> {
-    let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
-    tcfg = tcfg.congestion_controller_factory(crate::iroh_net::congestion_factory());
-    tcfg = tcfg.ack_frequency_config(crate::iroh_net::ack_frequency());
-    tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
-    tcfg = tcfg.send_window(8 * 1024 * 1024);
     let mut b = Endpoint::builder(presets::N0)
         .path_selector(std::sync::Arc::new(crate::iroh_net::DirectPathSelector::default()))
-        .transport_config(tcfg.build());
+        .transport_config(crate::iroh_net::transport_config());
     if let Some(dir) = state_dir {
         b = b.secret_key(lab_secret(dir));
     }
@@ -189,15 +179,10 @@ pub fn filter_addr(addr: EndpointAddr, mode: &str) -> EndpointAddr {
 /// app ALPN as a CLIENT (we dial devices, they don't dial us). Reuses the same
 /// production transport as the app so path behavior matches.
 pub async fn operator_endpoint(state_dir: &Path) -> Result<Endpoint> {
-    let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
-    tcfg = tcfg.congestion_controller_factory(crate::iroh_net::congestion_factory());
-    tcfg = tcfg.ack_frequency_config(crate::iroh_net::ack_frequency());
-    tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
-    tcfg = tcfg.send_window(8 * 1024 * 1024);
     Endpoint::builder(presets::N0)
         .path_selector(std::sync::Arc::new(crate::iroh_net::DirectPathSelector::default()))
         .secret_key(lab_secret(state_dir))
-        .transport_config(tcfg.build())
+        .transport_config(crate::iroh_net::transport_config())
         .bind()
         .await
         .context("bind operator endpoint")

@@ -2547,6 +2547,45 @@ pub(crate) fn congestion_factory() -> Arc<dyn noq_proto::congestion::ControllerF
     }
 }
 
+/// Throughput tuning, balanced against NOT wrecking the user's whole connection.
+/// BBR congestion control replaces quinn's CUBIC default (iroh benchmark
+/// n0-computer/iroh#4286: up to ~30x single-stream throughput, no "fill the
+/// window, stall, repeat" crawl).
+///
+/// CRITICAL: the flow-control windows are an UPPER BOUND on bytes in flight =
+/// the most data we can dump into the router's buffer. The old 32/64 MB windows
+/// let BBR's bandwidth probing balloon the home-router queue to tens of MB —
+/// multi-second bufferbloat that froze the user's OTHER traffic (YouTube, DNS),
+/// starved DNS into "lookup failed", and pushed the direct path onto the relay.
+/// 8 MB caps the queue depth while still covering a high-latency link's
+/// bandwidth-delay product (8 MB sustains ~320 Mbps at a 200 ms RTT — far beyond
+/// any home uplink), so realistic throughput is unchanged but the link stays
+/// usable for everything else during a transfer.
+///
+/// Field incident (2026-09-12): 14 advertised IPv4 addresses (11 Docker
+/// gateways) plus address churn exhausted the default 13 path ids, producing
+/// MaxPathIdReached and permanently relay-only connections. Both peers need
+/// headroom; iroh 0.98.2 also defaults to only 12 remote NAT addresses.
+///
+/// ONE definition shared by the app endpoint and every dropbeam-lab endpoint, so
+/// lab measurements always describe the shipping transport (the lab used to
+/// carry its own copy without the multipath headroom). DROPBEAM_STREAM_WINDOW /
+/// DROPBEAM_SEND_WINDOW (bytes) override the windows for lab A/B runs only.
+pub(crate) fn transport_config() -> iroh::endpoint::QuicTransportConfig {
+    let env_bytes = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
+    let stream_window = env_bytes("DROPBEAM_STREAM_WINDOW", STREAM_RECEIVE_WINDOW).min(u32::MAX as u64) as u32;
+    let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
+    tcfg = tcfg.congestion_controller_factory(congestion_factory());
+    tcfg = tcfg.ack_frequency_config(ack_frequency());
+    tcfg = tcfg.max_concurrent_multipath_paths(256u32);
+    tcfg = tcfg.max_remote_nat_traversal_addresses(32u8);
+    tcfg = tcfg.stream_receive_window(stream_window.into());
+    tcfg = tcfg.send_window(env_bytes("DROPBEAM_SEND_WINDOW", SEND_WINDOW));
+    tcfg.build()
+}
+const STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
+const SEND_WINDOW: u64 = 8 * 1024 * 1024;
+
 /// Path ranking: relay last; among direct paths a LOCAL-network one (the peer's
 /// address is on one of our LAN subnets) always beats a public one — even when a
 /// jittery Wi-Fi momentarily measures the public path faster. Field case
@@ -2682,37 +2721,12 @@ async fn start_with(config_dir: &Path, allow_fixed_port: bool) -> Result<Endpoin
     // Publish the tiny registry path before receives can record a destination.
     let _ = PARTIAL_DIRS_PATH.set(config_dir.join("partial-dirs.json"));
     partial_dirs::init(config_dir);
-    // Throughput tuning, balanced against NOT wrecking the user's whole connection.
-    // BBR congestion control replaces quinn's CUBIC default (iroh benchmark
-    // n0-computer/iroh#4286: up to ~30x single-stream throughput, no "fill the
-    // window, stall, repeat" crawl).
-    //
-    // CRITICAL: the flow-control windows are an UPPER BOUND on bytes in flight =
-    // the most data we can dump into the router's buffer. The old 32/64 MB windows
-    // let BBR's bandwidth probing balloon the home-router queue to tens of MB —
-    // multi-second bufferbloat that froze the user's OTHER traffic (YouTube, DNS),
-    // starved DNS into "lookup failed", and pushed the direct path onto the relay.
-    // 8 MB caps the queue depth while still covering a high-latency link's
-    // bandwidth-delay product (8 MB sustains ~320 Mbps at a 200 ms RTT — far beyond
-    // any home uplink), so realistic throughput is unchanged but the link stays
-    // usable for everything else during a transfer.
-    let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
-    tcfg = tcfg.congestion_controller_factory(congestion_factory());
-    tcfg = tcfg.ack_frequency_config(ack_frequency());
-    // Field incident (2026-09-12): 14 advertised IPv4 addresses (11 Docker
-    // gateways) plus address churn exhausted the default 13 path ids, producing
-    // MaxPathIdReached and permanently relay-only connections. Both peers need
-    // headroom; iroh 0.98.2 also defaults to only 12 remote NAT addresses.
-    tcfg = tcfg.max_concurrent_multipath_paths(256u32);
-    tcfg = tcfg.max_remote_nat_traversal_addresses(32u8);
-    tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
-    tcfg = tcfg.send_window(8 * 1024 * 1024);
 
     let mut builder = Endpoint::builder(presets::N0)
         .path_selector(Arc::new(DirectPathSelector::default()))
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()])
-        .transport_config(tcfg.build());
+        .transport_config(transport_config());
 
     // Relays (T10): our own baked-in relay(s) plus any the user adds in
     // Settings ("Custom relay": one or more https URLs), IN FRONT of n0's public
@@ -9065,7 +9079,15 @@ pub fn set_parallel_streams(on: bool) {
 /// zero after any blip (regression 540a837). One range stream is the same wire
 /// speed as the classic body and keeps the resumable/integrity path.
 fn parallel_streams_for(conn: &Connection, item_count: usize, total: u64) -> u64 {
-    local_stream_cap(matches!(conn_locality(conn), crate::models::Locality::Local), parallel_stream_count(item_count, total))
+    let local = matches!(conn_locality(conn), crate::models::Locality::Local);
+    let n = local_stream_cap(local, parallel_stream_count(item_count, total));
+    // Lab A/B only (unset in the app): DROPBEAM_LAN_STREAMS / DROPBEAM_NET_STREAMS
+    // force the fan-out for LAN / non-LAN paths of a send that would fan out at all.
+    let key = if local { "DROPBEAM_LAN_STREAMS" } else { "DROPBEAM_NET_STREAMS" };
+    match std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(forced) if n > 0 => forced.clamp(1, PARALLEL_STREAMS),
+        _ => n,
+    }
 }
 
 /// LAN caps the fan-out at one stream but never turns a resumable send (n ≥ 1)

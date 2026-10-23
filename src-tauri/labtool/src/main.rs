@@ -390,12 +390,19 @@ async fn send(args: &[String]) -> Result<()> {
                 .connect(peer.clone(), labkit::ALPN)
                 .await
                 .context("dial peer")?;
+            // Connection setup (dial → QUIC handshake done) and time to the first
+            // confirmed payload byte, both from the case start.
+            let connect_ms = started.elapsed().as_millis() as u64;
+            let first_byte_ms = std::sync::atomic::AtomicU64::new(0);
             let path_start = labkit::conn_detail(&conn);
             let engaged = AtomicBool::new(false);
             // --profile: sample (elapsed_ms, bytes_confirmed) roughly every 2s so
             // a long transfer's rate-over-time shape is visible (decay vs sawtooth).
             let samples = Mutex::new(Vec::<(u64, u64)>::new());
-            let progress = |done, _| {
+            let progress = |done: u64, _| {
+                if done > 0 && first_byte_ms.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    first_byte_ms.store(started.elapsed().as_millis().max(1) as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 if profile {
                     let t = started.elapsed().as_millis() as u64;
                     let mut s = samples.lock().unwrap();
@@ -424,6 +431,8 @@ async fn send(args: &[String]) -> Result<()> {
                 "bytes": sent,
                 "ms": ms,
                 "mbps": (sent as f64 / (1024.0 * 1024.0)) / (ms as f64 / 1000.0),
+                "connectMs": connect_ms,
+                "firstByteMs": first_byte_ms.load(std::sync::atomic::Ordering::Relaxed),
                 "parallelEngaged": engaged.load(std::sync::atomic::Ordering::Relaxed),
                 // Path the QUIC connection was on at dial time vs after the
                 // transfer — shows relay→direct upgrades and hairpin routes.
