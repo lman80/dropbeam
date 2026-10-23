@@ -141,6 +141,10 @@ async fn serve(args: &[String]) -> Result<()> {
                     s.write_all(&body).await?;
                     s.finish()?;
                     let _ = s.stopped().await;
+                    // Let the puller read everything and close first: dropping the
+                    // connection here raced its read ("connection lost") and aborted
+                    // whole send runs at the round-boundary reset.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
                     if req == b"reset" {
                         results.lock().unwrap().clear();
                         return Ok(json!({"event": "results-reset", "conn": idx}));
@@ -380,10 +384,19 @@ async fn send(args: &[String]) -> Result<()> {
     for case in &cases {
         if verify {
             // Round boundary: the next result on the receiver is this case's.
-            pull_results(&ep, &peer, true).await.context("reset receiver results")?;
+            let mut tries = 0;
+            loop {
+                match pull_results(&ep, &peer, true).await {
+                    Ok(_) => break,
+                    Err(_) if tries < 3 => { tries += 1; tokio::time::sleep(std::time::Duration::from_millis(300)).await; }
+                    Err(e) => return Err(e).context("reset receiver results"),
+                }
+            }
         }
-        let started = Instant::now();
+        // Hash the expected tree BEFORE starting the clock: hashing a big case
+        // used to land inside connectMs/ms (~1 s per 128 MiB) and understate speed.
         let (expected, exp_dirs) = labkit::expected_report(&case.paths)?;
+        let started = Instant::now();
         let expected_bytes: u64 = expected.iter().map(|f| f.size).sum();
         let result: Result<serde_json::Value> = async {
             let conn = ep
