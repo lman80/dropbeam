@@ -17,7 +17,7 @@ async function stats(p) {
   const out = {};
   (await p.getStats()).forEach(s => {
     if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') { out.rttMs = s.currentRoundTripTime * 1000; out.availOut = s.availableOutgoingBitrate; }
-    if (s.type === 'inbound-rtp' && s.kind === 'audio') { out.aLost = s.packetsLost; out.aRecv = s.packetsReceived; out.aJitterMs = s.jitter * 1000; out.aBytes = s.bytesReceived; out.aJbDelayMs = s.jitterBufferEmittedCount ? 1000 * s.jitterBufferDelay / s.jitterBufferEmittedCount : null; out.fec = s.fecPacketsReceived; }
+    if (s.type === 'inbound-rtp' && s.kind === 'audio') { out.aLost = s.packetsLost; out.aRecv = s.packetsReceived; out.aJitterMs = s.jitter * 1000; out.aBytes = s.bytesReceived; out.aJbDelay = s.jitterBufferDelay; out.aJbCount = s.jitterBufferEmittedCount; out.aJbTargetMs = s.jitterBufferEmittedCount ? 1000 * s.jitterBufferTargetDelay / s.jitterBufferEmittedCount : null; out.fec = s.fecPacketsReceived; }
     if (s.type === 'inbound-rtp' && s.kind === 'video') { out.vLost = s.packetsLost; out.vRecv = s.packetsReceived; out.vBytes = s.bytesReceived; out.w = s.frameWidth; out.h = s.frameHeight; out.fps = s.framesPerSecond; out.vDecoded = s.framesDecoded; out.codec = s.codecId; }
     if (s.type === 'local-candidate') out.localCand = `${s.candidateType} ${s.address}:${s.port}`;
   });
@@ -57,7 +57,8 @@ async function stats(p) {
     }
     const first = samples[0], last = samples[samples.length - 1];
     const secs = samples.length - 1 || 1;
-    const result = { ok: true, connectMs, last, kbpsVideoIntoB: ((last.b.vBytes - first.b.vBytes) * 8 / 1000) / secs, kbpsAudioIntoB: ((last.b.aBytes - first.b.aBytes) * 8 / 1000) / secs, samples };
+    const jb = k => (last[k].aJbCount - first[k].aJbCount) ? Math.round(1000 * (last[k].aJbDelay - first[k].aJbDelay) / (last[k].aJbCount - first[k].aJbCount)) : null;
+    const result = { ok: true, connectMs, jbMsA: jb('a'), jbMsB: jb('b'), last, kbpsVideoIntoB: ((last.b.vBytes - first.b.vBytes) * 8 / 1000) / secs, kbpsAudioIntoB: ((last.b.aBytes - first.b.aBytes) * 8 / 1000) / secs, samples };
     await fetch('/result', { method: 'POST', body: JSON.stringify(result) });
   } catch (e) {
     await fetch('/result', { method: 'POST', body: JSON.stringify({ ok: false, error: String(e && e.stack || e) }) });

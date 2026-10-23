@@ -68,6 +68,15 @@ fn mark_conn(stable_id: usize, on: bool) {
 
 pub fn now_ms() -> u64 { crate::chat::now_ms() }
 
+/// Debug builds only: test media and auto-answer for unattended call tests
+/// (DROPBEAM_CALL_FAKE_MEDIA=1, DROPBEAM_CALL_AUTOANSWER=1). Never in a release.
+pub(crate) fn lab_flags() -> Option<Value> {
+    if !cfg!(debug_assertions) { return None; }
+    let on = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
+    let (fake, auto) = (on("DROPBEAM_CALL_FAKE_MEDIA"), on("DROPBEAM_CALL_AUTOANSWER"));
+    (fake || auto).then(|| json!({ "fakeMedia": fake, "autoAnswer": auto }))
+}
+
 struct LegIo {
     tx: mpsc::UnboundedSender<Option<Value>>,
     conn: Connection,
@@ -88,6 +97,7 @@ struct Live {
     auto_accept: bool,
     /// Glare loser: ended without a history line.
     silent: bool,
+    unsupported: bool,
     rec: record::Consent,
 }
 
@@ -130,6 +140,8 @@ impl Calls {
         v["autoAccept"] = json!(l.auto_accept);
         // Ended only because the two of them called each other at once.
         v["glare"] = json!(l.silent);
+        // Some device of theirs answered that it can't take calls.
+        v["unsupported"] = json!(l.unsupported);
         v["recording"] = serde_json::to_value(&l.rec).unwrap_or(Value::Null);
         v
     }
@@ -254,7 +266,7 @@ pub async fn start(state: &IrohState, friend_id: &str, video: bool) -> Result<Va
     let mut guard = calls.live.lock().unwrap();
     anyhow::ensure!(guard.is_none(), "You're already in a call.");
     let l = Live { call: Call::outgoing(&id, &owner.id, video, &eps, now_ms()), tag, user, pass, bridge: Some(bridge),
-        name: owner.name.clone(), offer: None, legs: HashMap::new(), auto_accept: false, silent: false, rec: Default::default() };
+        name: owner.name.clone(), offer: None, legs: HashMap::new(), auto_accept: false, silent: false, unsupported: false, rec: Default::default() };
     let out = json!({ "callId": id, "turn": turn_info(&l), "call": Calls::snapshot(&l) });
     calls.emit("call://state", Calls::snapshot(&l));
     *guard = Some(l);
@@ -356,7 +368,12 @@ fn on_frame(calls: &Arc<Calls>, id: &str, ep: &str, frame: Value) {
         "call.busy" => ev(Ev::Busy),
         "call.decline" => ev(Ev::Declined),
         "call.missed" => ev(Ev::Missed),
-        "call.unavailable" => ev(Ev::Unavailable),
+        "call.unavailable" => {
+            if frame["reason"] == "unsupported" {
+                if let Some(l) = calls.live.lock().unwrap().as_mut().filter(|l| l.call.id == id) { l.unsupported = true; }
+            }
+            ev(Ev::Unavailable)
+        }
         "call.glare" => {
             // They're calling us at this very moment and their call wins.
             let mut g = calls.live.lock().unwrap();
@@ -447,12 +464,18 @@ pub(crate) async fn serve_offer(conn: &Connection, send: &mut SendStream, recv: 
     let id = req["callId"].as_str().unwrap_or("").to_string();
     let tag = req["tag"].as_str().and_then(|t| u64::from_str_radix(t, 16).ok());
     let offer = req["sdp"].as_str().and_then(|s| sdp::incoming(s).ok());
-    let (Some(friend), Some(tag), Some(offer), true, false, true) =
-        (friend, tag, offer, valid_id(&id), crate::mailbox::is_headless(), calls.capable()) else {
+    let (Some(friend), Some(tag), Some(offer), true) = (friend, tag, offer, valid_id(&id)) else {
         write_frame(send, &refuse("call.unavailable")).await?;
         let _ = send.finish();
         return Ok(());
     };
+    // A friend may learn that this device can't take calls (no screen, or a
+    // web view without WebRTC), so their screen can say so plainly.
+    if crate::mailbox::is_headless() || !calls.capable() {
+        write_frame(send, &json!({"kind": "call.unavailable", "reason": "unsupported"})).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
     if !calls.rate_ok(&who) {
         log::info!("call: refusing a ring — too many from this device");
         write_frame(send, &refuse("call.unavailable")).await?;
@@ -471,10 +494,11 @@ pub(crate) async fn serve_offer(conn: &Connection, send: &mut SendStream, recv: 
             Some(_) => Seen::Busy,
         }
     };
+    let lab_answer = lab_flags().is_some_and(|l| l["autoAnswer"] == true);
     let (auto_accept, glare_cancel) = match seen {
         Seen::Free => {
             let recent = calls.glare.lock().unwrap().take();
-            (recent.is_some_and(|(p, t)| p == friend.id && t.elapsed() < Duration::from_secs(10)), None)
+            (lab_answer || recent.is_some_and(|(p, t)| p == friend.id && t.elapsed() < Duration::from_secs(10)), None)
         }
         Seen::Glare(mine) => (true, Some(mine)),
         Seen::Lost => {
@@ -489,7 +513,7 @@ pub(crate) async fn serve_offer(conn: &Connection, send: &mut SendStream, recv: 
             let (mut missed, _) = Call::incoming(&id, &friend.id, video, &who, now_ms());
             missed.on(Ev::Canceled(who.clone()), now_ms());
             calls.record_history(&Live { call: missed, tag, user: String::new(), pass: String::new(), bridge: None,
-                name: friend.name.clone(), offer: None, legs: HashMap::new(), auto_accept: false, silent: false, rec: Default::default() });
+                name: friend.name.clone(), offer: None, legs: HashMap::new(), auto_accept: false, silent: false, unsupported: false, rec: Default::default() });
             return Ok(());
         }
     };
@@ -508,7 +532,7 @@ pub(crate) async fn serve_offer(conn: &Connection, send: &mut SendStream, recv: 
         let mut legs = HashMap::new();
         legs.insert(who.clone(), LegIo { tx: tx.clone(), conn: conn.clone() });
         let l = Live { call, tag, user, pass, bridge: Some(bridge), name: friend.name.clone(), offer: Some(offer), legs,
-            auto_accept, silent: false, rec: Default::default() };
+            auto_accept, silent: false, unsupported: false, rec: Default::default() };
         for a in acts { if let Act::Send(_, f) = a { let _ = tx.send(Some(f)); } }
         let snap = Calls::snapshot(&l);
         *guard = Some(l);
@@ -522,7 +546,7 @@ pub(crate) async fn serve_offer(conn: &Connection, send: &mut SendStream, recv: 
         write_frame(send, &refuse("call.busy")).await?;
         return Ok(());
     }
-    if !auto_accept { ring_here(&calls, &friend.name, &friend.id, video); }
+    ring_here(&calls, &friend.name, &friend.id, video, !auto_accept);
     spawn_ticker(calls.clone(), id.clone());
     pump(&calls, &id, &who, send, recv, rx).await;
     calls.apply(&id, Ev::Lost(who));
@@ -531,10 +555,11 @@ pub(crate) async fn serve_offer(conn: &Connection, send: &mut SendStream, recv: 
 
 /// Bring the window up and post a notification, so a call rings even when
 /// DropBeam sits in the menu bar / tray.
-fn ring_here(calls: &Calls, name: &str, person: &str, video: bool) {
+fn ring_here(calls: &Calls, name: &str, person: &str, video: bool, notify: bool) {
     let Some(app) = calls.app.get() else { return };
     #[cfg(desktop)]
     crate::show_main_window(app);
+    if !notify { return; }
     let what = if video { "Video call" } else { "Audio call" };
     crate::chat_notify::show(app, &format!("{name} is calling"), what, person);
 }

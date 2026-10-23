@@ -39,7 +39,7 @@ import { completedChatItems, restoredChatTransfer } from '../lib/chatTransfer'
 import { ChatTransferProgress } from '../components/ChatTransferProgress'
 import { DeliveryLine } from '../components/Deliveries'
 import { ConnInfo } from '../components/ConnInspector'
-import { callsSupported, startCall } from '../lib/calls'
+import { startCall } from '../lib/calls'
 import { GifPicker } from '../components/GifPicker'
 import { avatarGradient } from '../lib/avatar'
 import { FriendAvatar } from '../components/FriendAvatar'
@@ -859,7 +859,7 @@ function Conversation({ friendId }: { friendId: string }) {
           </div>
           <div className="chat-header-actions">
             {online && conn && <ConnInfo detail={conn} align="end" />}
-            {HAS_TAURI && callsSupported() && (
+            {HAS_TAURI && (
               <>
                 <IconButton label={`Audio call ${displayName}`} tooltip="Audio call" onClick={() => void startCall(friend.id, false).catch(() => {})}>
                   <Phone />
@@ -2097,7 +2097,7 @@ function CallLine({ m, friendId }: { m: ChatMessage; friendId: string }) {
         type="button"
         className={missed ? 'chat-call-pill missed' : 'chat-call-pill'}
         title={video ? 'Video call back' : 'Call back'}
-        onClick={() => { if (callsSupported()) void startCall(friendId, video).catch(() => {}) }}
+        onClick={() => void startCall(friendId, video).catch(() => {})}
       >
         {video ? <Video /> : <Icon />}
         <span className="chat-call-text">{m.text}</span>

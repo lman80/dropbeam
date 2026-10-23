@@ -45,6 +45,8 @@ export interface CallSnapshot {
   active: string | null
   autoAccept: boolean
   glare: boolean
+  /** A device of theirs said it can't take calls. */
+  unsupported?: boolean
   recording: RecordingConsent
 }
 
@@ -58,6 +60,8 @@ export interface CallQuality {
   /** Packets lost in the last interval, percent (incoming audio). */
   lossPct: number | null
   jitterMs: number | null
+  /** Incoming audio jitter-buffer delay (ms) over the last interval. */
+  jbMs: number | null
   /** Outgoing media bitrate, kbps. */
   sendKbps: number | null
   recvKbps: number | null
@@ -77,7 +81,7 @@ const api = {
   hangup: (callId: string) => invoke<void>('call_hangup', { callId }),
   mediaUp: (callId: string) => invoke<void>('call_media_up', { callId }),
   signal: (callId: string, frame: Record<string, unknown>) => invoke<void>('call_signal', { callId, frame }),
-  status: () => invoke<{ call: CallSnapshot | null; last: CallSnapshot | null; capable: boolean }>('call_status'),
+  status: () => invoke<{ call: CallSnapshot | null; last: CallSnapshot | null; capable: boolean; lab?: { fakeMedia: boolean; autoAnswer: boolean } }>('call_status'),
   stats: (callId: string) => invoke<{ path: { path: string; rttMs: number | null } | null; bridge: Record<string, number> | null }>('call_stats', { callId }),
   recordOpen: (callId: string) => invoke<{ recId: string; dir: string }>('call_record_open', { callId }),
   recordChunk: (recId: string, track: string, ext: string, bytes: Uint8Array) =>
@@ -87,7 +91,7 @@ const api = {
 
 /** Can this webview make calls? (WebKitGTK builds often ship without WebRTC.) */
 export function callsSupported(): boolean {
-  return typeof window !== 'undefined' && typeof RTCPeerConnection !== 'undefined' && !!navigator.mediaDevices?.getUserMedia
+  return typeof window !== 'undefined' && typeof RTCPeerConnection !== 'undefined' && (!!navigator.mediaDevices?.getUserMedia || !!lab?.fakeMedia)
 }
 
 export const CALLS_UNSUPPORTED = 'Calls need a newer system web view on this computer (WebRTC isn’t available here).'
@@ -101,7 +105,8 @@ interface CallUi {
   muted: boolean
   cameraOn: boolean
   remoteMuted: boolean
-  remoteCamera: boolean
+  /** null until the other side says (then follows their camera button). */
+  remoteCamera: boolean | null
   quality: CallQuality | null
   recording: { recId: string; dir: string } | null
   savedTo: string | null
@@ -112,7 +117,7 @@ interface CallUi {
 }
 
 export const useCall = create<CallUi>(() => ({
-  call: null, last: null, local: null, remote: null, muted: false, cameraOn: false, remoteMuted: false, remoteCamera: false,
+  call: null, last: null, local: null, remote: null, muted: false, cameraOn: false, remoteMuted: false, remoteCamera: null,
   quality: null, recording: null, savedTo: null, error: null, busy: false, shareTracks: false,
 }))
 
@@ -122,7 +127,7 @@ const set = useCall.setState
 let pc: RTCPeerConnection | null = null
 let callId: string | null = null
 let statsTimer: number | null = null
-let lastBytes: { at: number; sent: number; recv: number; lost: number; got: number } | null = null
+let lastBytes: { at: number; sent: number; recv: number; lost: number; got: number; jbd: number; jbn: number } | null = null
 let recorders: MediaRecorder[] = []
 let mixCtx: AudioContext | null = null
 let pendingAnswer: string | null = null
@@ -141,7 +146,12 @@ function gathered(p: RTCPeerConnection): Promise<void> {
 const AUDIO: MediaTrackConstraints = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 48000 }
 const VIDEO: MediaTrackConstraints = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }
 
+/** Debug builds only (env DROPBEAM_CALL_FAKE_MEDIA / _AUTOANSWER): test media + delay probe. */
+let lab: { fakeMedia: boolean; autoAnswer: boolean } | null = null
+let stopProbe: (() => void) | null = null
+
 async function getMedia(video: boolean): Promise<MediaStream> {
+  if (lab?.fakeMedia) return (await import('./callLab')).fakeMedia(video)
   try {
     return await navigator.mediaDevices.getUserMedia({ audio: AUDIO, video: video ? VIDEO : false })
   } catch (e) {
@@ -166,11 +176,17 @@ function makePc(turn: TurnInfo): RTCPeerConnection {
   p.addEventListener('track', (e) => {
     const cur = useCall.getState().remote ?? new MediaStream()
     if (!cur.getTracks().includes(e.track)) cur.addTrack(e.track)
-    set({ remote: new MediaStream(cur.getTracks()) })
+    const remote = new MediaStream(cur.getTracks())
+    set({ remote })
+    if (lab?.fakeMedia && !stopProbe && remote.getAudioTracks().length && remote.getVideoTracks().length) startProbe(remote)
   })
   p.addEventListener('connectionstatechange', () => {
     if (!callId || p !== pc) return
-    if (p.connectionState === 'connected') void api.mediaUp(callId).catch(() => {})
+    if (p.connectionState === 'connected') {
+      void api.mediaUp(callId).catch(() => {})
+      const st = useCall.getState()
+      void api.signal(callId, { kind: 'call.media', muted: st.muted, camera: st.cameraOn }).catch(() => {})
+    }
     if (p.connectionState === 'failed') void hangup()
   })
   return p
@@ -215,7 +231,19 @@ function addMedia(p: RTCPeerConnection, local: MediaStream) {
   if (v) v.contentHint = 'motion'
 }
 
+function startProbe(remote: MediaStream) {
+  stopProbe = () => {}
+  void import('./callLab').then((m) => {
+    stopProbe = m.probe(remote, (r) => {
+      const q = useCall.getState().quality
+      void invoke('frontend_log', { msg: `call-lab ${JSON.stringify({ ...r, rttMs: q?.rttMs, lossPct: q?.lossPct, jitterMs: q?.jitterMs, jbMs: q?.jbMs, sendKbps: q?.sendKbps, recvKbps: q?.recvKbps, video: q?.video, codec: q?.codec, path: q?.path })}` }).catch(() => {})
+    })
+  })
+}
+
 function reset() {
+  stopProbe?.()
+  stopProbe = null
   if (statsTimer) window.clearInterval(statsTimer)
   statsTimer = null
   lastBytes = null
@@ -226,7 +254,7 @@ function reset() {
   stopRecording(false)
   for (const t of useCall.getState().local?.getTracks() ?? []) t.stop()
   stopRing()
-  set({ local: null, remote: null, muted: false, cameraOn: false, remoteMuted: false, remoteCamera: false, quality: null, busy: false })
+  set({ local: null, remote: null, muted: false, cameraOn: false, remoteMuted: false, remoteCamera: null, quality: null, busy: false })
 }
 
 // ── placing and answering ──
@@ -368,7 +396,7 @@ async function sampleStats() {
   if (!pc || !callId) return
   const r = await pc.getStats().catch(() => null)
   if (!r) return
-  let rtt: number | null = null, sent = 0, recv = 0, lost = 0, got = 0, jitter: number | null = null
+  let rtt: number | null = null, sent = 0, recv = 0, lost = 0, got = 0, jitter: number | null = null, jbd = 0, jbn = 0
   let video: CallQuality['video'] = null, codecId: string | null = null
   const codecs = new Map<string, string>()
   r.forEach((s: Record<string, unknown> & { type: string; id: string }) => {
@@ -376,26 +404,27 @@ async function sampleStats() {
     if (s.type === 'outbound-rtp') sent += (s.bytesSent as number) || 0
     if (s.type === 'inbound-rtp') {
       recv += (s.bytesReceived as number) || 0
-      if (s.kind === 'audio') { lost += (s.packetsLost as number) || 0; got += (s.packetsReceived as number) || 0; jitter = Math.round(((s.jitter as number) || 0) * 1000) }
+      if (s.kind === 'audio') { lost += (s.packetsLost as number) || 0; got += (s.packetsReceived as number) || 0; jitter = Math.round(((s.jitter as number) || 0) * 1000); jbd += (s.jitterBufferDelay as number) || 0; jbn += (s.jitterBufferEmittedCount as number) || 0 }
       if (s.kind === 'video' && s.frameWidth) { video = { width: s.frameWidth as number, height: s.frameHeight as number, fps: Math.round((s.framesPerSecond as number) || 0) }; codecId = (s.codecId as string) ?? null }
     }
     if (s.type === 'codec') codecs.set(s.id, String(s.mimeType ?? ''))
   })
   const now = performance.now()
-  let sendKbps: number | null = null, recvKbps: number | null = null, lossPct: number | null = null
+  let sendKbps: number | null = null, recvKbps: number | null = null, lossPct: number | null = null, jbMs: number | null = null
   if (lastBytes) {
+    if (jbn > lastBytes.jbn) jbMs = Math.round((1000 * (jbd - lastBytes.jbd)) / (jbn - lastBytes.jbn))
     const secs = (now - lastBytes.at) / 1000
     sendKbps = Math.round(((sent - lastBytes.sent) * 8) / 1000 / secs)
     recvKbps = Math.round(((recv - lastBytes.recv) * 8) / 1000 / secs)
     const dl = lost - lastBytes.lost, dg = got - lastBytes.got
     lossPct = dl + dg > 0 ? Math.max(0, Math.round((1000 * dl) / (dl + dg)) / 10) : 0
   }
-  lastBytes = { at: now, sent, recv, lost, got }
+  lastBytes = { at: now, sent, recv, lost, got, jbd, jbn }
   const engine = await api.stats(callId).catch(() => null)
   const path = engine?.path?.path ?? null
   const rttMs: number | null = rtt ?? engine?.path?.rttMs ?? null
   const grade: CallQuality['grade'] = rttMs == null ? null : rttMs > 400 || (lossPct ?? 0) > 8 ? 'poor' : rttMs > 200 || (lossPct ?? 0) > 3 ? 'ok' : 'good'
-  set({ quality: { path, rttMs, lossPct, jitterMs: jitter, sendKbps, recvKbps, video, codec: codecId ? (codecs.get(codecId) ?? '').replace(/^video\//, '') || null : null, grade } })
+  set({ quality: { path, rttMs, lossPct, jitterMs: jitter, jbMs, sendKbps, recvKbps, video, codec: codecId ? (codecs.get(codecId) ?? '').replace(/^video\//, '') || null : null, grade } })
 }
 
 // ── recording (on this device, with the other person's yes) ──
@@ -517,7 +546,8 @@ let started = false
 export function startCallEngine(onEnded?: (c: CallSnapshot) => void): () => void {
   if (!HAS_TAURI || started) return () => {}
   started = true
-  void api.capable(callsSupported()).catch(() => {})
+  void invoke('frontend_log', { msg: `calls: webrtc=${typeof RTCPeerConnection !== 'undefined'} media=${!!navigator.mediaDevices?.getUserMedia} recorder=${typeof MediaRecorder !== 'undefined'}` }).catch(() => {})
+  void api.status().then((st) => { lab = st.lab ?? null }).catch(() => {}).finally(() => { void api.capable(callsSupported()).catch(() => {}) })
   const uns: Promise<UnlistenFn>[] = [
     listen<CallSnapshot>('call://state', (e) => onState(e.payload, onEnded)),
     listen<CallSnapshot>('call://incoming', (e) => {

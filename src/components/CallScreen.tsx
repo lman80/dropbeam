@@ -61,7 +61,7 @@ function endedLine(c: CallSnapshot): string {
     case 'no_answer': return 'No answer'
     case 'missed': return 'Missed call'
     case 'canceled': return 'Canceled'
-    case 'unavailable': return `Couldn’t reach ${c.name}. They may need to open or update DropBeam.`
+    case 'unavailable': return c.unsupported ? `${c.name}’s device can’t take calls yet.` : `Couldn’t reach ${c.name}. They may need to open or update DropBeam.`
     case 'failed': return dur ? `Call dropped · ${dur}` : 'Couldn’t connect the call'
     default: return 'Call ended'
   }
@@ -121,8 +121,8 @@ function InCall({ call }: { call: CallSnapshot }) {
   const [outs, setOuts] = useState<MediaDeviceInfo[]>([])
   const [sink, setSink] = useState('')
   const now = useNow(true)
-  const remoteVideo = useMemo(() => !!remote?.getVideoTracks().some((t) => t.readyState === 'live') && remoteCamera !== false, [remote, remoteCamera])
-  const showRemoteVideo = remoteVideo && (call.video || remoteCamera)
+  const showRemoteVideo = useMemo(() => !!remote?.getVideoTracks().some((t) => t.readyState === 'live') && remoteCamera !== false
+    && (call.video || remoteCamera === true), [remote, remoteCamera, call.video])
   const rec = call.recording
   const live = call.phase === 'active'
 

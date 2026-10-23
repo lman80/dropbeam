@@ -54,7 +54,11 @@ pub fn call_signal(iroh: Iroh<'_>, call_id: String, frame: Value) -> Result<(), 
 }
 
 #[tauri::command]
-pub fn call_status(iroh: Iroh<'_>) -> Value { super::calls_of(&iroh).status() }
+pub fn call_status(iroh: Iroh<'_>) -> Value {
+    let mut v = super::calls_of(&iroh).status();
+    if let Some(lab) = super::lab_flags() { v["lab"] = lab; }
+    v
+}
 
 #[tauri::command]
 pub fn call_stats(iroh: Iroh<'_>, call_id: String) -> Result<Value, String> {

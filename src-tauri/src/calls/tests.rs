@@ -196,7 +196,9 @@ async fn a_device_that_cannot_do_calls_says_unavailable() {
     b.state.calls.set_capable(false);
     let id = super::start(&a.state, &b_in_a, false).await.unwrap()["callId"].as_str().unwrap().to_string();
     super::send_offer(&a.state, &id, SDP).await.unwrap();
-    assert_eq!(a.wait_end().await["end"], "unavailable");
+    let end = a.wait_end().await;
+    assert_eq!(end["end"], "unavailable");
+    assert_eq!(end["unsupported"], true);
     assert_eq!(a.history()[0]["text"], "Audio call · Couldn’t connect");
 }
 
