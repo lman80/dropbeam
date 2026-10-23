@@ -21,6 +21,8 @@ pub mod media;
 pub mod signal;
 pub mod sdp;
 pub mod record;
+pub mod commands;
+pub mod wake;
 
 #[cfg(test)]
 mod lab_tests;
@@ -48,6 +50,8 @@ const RING_PER_MINUTE: usize = 5;
 const RING_PER_HOUR: usize = 30;
 /// Mid-call frames the two call screens exchange through the engine.
 const PASS_KINDS: &[&str] = &["call.media", "call.record", "call.sdp"];
+/// Shown when this device's call screen can't do WebRTC.
+pub const UNSUPPORTED: &str = "Calls need a newer system web view on this computer (WebRTC isn’t available here).";
 
 /// Connections carrying a call: never rotated or closed for housekeeping.
 static IN_CALL: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
@@ -182,6 +186,7 @@ impl Calls {
             self.emit("call://state", snap);
         }
         if let Some(done) = ended {
+            record::close_for_call(&done.call.id);
             if !done.silent { self.record_history(&done); }
         }
     }
@@ -273,7 +278,19 @@ pub async fn send_offer(state: &Arc<IrohState>, id: &str, offer: &str) -> Result
         let (state, calls, id, offer) = (state.clone(), calls.clone(), id.to_string(), offer.clone());
         tauri::async_runtime::spawn(async move {
             let frame = json!({ "kind": "call.offer", "v": 1, "callId": id, "tag": format!("{tag:016x}"), "video": video, "sdp": offer });
-            match open_leg(&state, &ep, &frame).await {
+            let mut opened = open_leg(&state, &ep, &frame).await;
+            // Asleep (an iPhone in the background)? Wake it with a push and keep
+            // redialing while the call still rings.
+            if opened.is_err() && wake::wake(&state, &ep, &id, video).await {
+                for _ in 0..12 {
+                    let ringing = calls.live.lock().unwrap().as_ref().is_some_and(|l| l.call.id == id && l.call.phase == Phase::Ringing);
+                    if !ringing { break; }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    opened = open_leg(&state, &ep, &frame).await;
+                    if opened.is_ok() { break; }
+                }
+            }
+            match opened {
                 Ok((conn, send, recv)) => run_leg(calls, id, ep, conn, send, recv).await,
                 Err(e) => {
                     log::info!("call: couldn't ring {}: {e:#}", crate::telemetry::redact_paths_only(&ep[..ep.len().min(10)]));
@@ -454,14 +471,12 @@ pub(crate) async fn serve_offer(conn: &Connection, send: &mut SendStream, recv: 
             Some(_) => Seen::Busy,
         }
     };
-    let mut auto_accept = false;
-    let glare_cancel = match seen {
+    let (auto_accept, glare_cancel) = match seen {
         Seen::Free => {
             let recent = calls.glare.lock().unwrap().take();
-            auto_accept = recent.is_some_and(|(p, t)| p == friend.id && t.elapsed() < Duration::from_secs(10));
-            None
+            (recent.is_some_and(|(p, t)| p == friend.id && t.elapsed() < Duration::from_secs(10)), None)
         }
-        Seen::Glare(mine) => { auto_accept = true; Some(mine) }
+        Seen::Glare(mine) => (true, Some(mine)),
         Seen::Lost => {
             // Our own call to them wins; they drop theirs when ours arrives.
             write_frame(send, &refuse("call.glare")).await?;

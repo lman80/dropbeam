@@ -1014,6 +1014,22 @@ pub fn run() {
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
+            calls::commands::call_capable,
+            calls::commands::call_start,
+            calls::commands::call_offer,
+            calls::commands::call_accept,
+            calls::commands::call_answer,
+            calls::commands::call_decline,
+            calls::commands::call_hangup,
+            calls::commands::call_media_up,
+            calls::commands::call_signal,
+            calls::commands::call_status,
+            calls::commands::call_stats,
+            calls::commands::call_record_open,
+            calls::commands::call_record_chunk,
+            calls::commands::call_record_close,
+            calls::commands::call_recordings,
+            calls::commands::call_history,
             commands::cancel_transfer,
             commands::pause_transfer,
             commands::get_settings,

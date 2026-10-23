@@ -21,8 +21,13 @@ import {
   MoreHorizontal,
   Paperclip,
   Pencil,
+  Phone,
+  PhoneIncoming,
+  PhoneMissed,
+  PhoneOutgoing,
   Play,
   Search,
+  Video,
   Smile,
   SquarePen,
   Trash2,
@@ -34,6 +39,7 @@ import { completedChatItems, restoredChatTransfer } from '../lib/chatTransfer'
 import { ChatTransferProgress } from '../components/ChatTransferProgress'
 import { DeliveryLine } from '../components/Deliveries'
 import { ConnInfo } from '../components/ConnInspector'
+import { callsSupported, startCall } from '../lib/calls'
 import { GifPicker } from '../components/GifPicker'
 import { avatarGradient } from '../lib/avatar'
 import { FriendAvatar } from '../components/FriendAvatar'
@@ -853,6 +859,16 @@ function Conversation({ friendId }: { friendId: string }) {
           </div>
           <div className="chat-header-actions">
             {online && conn && <ConnInfo detail={conn} align="end" />}
+            {HAS_TAURI && callsSupported() && (
+              <>
+                <IconButton label={`Audio call ${displayName}`} tooltip="Audio call" onClick={() => void startCall(friend.id, false).catch(() => {})}>
+                  <Phone />
+                </IconButton>
+                <IconButton label={`Video call ${displayName}`} tooltip="Video call" onClick={() => void startCall(friend.id, true).catch(() => {})}>
+                  <Video />
+                </IconButton>
+              </>
+            )}
             <IconButton
               label="Search this conversation"
               tooltip={`Search  ${shortcutLabel('f')}`}
@@ -962,6 +978,8 @@ function Conversation({ friendId }: { friendId: string }) {
                         folderName={row.folderName}
                         friendName={friend.name}
                       />
+                    ) : row.m.kind === 'call' ? (
+                      <CallLine m={row.m} friendId={friend.id} />
                     ) : (
                       <MessageRow
                         m={row.m}
@@ -2065,4 +2083,26 @@ function TextPreview({ src, onOpen }: { src: string; onOpen: () => void }) {
 /** "Alex" from "Alex Rivera" (a whole name with no spaces stays whole). */
 function firstWord(name: string): string {
   return name.trim().split(/\s+/)[0] || name
+}
+
+/** A call in the thread: who called, audio/video, how it went. Click to call back. */
+function CallLine({ m, friendId }: { m: ChatMessage; friendId: string }) {
+  const outcome = m.call?.outcome ?? ''
+  const missed = !m.fromMe && (outcome === 'missed' || outcome === 'declined')
+  const Icon = missed ? PhoneMissed : m.fromMe ? PhoneOutgoing : PhoneIncoming
+  const video = !!m.call?.video
+  return (
+    <div className="chat-call-line">
+      <button
+        type="button"
+        className={missed ? 'chat-call-pill missed' : 'chat-call-pill'}
+        title={video ? 'Video call back' : 'Call back'}
+        onClick={() => { if (callsSupported()) void startCall(friendId, video).catch(() => {}) }}
+      >
+        {video ? <Video /> : <Icon />}
+        <span className="chat-call-text">{m.text}</span>
+        <span className="chat-call-time">{clockTime(m.ts)}</span>
+      </button>
+    </div>
+  )
 }

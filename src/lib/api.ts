@@ -362,8 +362,10 @@ export interface ChatMessage {
   fromMe: boolean
   /** Live event only: you already read this on another of your devices (no badge/chime). */
   alreadyRead?: boolean
-  /** "text" or "file". */
-  kind: 'text' | 'file'
+  /** "text", "file" or "call" (a call history line, written by this device). */
+  kind: 'text' | 'file' | 'call'
+  /** Call history line details. */
+  call?: { video: boolean; outcome: string; durationMs: number } | null
   text: string
   /** For file messages: the names of the files shared. */
   files: string[]

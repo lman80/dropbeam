@@ -6,5 +6,8 @@
 	     macOS denies getUserMedia silently and never shows the permission prompt. -->
 	<key>com.apple.security.device.camera</key>
 	<true/>
+	<!-- Calls: the microphone under the hardened runtime (same reason as the camera). -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
 </dict>
 </plist>

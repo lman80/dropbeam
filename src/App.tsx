@@ -27,6 +27,7 @@ import { IconButton, Spinner } from './components/ui'
 import { Dialog } from './components/Dialog'
 import { SendView } from './views/SendView'
 import { SendToChooser } from './components/SendToChooser'
+import { CallHost } from './components/CallScreen'
 // Route-level code splitting: Send & Receive (the landing page) ships in the main
 // chunk; every other page loads on first visit (and is prefetched once idle, so a
 // click never waits on the network-free-but-still-async import).
@@ -301,6 +302,7 @@ export default function App() {
         {!nativeShell && <FolderInviteModal />}
         {!nativeShell && <SafetyDialogHost />}
         {!MOBILE_UI && <PopoverCodeHandoff />}
+        {!MOBILE_UI && <CallHost />}
       </ErrorBoundary>
       <ErrorBoundary region="toasts" fallbackStyle={{ position: 'fixed', bottom: 12, right: 12, zIndex: 101 }}>
         <Toasts />
