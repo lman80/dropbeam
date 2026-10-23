@@ -1091,6 +1091,14 @@ impl<T: ConnectionState> Connection<T> {
         self.inner.export_keying_material(output, label, context)
     }
 
+    /// DropBeam patch: changes the `max_ack_delay` this connection asks the peer to
+    /// use (QUIC ACK frequency extension) for this connection only; `None` restores
+    /// the endpoint's configured value.
+    #[inline]
+    pub fn set_requested_max_ack_delay(&self, value: Option<Duration>) {
+        self.inner.set_requested_max_ack_delay(value)
+    }
+
     /// Modifies the number of unidirectional streams that may be concurrently opened.
     ///
     /// No streams may be opened by the peer unless fewer than `count` are already

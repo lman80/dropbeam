@@ -902,6 +902,12 @@ impl Connection {
         conn.inner.set_max_concurrent_streams(Dir::Uni, count);
     }
 
+    /// DropBeam patch: see [`proto::Connection::set_requested_max_ack_delay()`]
+    pub fn set_requested_max_ack_delay(&self, value: Option<Duration>) {
+        let mut conn = self.0.lock_and_wake("set_requested_max_ack_delay");
+        conn.inner.set_requested_max_ack_delay(value);
+    }
+
     /// See [`proto::TransportConfig::send_window()`]
     pub fn set_send_window(&self, send_window: u64) {
         let mut conn = self.0.lock_and_wake("set_send_window");

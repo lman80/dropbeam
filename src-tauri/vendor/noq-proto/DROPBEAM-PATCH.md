@@ -26,6 +26,18 @@ Vendored from crates.io `noq-proto` 1.3.0. Search `DropBeam patch` in `src/`.
    `tests::multipath::many_paths_fragmented_acks_do_not_overflow_{packet,close_packet}` (both
    reproduce the exact `bytes` panic without the fix).
 
+3. **Per-connection requested ACK delay.** `Connection::set_requested_max_ack_delay(Option<Duration>)`
+   replaces `AckFrequencyConfig::max_ack_delay` for one connection at runtime
+   (`AckFrequencyState::max_ack_delay_override`, used by `candidate_max_ack_delay`); the existing
+   "desired vs requested differs > 20 %" check then sends a new ACK_FREQUENCY frame. With no
+   configured delay the fallback is now the peer's `max_ack_delay` transport parameter
+   (`peer_transport_max_ack_delay`), not `peer_max_ack_delay`, which tracks our last acknowledged
+   request and would keep an overridden delay after it was cleared. DropBeam asks
+   for a 5 ms ACK delay only on a connection carrying a live call (low-rate media starved by the
+   10-packet ACK threshold) and keeps the default 25 ms for bulk transfers (5 ms on every
+   connection cost Wi-Fi receivers ~5–9 % CPU, docs/CALLS.md). Wrapped by vendored `noq` and
+   `iroh` `Connection`. Test: `tests::ack_frequency_max_ack_delay_override_per_connection`.
+
 Running the crate's own tests (it is excluded from the app workspace): copy `Cargo.toml` to a
 scratch dir, append an empty `[workspace]`, symlink `src`, `benches`, `proptest-regressions`,
 then `cargo test --lib`.

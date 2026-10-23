@@ -412,3 +412,51 @@ fn taking_back_recording_consent_stops_the_recording() {
     assert!(dir.join("call.json").exists());
     let _ = std::fs::remove_dir_all(&dl);
 }
+
+/// The short call ACK delay is asked for only on the connection carrying the
+/// call, and taken back afterwards: each switch sends the peer a new
+/// ACK_FREQUENCY frame (the first one goes out at the handshake).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_connection_asks_for_prompt_acks_and_gives_it_back() {
+    let bind = || Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate()).alpns(vec![b"ack-test".to_vec()])
+        .relay_mode(RelayMode::Disabled).transport_config(crate::iroh_net::transport_config())
+        .bind_addr("127.0.0.1:0").unwrap().bind();
+    let (a, b) = (bind().await.unwrap(), bind().await.unwrap());
+    let b_addr = b.addr();
+    let server = tokio::spawn(async move {
+        let conn = b.accept().await.unwrap().await.unwrap();
+        while let Ok(mut r) = conn.accept_uni().await { let _ = r.read_to_end(1024).await; }
+        drop(b);
+    });
+    let conn = a.connect(b_addr, b"ack-test").await.unwrap();
+    let sent = |c: &iroh::endpoint::Connection| c.stats().frame_tx.ack_frequency;
+    let poke = |c: iroh::endpoint::Connection| async move {
+        let mut s = c.open_uni().await.unwrap();
+        s.write_all(b"x").await.unwrap();
+        s.finish().unwrap();
+    };
+    let wait_for = |c: iroh::endpoint::Connection, n: u64| async move {
+        for _ in 0..100 {
+            if sent(&c) >= n { return; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("ACK_FREQUENCY frames sent: {} (wanted {n})", sent(&c));
+    };
+    wait_for(conn.clone(), 1).await;
+    let base = sent(&conn);
+    poke(conn.clone()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(sent(&conn), base, "no call, no new request");
+
+    crate::iroh_net::set_call_ack_delay(&conn, true);
+    poke(conn.clone()).await;
+    wait_for(conn.clone(), base + 1).await;
+
+    crate::iroh_net::set_call_ack_delay(&conn, false);
+    poke(conn.clone()).await;
+    wait_for(conn.clone(), base + 2).await;
+
+    conn.close(0u32.into(), b"done");
+    a.close().await;
+    let _ = server.await;
+}

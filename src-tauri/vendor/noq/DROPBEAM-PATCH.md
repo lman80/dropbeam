@@ -1,6 +1,7 @@
 # noq 1.3.0 — DropBeam patch
 
-Vendored from crates.io `noq` 1.3.0. Only `src/mutex.rs` changed (search `DropBeam patch`).
+Vendored from crates.io `noq` 1.3.0. `src/mutex.rs` and `src/connection.rs` changed (search
+`DropBeam patch`).
 
 The connection `Mutex::lock` tolerates poison (`PoisonError::into_inner`) instead of
 `unwrap()`. Before, one panic while a connection was locked (see the noq-proto ACK overflow in
@@ -10,3 +11,7 @@ cleanup" aborted the whole app. With this patch the panicking task (a tokio task
 it) dies alone and the rest of the process keeps serving.
 
 Remove when upstream noq makes connection locking poison-tolerant.
+
+`Connection::set_requested_max_ack_delay` (src/connection.rs) forwards to the noq-proto method of
+the same name (patch 3 in `../noq-proto/DROPBEAM-PATCH.md`): the per-connection ACK delay a call
+asks for.

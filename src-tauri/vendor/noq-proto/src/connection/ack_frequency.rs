@@ -19,6 +19,14 @@ pub(super) struct AckFrequencyState {
     /// The sequence number of the most recently received ACK_FREQUENCY frame
     last_ack_frequency_frame: Option<u64>,
     pub(super) max_ack_delay: Duration,
+
+    /// DropBeam patch: per-connection replacement for `AckFrequencyConfig::max_ack_delay`,
+    /// set at runtime (`Connection::set_requested_max_ack_delay`).
+    pub(super) max_ack_delay_override: Option<Duration>,
+    /// DropBeam patch: the peer's `max_ack_delay` transport parameter. `peer_max_ack_delay`
+    /// follows our acknowledged requests, so it can't be the fallback once an override was
+    /// in use (clearing the override would keep the short delay forever).
+    pub(super) peer_transport_max_ack_delay: Duration,
 }
 
 impl AckFrequencyState {
@@ -30,6 +38,8 @@ impl AckFrequencyState {
 
             last_ack_frequency_frame: None,
             max_ack_delay: default_max_ack_delay,
+            max_ack_delay_override: None,
+            peer_transport_max_ack_delay: default_max_ack_delay,
         }
     }
 
@@ -42,11 +52,12 @@ impl AckFrequencyState {
         peer_params: &TransportParameters,
     ) -> Duration {
         // Use the peer's max_ack_delay if no custom max_ack_delay was provided in the config
+        // (DropBeam patch: its transport parameter, not the last value we requested)
         let min_ack_delay =
             Duration::from_micros(peer_params.min_ack_delay.map_or(0, |x| x.into()));
-        config
-            .max_ack_delay
-            .unwrap_or(self.peer_max_ack_delay)
+        self.max_ack_delay_override
+            .or(config.max_ack_delay)
+            .unwrap_or(self.peer_transport_max_ack_delay)
             .clamp(min_ack_delay, rtt.max(MIN_AUTOMATIC_ACK_DELAY))
     }
 

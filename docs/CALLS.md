@@ -305,11 +305,16 @@ gaps of 120–200 ms showed up at the receiving bridge (25 in 40 s) while plain 
 under 63 ms. DropBeam asks peers to acknowledge only every 10th packet (good for bulk
 transfers). A call sends 50–150 packets/s, so it was acknowledged about once per round
 trip, and the congestion window stalled the sender in bursts. The far side's jitter
-buffer grew to 170–240 ms. With ACK frequency off it was 54–83 ms. Fix
-(`iroh_net::ack_frequency`): the requested max ACK delay is capped at 5 ms
-(`DROPBEAM_ACK_DELAY_MS` overrides). A bulk transfer still reaches the 10-packet
-threshold first, so it keeps the reduced ACK rate. After the fix: no gaps > 120 ms, and
-jitter buffer 62–87 ms (one direction) and 63–133 ms (other, over the home uplink).
+buffer grew to 170–240 ms. With ACK frequency off it was 54–83 ms. Fix: the connection
+carrying a call asks the peer for a max ACK delay of 5 ms (`iroh_net::set_call_ack_delay`,
+switched on with the media in `calls::mark_conn` and back off when the leg closes;
+`DROPBEAM_CALL_ACK_DELAY_MS` overrides). After the fix: no gaps > 120 ms, and jitter buffer
+62–87 ms (one direction) and 63–133 ms (other, over the home uplink). The fix first shipped
+as a 5 ms cap on *every* connection; a transfer A/B (2026-10-23, `dropbeam-lab`, 5 ms vs the
+default 25 ms on both ends, alternating) found no throughput change on wired receivers
+(office LAN 898 vs 871 Mbit/s, home → office 18 vs 18) but ~5–9 % more receiver CPU on
+Wi-Fi Mac receivers (Korea 26.6 vs 24.5 CPU-s/GiB, 80 vs 84 Mbit/s median) — timer ACKs
+between Wi-Fi bursts. Hence call connections only; transfers keep the 25 ms default.
 
 **Queue bound**: when the congestion window is full, QUIC would queue up to 1 MB of
 datagrams. That is seconds of video, and audio would wait behind it. The bridge now

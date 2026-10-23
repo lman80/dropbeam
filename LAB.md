@@ -57,7 +57,8 @@ like the shipping app; the first-case throughput is the relay-path signal.
 confirmed payload byte), both from the case start, which is AFTER the expected files
 are hashed. Lab-only env overrides (never set by the app) let one binary A/B the
 transport: `DROPBEAM_CC` (bbr|cubic|newreno), `DROPBEAM_INITIAL_WINDOW`,
-`DROPBEAM_ACK_THRESH` (n|off), `DROPBEAM_STREAM_WINDOW`, `DROPBEAM_SEND_WINDOW`,
+`DROPBEAM_ACK_THRESH` (n|off), `DROPBEAM_ACK_DELAY_MS` (requested max ACK delay, default
+the peer's 25 ms), `DROPBEAM_CALL_ACK_DELAY_MS` (calls only, default 5), `DROPBEAM_STREAM_WINDOW`, `DROPBEAM_SEND_WINDOW`,
 `DROPBEAM_LAN_STREAMS` / `DROPBEAM_NET_STREAMS` (1–4), `DROPBEAM_PATH_IDLE_MS`.
 Windows builds: push to the `lab-build` branch (`.github/workflows/lab-build.yml`).
 Results of the 2026-10-23 lab: docs/NETWORK-LAB-2026-10-23.md.

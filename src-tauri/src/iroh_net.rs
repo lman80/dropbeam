@@ -2533,7 +2533,10 @@ pub(crate) fn ack_frequency() -> Option<noq_proto::AckFrequencyConfig> {
     };
     let mut c = noq_proto::AckFrequencyConfig::default();
     c.ack_eliciting_threshold(n.into());
-    c.max_ack_delay(Some(Duration::from_millis(ack_delay_ms())));
+    // Lab-only A/B override; unset = the peer's own max_ack_delay (25 ms).
+    if let Some(ms) = std::env::var("DROPBEAM_ACK_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        c.max_ack_delay(Some(Duration::from_millis(ms)));
+    }
     Some(c)
 }
 const ACK_THRESHOLD: u32 = 10;
@@ -2542,13 +2545,23 @@ const ACK_THRESHOLD: u32 = 10;
 /// call's 50–150 packets/s of media datagrams — was acknowledged roughly once
 /// per round trip, so the congestion window stalled its sender for up to 200 ms
 /// at a time and the far side's jitter buffer grew to match (170–240 ms across
-/// town; 54–83 ms with ACK frequency off). Capping the requested ACK delay keeps
-/// small flows acknowledged within a few ms; a bulk transfer still reaches the
-/// 10-packet threshold first, so it keeps the reduced ACK rate.
-fn ack_delay_ms() -> u64 {
-    std::env::var("DROPBEAM_ACK_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(ACK_DELAY_MS)
+/// town; 54–83 ms with ACK frequency off). A connection carrying a live call
+/// therefore asks for ACKs within 5 ms. Only that connection: on every
+/// connection the short delay cost bulk transfers to Wi-Fi receivers ~5–9 % more
+/// receiver CPU (timer ACKs between Wi-Fi bursts; lab 2026-10-23, Korea 84 →
+/// 80 Mbit/s median), while wired receivers saw no change.
+/// DROPBEAM_CALL_ACK_DELAY_MS overrides for A/B tests.
+pub(crate) fn call_ack_delay() -> Duration {
+    let ms = std::env::var("DROPBEAM_CALL_ACK_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(CALL_ACK_DELAY_MS);
+    Duration::from_millis(ms)
 }
-const ACK_DELAY_MS: u64 = 5;
+const CALL_ACK_DELAY_MS: u64 = 5;
+
+/// Switch `conn`'s requested ACK delay between the call value and the default
+/// (see `call_ack_delay`). A new ACK_FREQUENCY frame tells the peer at once.
+pub(crate) fn set_call_ack_delay(conn: &Connection, live_call: bool) {
+    conn.set_requested_max_ack_delay(live_call.then(call_ack_delay));
+}
 
 /// The congestion controller every endpoint uses: patched BBRv3 ("bbrfix", the
 /// default) unless DROPBEAM_CC picks another for an A/B test: bbr (stock noq

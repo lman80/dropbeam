@@ -61,11 +61,14 @@ static IN_CALL: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 pub(crate) fn uses_conn(stable_id: usize) -> bool {
     IN_CALL.lock().ok().and_then(|s| s.as_ref().map(|s| s.contains(&stable_id))).unwrap_or(false)
 }
-fn mark_conn(stable_id: usize, on: bool) {
+/// Mark `conn` as carrying (or no longer carrying) the call's media: kept out of
+/// housekeeping, and asking the peer for prompt ACKs (`iroh_net::set_call_ack_delay`).
+fn mark_conn(conn: &Connection, on: bool) {
     if let Ok(mut s) = IN_CALL.lock() {
         let set = s.get_or_insert_with(HashSet::new);
-        if on { set.insert(stable_id); } else { set.remove(&stable_id); }
+        if on { set.insert(conn.stable_id()); } else { set.remove(&conn.stable_id()); }
     }
+    crate::iroh_net::set_call_ack_delay(conn, on);
 }
 
 pub fn now_ms() -> u64 { crate::chat::now_ms() }
@@ -188,11 +191,11 @@ impl Calls {
                 match a {
                     Act::Send(ep, frame) => { if let Some(leg) = l.legs.get(&ep) { let _ = leg.tx.send(Some(frame)); } }
                     Act::Close(ep) => {
-                        if let Some(leg) = l.legs.remove(&ep) { let _ = leg.tx.send(None); mark_conn(leg.conn.stable_id(), false); }
+                        if let Some(leg) = l.legs.remove(&ep) { let _ = leg.tx.send(None); mark_conn(&leg.conn, false); }
                     }
                     Act::Media(ep) => {
                         if let (Some(leg), Some(b)) = (l.legs.get(&ep), l.bridge.as_ref()) {
-                            mark_conn(leg.conn.stable_id(), true);
+                            mark_conn(&leg.conn, true);
                             b.attach(leg.conn.clone());
                         }
                     }
@@ -202,7 +205,7 @@ impl Calls {
             let snap = Self::snapshot(l);
             if l.call.ended() {
                 let done = guard.take().unwrap();
-                for leg in done.legs.values() { let _ = leg.tx.send(None); mark_conn(leg.conn.stable_id(), false); }
+                for leg in done.legs.values() { let _ = leg.tx.send(None); mark_conn(&leg.conn, false); }
                 *self.last.lock().unwrap() = Some(snap.clone());
                 ended = Some(done);
             }

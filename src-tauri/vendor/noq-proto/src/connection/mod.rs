@@ -2883,6 +2883,15 @@ impl Connection {
         self.streams.max_concurrent(dir)
     }
 
+    /// DropBeam patch: change the `max_ack_delay` this connection requests of the peer through
+    /// the ACK frequency extension, replacing [`crate::AckFrequencyConfig::max_ack_delay`] for this
+    /// connection only (`None` = back to the configured value). A new ACK_FREQUENCY frame goes
+    /// out with the next packet when the value changes by more than 20 %. No effect if ACK
+    /// frequency isn't configured or the peer doesn't support it.
+    pub fn set_requested_max_ack_delay(&mut self, value: Option<Duration>) {
+        self.ack_frequency.max_ack_delay_override = value;
+    }
+
     /// See [`TransportConfig::send_window()`]
     pub fn set_send_window(&mut self, send_window: u64) {
         self.streams.set_send_window(send_window);
@@ -6740,6 +6749,8 @@ impl Connection {
             self.set_reset_token(PathId::ZERO, remote, info.stateless_reset_token);
         }
         self.ack_frequency.peer_max_ack_delay = get_max_ack_delay(&params);
+        // DropBeam patch: remember the transport parameter itself (see AckFrequencyState).
+        self.ack_frequency.peer_transport_max_ack_delay = self.ack_frequency.peer_max_ack_delay;
 
         let mut multipath_enabled = false;
         if let (Some(local_max_path_id), Some(remote_max_path_id)) = (

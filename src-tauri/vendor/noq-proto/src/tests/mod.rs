@@ -3386,11 +3386,17 @@ fn single_ack_eliciting_packet_with_ce_bit_triggers_immediate_ack() {
 }
 
 fn setup_ack_frequency_test(max_ack_delay: Duration) -> (Pair, ConnectionHandle, ConnectionHandle) {
+    setup_ack_frequency_test_with(Some(max_ack_delay))
+}
+
+fn setup_ack_frequency_test_with(
+    max_ack_delay: Option<Duration>,
+) -> (Pair, ConnectionHandle, ConnectionHandle) {
     let mut client_config = client_config_with_deterministic_pns();
     let mut ack_freq_config = AckFrequencyConfig::default();
     ack_freq_config
         .ack_eliciting_threshold(10u32.into())
-        .max_ack_delay(Some(max_ack_delay));
+        .max_ack_delay(max_ack_delay);
     Arc::get_mut(&mut client_config.transport)
         .unwrap()
         .ack_frequency_config(Some(ack_freq_config))
@@ -3508,6 +3514,56 @@ fn ack_frequency_ack_sent_after_max_ack_delay() {
         server_stats_after.frame_tx.acks - server_stats_before.frame_tx.acks,
         1
     );
+}
+
+/// Ping once from the client and report whether the server ACKed it within 6 ms.
+fn lone_ping_acked_within_6ms(
+    pair: &mut Pair,
+    client_ch: ConnectionHandle,
+    server_ch: ConnectionHandle,
+) -> bool {
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    pair.time += pair.routes.as_basic().latency;
+    pair.drive_server();
+    let before = pair.server_conn_mut(server_ch).stats().frame_tx.acks;
+    pair.time += Duration::from_millis(6);
+    pair.drive_server();
+    let acked = pair.server_conn_mut(server_ch).stats().frame_tx.acks > before;
+    pair.drive();
+    acked
+}
+
+/// DropBeam patch: `set_requested_max_ack_delay` changes the ACK delay the peer uses on this
+/// connection only — a new ACK_FREQUENCY frame goes out, the peer then ACKs a lone packet
+/// after the short delay, and `None` puts the previous delay back. Covers both a configured
+/// `max_ack_delay` and none (= the peer's transport parameter, 25 ms: the fallback must not
+/// stick at the last value we requested).
+#[test]
+fn ack_frequency_max_ack_delay_override_per_connection() {
+    let _guard = subscribe();
+    for configured in [Some(Duration::from_millis(25)), None] {
+        let (mut pair, client_ch, server_ch) = setup_ack_frequency_test_with(configured);
+        assert!(!lone_ping_acked_within_6ms(&mut pair, client_ch, server_ch));
+
+        pair.client_conn_mut(client_ch)
+            .set_requested_max_ack_delay(Some(Duration::from_millis(5)));
+        pair.client_conn_mut(client_ch).ping();
+        pair.drive();
+        assert_eq!(pair.client_conn_mut(client_ch).stats().frame_tx.ack_frequency, 2);
+        assert!(lone_ping_acked_within_6ms(&mut pair, client_ch, server_ch));
+        assert!(lone_ping_acked_within_6ms(&mut pair, client_ch, server_ch));
+
+        pair.client_conn_mut(client_ch).set_requested_max_ack_delay(None);
+        pair.client_conn_mut(client_ch).ping();
+        pair.drive();
+        assert_eq!(
+            pair.client_conn_mut(client_ch).stats().frame_tx.ack_frequency,
+            3,
+            "{configured:?}"
+        );
+        assert!(!lone_ping_acked_within_6ms(&mut pair, client_ch, server_ch));
+    }
 }
 
 #[test]
