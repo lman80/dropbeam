@@ -253,6 +253,11 @@ Bold arguments are required. 141 ops.
 | `friends.lookAlike` | read |  | Friends with confusingly similar names (to check before trusting a name). |
 | `friends.ping` | read | **who** | Check whether a friend's device answers right now. |
 | `friends.connection` | read | **who** | How this device reaches a friend right now (local network, direct or relay, speed estimates). |
+| `calls.status` | read |  | The call this device is in right now and the last one that ended. |
+| `calls.history` | read | limit, who | Call history, newest first: who, when, audio or video, in or out, how it ended, how long. |
+| `calls.recordings` | read |  | Call recordings on this device (made with both people's agreement). |
+| `calls.start` | write (dryRun) | video, **who** | Ring a friend from this computer's call screen; a person has to be here to talk. Agents never answer or record. |
+| `calls.hangup` | write |  | End the current call, or decline one that is ringing. |
 | `chat.list` | read |  | Every conversation with its last message, newest first. |
 | `chat.read` | read | limit, since, **who** | Messages in a conversation, oldest first. |
 | `chat.send` | write (dryRun) | replyTo, **text**, **to** | Send a text message. It shows as sent via your agent's name. Delivered right away when they're online, otherwise as soon as they are. |
@@ -383,6 +388,9 @@ Tauri commands no op covers (`ops.describe` also lists them as `humanOnly`):
 | `open_main_window`, `hide_popover`, `set_card_active`, `set_popover_rows`, `traydrag_debug`, `frontend_log`, `take_launch_file`, `take_open_urls`, `set_active_chat`, `set_unread_badge`, `set_keep_awake` | the window's own plumbing |
 | `network_changed`, `lan_self_info`, `lan_peer_found`, `push_unregister_all`, `network_shutdown`, `push_set_device` | iOS native shell plumbing |
 | `save_pasted_image`, `paste_clipboard_image`, `clipboard_file_paths`, `download_gif`, `send_chat_gif` | clipboard paste and the GIF picker; agents send text and files |
+| `call_accept`, `call_answer` | answering a call is the person's decision on their call screen |
+| `call_record_open`, `call_record_chunk`, `call_record_close` | recording needs both people's yes on their call screens; agents never start one |
+| `call_capable`, `call_start`, `call_offer`, `call_media_up`, `call_signal`, `call_stats`, `push_set_voip_token` | the call screen's WebRTC plumbing (`calls.start` asks the window to place a call) |
 | `restart_app`, `quit_app` | would end the agent's own connection |
 | `force_relay` | developer test that slows one connection on purpose |
 | `location_thumb`, `location_open`, `drive_open` | picture previews for the browser grid; open a file or the drive on screen (agents use `locations.readUrl` / `locations.cacheFile`) |

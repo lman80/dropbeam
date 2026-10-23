@@ -132,6 +132,11 @@ pub fn hello_fields(config: &Path, signer: &iroh::SecretKey, who: &str) -> Value
         v["push_sig"] = json!(sig);
         v["push_text"] = json!(push::previews_allowed(config));
     }
+    // Calls: this phone's VoIP token, sealed for the relay and usable only by `who`
+    // (calls/wake.rs) — so they can ring us while DropBeam is in the background.
+    if let Some(sealed) = crate::calls::wake::hello_field(config, signer, who) {
+        v["voip"] = json!(sealed);
+    }
     v
 }
 
@@ -145,6 +150,8 @@ pub fn on_hello(state: &IrohState, config: &Path, who: &str, hello: &Value) {
     if !own && crate::friends::chat_sender(config, who).is_none() {
         return;
     }
+    // How to wake this device for a call (or forget it, when the field is gone).
+    crate::calls::wake::learn(config, who, m);
     let before: Vec<String> = keys::peers(config).get(who).map(|p| p.shared.iter().map(|s| s.eid.clone()).collect()).unwrap_or_default();
     let learned = keys::learn(config, who, m);
     let now_shared: Vec<String> = keys::peers(config).get(who).map(|p| p.shared.iter().map(|s| s.eid.clone()).collect()).unwrap_or_default();

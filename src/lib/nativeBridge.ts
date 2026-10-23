@@ -431,6 +431,29 @@ const handlers: BridgeHandlers = {
     await bounded(invoke('network_shutdown'), 4_000)
     return true
   },
+  // Calls (docs/CALLS.md): the iPhone's native call engine (WebRTC + CallKit,
+  // NativeUIPlugin/Calls) drives the same engine commands as the desktop call screen.
+  callCapable: a => invoke('call_capable', { supported: a.supported === true }),
+  callStart: a => invoke('call_start', { friendId: string(a, 'friendId'), video: a.video === true }),
+  callOffer: a => invoke('call_offer', { callId: string(a, 'callId'), sdp: string(a, 'sdp') }),
+  callAccept: a => invoke('call_accept', { callId: string(a, 'callId') }),
+  callAnswer: a => invoke('call_answer', { callId: string(a, 'callId'), sdp: string(a, 'sdp') }),
+  callDecline: a => invoke('call_decline', { callId: string(a, 'callId') }),
+  callHangup: a => invoke('call_hangup', { callId: string(a, 'callId') }),
+  callMediaUp: a => invoke('call_media_up', { callId: string(a, 'callId') }),
+  callSignal: a => {
+    if (!a.frame || typeof a.frame !== 'object' || Array.isArray(a.frame)) throw new Error('Invalid call message')
+    return invoke('call_signal', { callId: string(a, 'callId'), frame: a.frame })
+  },
+  callStatus: () => invoke('call_status'),
+  callStats: a => invoke('call_stats', { callId: string(a, 'callId') }),
+  // Recording on the iPhone (calls/record.rs): opened only after the other side allowed it.
+  callRecordOpen: a => invoke('call_record_open', { callId: string(a, 'callId') }),
+  callRecordImport: a => invoke('call_record_import', { recId: string(a, 'recId'), track: string(a, 'track'), ext: string(a, 'ext'), path: string(a, 'path') }),
+  callRecordClose: a => invoke('call_record_close', { recId: string(a, 'recId') }),
+  // Both agreed to swap clean tracks: my voice goes to them as a normal verified file in the chat.
+  callShareTrack: a => st().shareFilesInChat(string(a, 'friendId'), [string(a, 'path')], 'My side of our call (clean voice track)'),
+  pushSetVoipToken: a => invoke('push_set_voip_token', { token: typeof a.token === 'string' ? a.token : '', env: a.env === 'sandbox' ? 'sandbox' : 'prod' }),
   folderInviteFriend: async a => {
     await api.inviteFriendToFolder(folderLink(a).id, string(a, 'friendId'))
     await st().reloadPairs()
@@ -704,6 +727,10 @@ async function start() {
   void st().refreshMyDevice().catch(() => {})
   const timer = window.setInterval(sync, 15_000) // Presence must expire without a store mutation.
   cleanup = () => { resnapshot = undefined; pushLocations = undefined; running = false; stops.forEach(stop => stop()); clearInterval(timer); clearTimeout(syncTimer) }
+  // Calls: the native call engine follows the engine's call events.
+  for (const name of ['call://state', 'call://incoming', 'call://signal', 'call://dial']) {
+    try { stops.push(await listen(name, ({ payload }) => send('event', { name, payload }))) } catch { /* optional event */ }
+  }
   for (const name of ['chat://message', 'friend://presence', 'folder-history://changed', 'folder-invite://incoming', 'locations://changed', 'received://files']) {
     try { stops.push(await listen(name, ({ payload }) => {
       send('event', { name, payload })

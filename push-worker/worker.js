@@ -10,6 +10,7 @@
  *   POST /push    {v, server, sealed_token, collapse, payload, ts, sig}
  *                 sig = Ed25519 by `server` (its DropBeam endpoint key) over
  *                 "dropbeam-push-v1\n" + [v, server, sealed_token, collapse, payload, ts].join("\n")
+ *   POST /call    wake an iPhone for a DropBeam call (VoIP push; see call() below)
  *   GET  /health  {configured}
  *
  * Secrets: APNS_KEY_P8 (the .p8 contents), APNS_KEY_ID, APNS_TEAM_ID,
@@ -62,6 +63,17 @@ export default {
           return json({ ok: false, reason: 'rate' }, 429)
         }
         return await push(request, env)
+      } catch (e) {
+        return json({ ok: false, reason: 'error' }, 500)
+      }
+    }
+    if (request.method === 'POST' && url.pathname === '/call') {
+      try {
+        const net = ipKey(request.headers.get('cf-connecting-ip'))
+        if (!(await allowMinute(env, 'RL_IP', `ip:${net}`))) {
+          return json({ ok: false, reason: 'rate' }, 429)
+        }
+        return await call(request, env)
       } catch (e) {
         return json({ ok: false, reason: 'error' }, 500)
       }
@@ -170,6 +182,88 @@ async function push(request, env) {
     return json({ ok: false, reason: r.reason || 'apns' }, 502)
   }
   return json({ ok: res.ok, status: res.status })
+}
+
+/**
+ * POST /call — wake an iPhone so a DropBeam call can ring (src-tauri/src/calls/wake.rs).
+ *   {v:1, caller, sealed_token, call, payload, ts, sig}
+ *   sig = Ed25519 by `caller` (the calling device's endpoint key) over
+ *   "dropbeam-call-v1\n" + [v, caller, sealed_token, call, payload, ts].join("\n")
+ * The phone sealed its PushKit VoIP token to this Worker's key with
+ * kind "voip" and allowed_server = that one calling device (it hands one to each
+ * friend/own device in its hello), so only those devices can ring it, and none
+ * of them can read the token. Only a wake-up goes through here: the call itself
+ * travels over the iroh connection between the two devices.
+ * Limits (anti-spam ringing): per caller and per phone per minute (bindings
+ * RL_SERVER/RL_TOKEN), an hourly per-phone budget, one push per (phone, call) a
+ * minute (the caller redials every 2 s while it rings), then RL_GLOBAL.
+ */
+const CALLS_PER_PHONE_HOUR = 30
+const CALLS_PER_CALLER_HOUR = 60
+
+async function call(request, env) {
+  const raw = await readCapped(request, MAX_BODY)
+  if (raw === null) return json({ ok: false, reason: 'too_big' }, 413)
+  let b
+  try { b = JSON.parse(raw) } catch { return json({ ok: false, reason: 'invalid' }, 400) }
+  if (!b || b.v !== 1 || typeof b.caller !== 'string' || typeof b.sealed_token !== 'string' || typeof b.ts !== 'number' || typeof b.sig !== 'string'
+    || typeof b.call !== 'string' || !/^[A-Za-z0-9-]{1,64}$/.test(b.call) || typeof b.payload !== 'string' || b.payload.length > 1500
+    || b.sealed_token.length > 2048 || b.sig.length > 128) {
+    return json({ ok: false, reason: 'invalid' }, 400)
+  }
+  // A ring is only worth anything for a minute.
+  if (Math.abs(Date.now() - b.ts) > 60 * 1000) return json({ ok: false, reason: 'stale' }, 400)
+  const callerKey = hexBytes(b.caller)
+  if (!callerKey) return json({ ok: false, reason: 'invalid' }, 400)
+  const key = await crypto.subtle.importKey('raw', callerKey, { name: 'Ed25519' }, false, ['verify'])
+  const msg = enc.encode('dropbeam-call-v1\n' + [b.v, b.caller, b.sealed_token, b.call, b.payload, b.ts].join('\n'))
+  let good = false
+  try { good = await crypto.subtle.verify({ name: 'Ed25519' }, key, b64(b.sig), msg) } catch { good = false }
+  if (!good) return json({ ok: false, reason: 'signature' }, 401)
+  if (!configured(env)) return json({ ok: false, reason: 'not_configured' }, 503)
+  let tok
+  try { tok = await openToken(env, b.sealed_token) } catch { return json({ ok: false, reason: 'token' }, 400) }
+  if (tok.kind !== 'voip' || tok.allowed_server !== b.caller) return json({ ok: false, reason: 'token' }, 403)
+  if (typeof tok.exp !== 'number' || tok.exp < Date.now()) return json({ ok: false, gone: true, reason: 'expired' }, 410)
+  if (!/^[0-9a-f]{64,200}$/i.test(tok.token || '')) return json({ ok: false, reason: 'token' }, 400)
+  // Only known fields reach Apple and the phone.
+  let p
+  try { p = JSON.parse(b.payload) } catch { return json({ ok: false, reason: 'invalid' }, 400) }
+  if (!p || p.c !== b.call) return json({ ok: false, reason: 'invalid' }, 400)
+  const out = { c: b.call, v: p.v === true }
+  if (typeof p.s === 'string' && p.s.length <= 1024) out.s = p.s
+  else if (typeof p.f === 'string' && /^[0-9a-f]{64}$/i.test(p.f)) out.f = p.f
+  const phone = await sha256hex(tok.token.toLowerCase())
+  // The same call rings once per minute at most, whatever the redials do.
+  if (!bump(`d:${phone}:${b.call}:${Math.floor(Date.now() / 60_000)}`, 1)) return json({ ok: true, duplicate: true })
+  if (!(await allowMinute(env, 'RL_SERVER', `c:${b.caller}`)) || !(await allowMinute(env, 'RL_TOKEN', `v:${phone}`))
+    || !allowHour(`c:${b.caller}`, CALLS_PER_CALLER_HOUR) || !allowHour(`v:${phone}`, CALLS_PER_PHONE_HOUR)) {
+    return json({ ok: false, reason: 'rate' }, 429)
+  }
+  if (!(await allowMinute(env, 'RL_GLOBAL', 'all'))) return json({ ok: false, reason: 'rate' }, 429)
+  const host = tok.env === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com'
+  const topic = `${env.APNS_TOPIC || tok.bundle || 'com.ashtonmiller.dropbeam'}.voip`
+  const res = await fetch(`https://${host}/3/device/${tok.token}`, {
+    method: 'POST',
+    headers: {
+      authorization: `bearer ${await jwt(env)}`,
+      'apns-topic': topic,
+      'apns-push-type': 'voip',
+      'apns-priority': '10',
+      // A ring that can't be delivered within half a minute is pointless.
+      'apns-expiration': String(Math.floor(Date.now() / 1000) + 30),
+      'apns-collapse-id': b.call,
+    },
+    body: JSON.stringify({ aps: {}, ...out }),
+  })
+  console.log(`apns-voip ${res.status} ${tok.env === 'sandbox' ? 'sandbox' : 'prod'}`)
+  if (res.status === 410 || res.status === 400) {
+    const r = await res.json().catch(() => ({}))
+    console.log(`apns-voip reason ${String(r.reason || '').slice(0, 40)}`)
+    if (res.status === 410 || r.reason === 'BadDeviceToken' || r.reason === 'Unregistered') return json({ ok: false, gone: true }, 410)
+    return json({ ok: false, reason: r.reason || 'apns' }, 502)
+  }
+  return json({ ok: res.ok, status: res.status }, res.ok ? 200 : 502)
 }
 
 /** eph_pub(32) || nonce(12) || AES-256-GCM(ct+tag); key = HKDF-SHA256(X25519(worker, eph), eph_pub || worker_pub, "dropbeam-push-token-v1"). */

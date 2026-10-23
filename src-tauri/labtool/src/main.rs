@@ -54,6 +54,12 @@ async fn main() -> Result<()> {
         Some("push-update") => push_update(&args).await,
         Some("lab-id") => lab_id(&args).await,
         Some("lab") => lab_cmd(&args).await,
+        // A headless call node with a browser call screen (labkit::call_node).
+        Some("call-node") => {
+            let dir = PathBuf::from(flag(&args, "--dir").context("--dir <state dir> required")?);
+            let port: u16 = flag(&args, "--port").unwrap_or_else(|| "8930".into()).parse()?;
+            labkit::call_node(&dir, port, &flag(&args, "--mode").unwrap_or_else(|| "auto".into())).await
+        }
         Some("version") => {
             println!("{}", labkit::LAB_BUILD);
             Ok(())

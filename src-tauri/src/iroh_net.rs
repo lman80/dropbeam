@@ -135,6 +135,8 @@ pub struct IrohState {
     /// where it went, and the completed card to re-emit the report on. Bounded
     /// (oldest evicted) by `verify::remember`.
     verify_records: Mutex<Vec<(String, Arc<VerifyEntry>)>>,
+    /// Audio/video calls (calls/mod.rs): the one live call and its bridge.
+    pub calls: Arc<crate::calls::Calls>,
 }
 
 /// A finished send, kept verifiable. The card is stored alongside the record so
@@ -274,7 +276,8 @@ impl IrohState {
             now.duration_since(cached.created_at), locality, has_direct_addrs,
             cached.relay_with_direct_since.map(|since| now.duration_since(since)),
         );
-        let busy = cached.busy_since_last_check();
+        // A call's media rides this connection: never rotate it mid-call.
+        let busy = cached.busy_since_last_check() || crate::calls::uses_conn(cached.conn.stable_id());
         if let Some(reason) = reason.filter(|_| !busy) {
             log::info!("iroh: rotating friend connection {endpoint}: {reason}");
             cached.conn.close(0u32.into(), b"friend connection rotation");
@@ -1551,7 +1554,7 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
                     via: via.map(String::from),
                     deliveries: vec![],
                     link_preview,
-                    text_rev: 0, reaction_revs: vec![], from_agent: req.get("fromAgent").and_then(|a| a["name"].as_str()).and_then(crate::agent_ctl::AgentTag::sanitized),
+                    text_rev: 0, reaction_revs: vec![], call: None, from_agent: req.get("fromAgent").and_then(|a| a["name"].as_str()).and_then(crate::agent_ctl::AgentTag::sanitized),
                 };
                 // D11: acknowledged only once it's on disk (Err → no ack, so the
                 // sender / Transfer Server keeps its copy and retries).
@@ -1669,7 +1672,7 @@ pub(crate) fn land_server_files(
             via: Some(server_name.to_owned()),
             deliveries: vec![],
             link_preview: None,
-            text_rev: 0, reaction_revs: vec![], from_agent: None,
+            text_rev: 0, reaction_revs: vec![], call: None, from_agent: None,
         };
         if crate::chat::append(config, &msg) {
             changed = Some(msg);
@@ -2530,9 +2533,22 @@ pub(crate) fn ack_frequency() -> Option<noq_proto::AckFrequencyConfig> {
     };
     let mut c = noq_proto::AckFrequencyConfig::default();
     c.ack_eliciting_threshold(n.into());
+    c.max_ack_delay(Some(Duration::from_millis(ack_delay_ms())));
     Some(c)
 }
 const ACK_THRESHOLD: u32 = 10;
+
+/// Calls (docs/CALLS.md): with only the packet threshold, a low-rate flow — a
+/// call's 50–150 packets/s of media datagrams — was acknowledged roughly once
+/// per round trip, so the congestion window stalled its sender for up to 200 ms
+/// at a time and the far side's jitter buffer grew to match (170–240 ms across
+/// town; 54–83 ms with ACK frequency off). Capping the requested ACK delay keeps
+/// small flows acknowledged within a few ms; a bulk transfer still reaches the
+/// 10-packet threshold first, so it keeps the reduced ACK rate.
+fn ack_delay_ms() -> u64 {
+    std::env::var("DROPBEAM_ACK_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(ACK_DELAY_MS)
+}
+const ACK_DELAY_MS: u64 = 5;
 
 /// The congestion controller every endpoint uses: patched BBRv3 ("bbrfix", the
 /// default) unless DROPBEAM_CC picks another for an A/B test: bbr (stock noq
@@ -3000,6 +3016,7 @@ fn is_blockable_kind(kind: &str) -> bool {
         | "folder-hello" | "folder-files" | "folder-ctrl" | "folder-reconcile")
         || kind.starts_with("locations.")
         || kind.starts_with("mailbox.")
+        || kind == "call.offer"
 }
 
 /// Answer a blocked peer exactly as a stranger is answered, so nothing tells
@@ -3027,6 +3044,8 @@ async fn serve_blocked(kind: &str, req: &serde_json::Value, send: &mut SendStrea
         // sender clean up its copy): the stream just fails, as for a folder
         // this device doesn't have.
         "folder-files" | "folder-ctrl" | "folder-reconcile" | "folder-hello" => anyhow::bail!("folder access denied"),
+        // Exactly what a stranger's call gets.
+        "call.offer" => write_frame(send, &serde_json::json!({ "kind": "call.unavailable" })).await?,
         _ => write_frame(send, &serde_json::json!({ "kind": "ok" })).await?,
     }
     let _ = send.finish();
@@ -3067,6 +3086,8 @@ async fn serve_stream_inner(
             write_frame(send, &serde_json::json!({ "kind": "pong", "locations_v": crate::locations::VERSION, "locations_max": crate::locations::STREAM_VERSION })).await?;
             send.finish()?;
         }
+        // A call (calls/mod.rs): this stream stays open as the call's line.
+        Some("call.offer") => crate::calls::serve_offer(conn, send, recv, state, &req).await?,
         // Transfer Server (store-and-forward): hosting + the server's delivery poke.
         Some(kind) if kind.starts_with("mailbox.") => {
             crate::mailbox::serve(state, conn, send, recv, kind, &req).await?;

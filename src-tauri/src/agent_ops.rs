@@ -20,7 +20,7 @@ use std::sync::{Arc, LazyLock};
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::models::Friend;
 use crate::{commands, friends, AppState};
@@ -372,6 +372,20 @@ fn catalog() -> Vec<OpSpec> {
         op("diagnostics.send", Write, "Send a diagnostics test report now.").cmds(&["diagnostics_test"]).build(),
         op("diagnostics.installHint", Read, "On macOS: advice if DropBeam runs from a place updates can't replace.").cmds(&["macos_install_hint"]).build(),
 
+        // ── calls (docs/CALLS.md) ──
+        op("calls.status", Read, "The call this device is in right now (ringing, connecting or active: who, audio or video, since when, recording state) and the last one that ended.")
+            .out("{call, last, capable}").cmds(&["call_status"]).build(),
+        op("calls.history", Read, "Call history, newest first: who, when, audio or video, in or out, how it ended and how long it lasted.")
+            .opt("who", S, WHO).opt("limit", I, "At most this many. Default 50.")
+            .out("[{friendId, name, at, outgoing, video, outcome, durationMs, text}]").cmds(&["call_history"]).build(),
+        op("calls.recordings", Read, "Call recordings saved on this device (made with both people's agreement), newest first, with which file holds whose voice.")
+            .out("[{dir, meta: {with, startedAt, endedAt, tracks}}]").cmds(&["call_recordings"]).build(),
+        op("calls.start", Write, "Ring a friend (all their devices) from this computer's call screen. It rings in their DropBeam like any call and they decide whether to answer; a person has to be at this computer to talk. Recording is never started by an agent.")
+            .req("who", S, WHO).opt("video", B, "Video call (default: audio only).").dry()
+            .out("{ringing: true}").promise("Opens the call screen here and rings them; nothing is recorded. Recorded in the agent activity log.").build(),
+        op("calls.hangup", Write, "End the current call, or stop it ringing (an incoming call is declined).")
+            .out("{ended: true}").cmds(&["call_hangup", "call_decline"]).build(),
+
         // ── live events ──
         op("events.subscribe", Read, "Stream events as they happen: transfer progress, new messages, friends coming online, typing, friend requests, linking. One JSON line per event until you disconnect (or timeoutSecs).")
             .opt("types", Strs, "Any of: transfer, chat, presence, typing, requests, friends, link. Default: all.").opt("timeoutSecs", I, "Stop after this long (default: never on the socket; 60 over MCP).").streams()
@@ -384,6 +398,18 @@ fn catalog() -> Vec<OpSpec> {
 /// Window plumbing (pickers, focus, badges) and the agent switches themselves
 /// (an agent must not be able to widen its own access) stay human-only.
 pub const EXCLUDED: &[(&str, &str)] = &[
+    ("call_capable", "the call screen reports whether its web view can do WebRTC"),
+    ("call_start", "call screen WebRTC plumbing (calls.start asks the window to place the call)"),
+    ("call_offer", "call screen WebRTC plumbing"),
+    ("call_accept", "answering is the person's decision on their call screen"),
+    ("call_answer", "answering is the person's decision on their call screen"),
+    ("call_media_up", "call screen WebRTC plumbing"),
+    ("call_signal", "mid-call messages between the two call screens (mute, camera, recording consent)"),
+    ("call_stats", "call screen quality indicator"),
+    ("call_record_open", "recording needs both people's yes on their call screens; agents never start one"),
+    ("call_record_chunk", "recording plumbing"),
+    ("call_record_close", "recording plumbing"),
+    ("call_record_import", "recording plumbing"),
     ("pick_files", "native file picker on screen; agents pass paths"),
     ("pick_directory", "native folder picker on screen; agents pass paths"),
     ("pick_photos", "iOS photo picker on screen"),
@@ -394,6 +420,7 @@ pub const EXCLUDED: &[(&str, &str)] = &[
     ("push_unregister_all", "iOS native shell plumbing"),
     ("network_shutdown", "iOS native shell plumbing"),
     ("push_set_device", "iOS native shell hands over its notification token"),
+    ("push_set_voip_token", "iOS native shell plumbing (PushKit VoIP token for ringing calls)"),
     ("reveal_path", "shows a file in Finder/Explorer on screen"),
     ("open_path", "opens a file on screen"),
     ("open_url", "opens a browser on screen"),
@@ -675,6 +702,34 @@ pub async fn run(app: &AppHandle, name: &str, i: &Value, ctx: &Ctx) -> R {
             ok(commands::send_chat_message(app.state(), app.state(), app.clone(), thread_id(&dir, &f), text, os(i, "replyTo"), None).await.map_err(failed)?)
         }
         "chat.wait" => crate::agent_ctl::chat_wait(app, i).await,
+        "calls.status" => ok(crate::calls::commands::call_status(app.state())),
+        "calls.history" => {
+            let who = match os(i, "who") { Some(w) => Some(thread_id(&dir, &resolve(&dir, &w)?)), None => None };
+            let limit = i["limit"].as_u64().unwrap_or(50).clamp(1, 1000) as usize;
+            ok(crate::calls::commands::call_history(app.state(), who, Some(limit)))
+        }
+        "calls.recordings" => ok(crate::calls::commands::call_recordings(app.clone(), app.state()).map_err(failed)?),
+        "calls.start" => {
+            let f = resolve(&dir, &s(i, "who")?)?;
+            let video = i["video"].as_bool().unwrap_or(false);
+            if dry { return plan(json!({"call": f.name, "video": video})); }
+            let iroh = app.state::<Arc<crate::iroh_net::IrohState>>();
+            if !crate::calls::calls_of(&iroh).capable() { return Err(failed(crate::calls::UNSUPPORTED)); }
+            if crate::calls::calls_of(&iroh).status()["call"].is_object() { return Err(failed("Already in a call.")); }
+            // The window places it: WebRTC (camera, microphone) lives on the call screen.
+            #[cfg(desktop)]
+            crate::show_main_window(app);
+            app.emit_to("main", "call://dial", json!({"friendId": thread_id(&dir, &f), "video": video})).map_err(failed)?;
+            Ok(json!({"ringing": true, "who": f.name, "video": video}))
+        }
+        "calls.hangup" => {
+            let iroh = app.state::<Arc<crate::iroh_net::IrohState>>();
+            let st = crate::calls::calls_of(&iroh).status();
+            let Some(id) = st["call"]["id"].as_str().map(str::to_owned) else { return Err(not_found("No call right now.")) };
+            if st["call"]["dir"] == "in" && st["call"]["phase"] == "ringing" { crate::calls::commands::call_decline(iroh, id); }
+            else { crate::calls::commands::call_hangup(iroh, id); }
+            Ok(json!({"ended": true}))
+        }
         "chat.react" => {
             let f = resolve(&dir, &s(i, "who")?)?;
             commands::react_to_message(app.state(), app.clone(), thread_id(&dir, &f), s(i, "messageId")?, s(i, "emoji")?, ob(i, "add").unwrap_or(true)).await.map_err(failed)?; done()

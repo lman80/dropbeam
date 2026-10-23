@@ -17,7 +17,12 @@ class NativeUIPlugin: Plugin {
     private static var feedbackStarted = false
     private var host: UIHostingController<AnyView>?
 
-    override func load(webview: WKWebView) { self.webview = webview }
+    override func load(webview: WKWebView) {
+        self.webview = webview
+        // Calls: PushKit right away, so a VoIP push that launched us is delivered
+        // (and reported to CallKit) without waiting for the web view.
+        DispatchQueue.main.async { MainActor.assumeIsolated { CallCenter.shared.registerPushKit() } }
+    }
 
     @objc func activate(_ invoke: Invoke) {
         DispatchQueue.main.async {
@@ -27,6 +32,7 @@ class NativeUIPlugin: Plugin {
             }
             Bridge.shared.webview = webview
             PushRegistration.start()
+            CallCenter.shared.start()
             if self.host == nil {
                 let host = UIHostingController(rootView: AnyView(RootView().environmentObject(Bridge.shared)))
                 host.view.backgroundColor = .clear

@@ -22,6 +22,7 @@ mod background_host;
 mod elevate;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod headless;
+mod calls;
 mod chat;
 #[cfg(desktop)]
 mod chat_notify;
@@ -1013,6 +1014,23 @@ pub fn run() {
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
+            calls::commands::call_capable,
+            calls::commands::call_start,
+            calls::commands::call_offer,
+            calls::commands::call_accept,
+            calls::commands::call_answer,
+            calls::commands::call_decline,
+            calls::commands::call_hangup,
+            calls::commands::call_media_up,
+            calls::commands::call_signal,
+            calls::commands::call_status,
+            calls::commands::call_stats,
+            calls::commands::call_record_open,
+            calls::commands::call_record_chunk,
+            calls::commands::call_record_close,
+            calls::commands::call_record_import,
+            calls::commands::call_recordings,
+            calls::commands::call_history,
             commands::cancel_transfer,
             commands::pause_transfer,
             commands::get_settings,
@@ -1149,6 +1167,7 @@ pub fn run() {
             mailbox::cmds::mailbox_pending_files,
             mailbox::cmds::mailbox_decide_file,
             mailbox::cmds::push_set_device,
+            calls::wake::push_set_voip_token,
             mailbox::cmds::push_set_previews,
             mailbox::cmds::push_status,
             location_sync::list_synced_folders,
@@ -1331,7 +1350,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 }
 
 #[cfg(desktop)]
-fn show_main_window(app: &AppHandle) {
+pub(crate) fn show_main_window(app: &AppHandle) {
     // Become a normal app (Dock icon + proper focus) while the window is open.
     set_dock_icon_visible(app, true);
     if let Some(window) = app.get_webview_window("main") {

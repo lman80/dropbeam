@@ -158,8 +158,16 @@ struct ChatMessage: Decodable, Identifiable, Equatable {
     var linkPreview: ChatLinkPreview?
     /// Written by an AI agent through DropBeam's command line / MCP (shown as "via <name>").
     var fromAgent: ChatAgent?
+    /// A call history line (kind "call"), written by this device.
+    var call: ChatCallInfo?
     var date: Date { Date(timeIntervalSince1970: ts / 1000) }
     var preview: String { deleted == true ? "Message deleted" : text?.isEmpty == false ? (text ?? "") : files?.joined(separator: ", ") ?? "Attachment" }
+}
+struct ChatCallInfo: Decodable, Equatable {
+    var video: Bool?
+    /// hangup | remote_hangup | declined | busy | no_answer | missed | canceled | unavailable | failed
+    var outcome: String?
+    var durationMs: Double?
 }
 struct ChatReaction: Decodable, Equatable {
     var emoji: String?
