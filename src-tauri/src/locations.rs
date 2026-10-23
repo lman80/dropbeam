@@ -260,8 +260,12 @@ pub fn shared(config: &Path, endpoint: &str) -> Result<Value> {
             // 4 TB" BEFORE they start a 300 GB upload. The path itself is never
             // disclosed. An older host simply omits all three fields.
             let (reachable, free, total) = room(l);
+            // Additive too: an uploader renames what Windows can't store
+            // (`a:b`, `CON.txt`, `trail.`) before sending, instead of this
+            // host refusing the whole upload over one name.
             json!({"id": l.id, "name": l.name, "rights": l.rights,
-                "reachable": reachable, "free_bytes": free, "total_bytes": total})
+                "reachable": reachable, "free_bytes": free, "total_bytes": total,
+                "names": if cfg!(windows) { "windows" } else { "posix" }})
         }).collect::<Vec<_>>()))
 }
 /// Whether this location's volume is mounted right now, and its free/total

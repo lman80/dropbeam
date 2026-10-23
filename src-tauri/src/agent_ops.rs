@@ -267,7 +267,7 @@ fn catalog() -> Vec<OpSpec> {
             .out("{entries:[{name,isDir,size,modified}], hasMore, nextCursor, total}").build(),
         op("locations.download", Write, "Download files or folders from a friend's Location into your download folder.")
             .req("who", S, WHO).req("location", S, "Location name or id.").req("paths", Strs, "Paths inside the Location.").out("{transferId, receiveId} — follow receiveId (the incoming transfer here) with transfers.wait").build(),
-        op("locations.upload", Write, "Upload files into a friend's Location (if they gave you upload rights). Never overwrites: a same-named file lands beside it.")
+        op("locations.upload", Write, "Upload files into a friend's Location (if they gave you upload rights). Never overwrites: a same-named file lands beside it. An exact copy: every file goes, hidden and OS files too (only .dropbeam-* stays); anything unreadable refuses the upload before it starts; symlinks and names a Windows host can't store are listed in the result's uploadNotes.")
             .req("who", S, WHO).req("location", S, "Location name or id.").req("paths", Strs, PATHS).opt("path", S, "Folder inside it ('' = top).").dry()
             .out("the transfer").cmds(&["upload_to_location"]).build(),
         op("locations.mkdir", Write, "Make a folder inside a friend's Location (needs manage rights).")

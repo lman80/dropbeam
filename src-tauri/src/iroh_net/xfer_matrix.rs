@@ -387,7 +387,7 @@ async fn location(paths: &[PathBuf], dest: &Path) -> Result<u64> {
     let (items, dirs, _) = manifest(Via::Location, paths);
     let mut batch = LocationBatch { items, dirs, next_file: 0, dirs_pending: true };
     let options = LocationSend { target: Some(crate::locations::Target { location_id: "nas".into(), rel_path: "".into() }),
-        transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing: false };
+        transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing: false, windows_names: false };
     let sent = batch.send_attempt(&conn, &options, &AtomicBool::new(false), "Matrix", &AtomicBool::new(false),
         &AtomicU64::new(0), None, |_, _| {}, |_| {}, |_| {}, |_| {}, || Ok(())).await;
     conn.close(0u32.into(), b"done");
@@ -1261,7 +1261,7 @@ async fn matrix_location_download_lands_every_selected_file() {
             &serde_json::json!({"locations_v": crate::locations::VERSION, "id": "nas", "paths": selection})).unwrap();
         assert!(snapshot.skipped.is_empty(), "{:?}", snapshot.skipped);
         let items = snapshot.source.items.clone();
-        let options = LocationSend { target: None, transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: Some(snapshot), replace_existing: false };
+        let options = LocationSend { target: None, transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: Some(snapshot), replace_existing: false, windows_names: false };
         tokio::time::timeout(QUICK, send_files_linked(&conn, &[], &AtomicBool::new(false), |_, _| {}, "Host",
             &AtomicBool::new(false), &AtomicU64::new(0), None, None, Some(&options))).await.expect("download hung").unwrap();
         for (src, rel, size, mtime) in &items {

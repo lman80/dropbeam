@@ -158,15 +158,22 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   const verify = t.verify
   const verifyOk = verify?.state === 'done' && verify.mismatched.length + verify.missing.length === 0
   const verifyBad = verify?.state === 'done' && !verifyOk
+  const notes = t.uploadNotes
+  const listed = (shown: string[], total: number) =>
+    shown.join(', ') + (total > shown.length ? ` and ${total - shown.length} more (all in the log)` : '')
   const locationNotes = [
     t.locationSkipped ? `${t.locationSkipped} already there` : '',
     t.locationConflicts ? `${t.locationConflicts} kept as copies` : '',
     t.locationReplaced ? `${t.locationReplaced} updated` : '',
+    notes?.notCopied ? `${notes.notCopied} not copied` : '',
+    notes?.renamed ? `${notes.renamed} renamed` : '',
   ].filter(Boolean)
   const locationTip = [
     t.locationSkipped ? `${t.locationSkipped} ${t.locationSkipped === 1 ? 'file was' : 'files were'} already there.` : '',
     t.locationConflicts ? `${t.locationConflicts} ${t.locationConflicts === 1 ? 'file' : 'files'} already existed with different content — saved next to them as “… (2)”.` : '',
     t.locationReplaced ? `${t.locationReplaced} ${t.locationReplaced === 1 ? 'file was' : 'files were'} updated — the older version is in the folder’s Trash.` : '',
+    notes?.notCopied ? `Not copied (symlinks and other non-files): ${listed(notes.notCopiedExamples, notes.notCopied)}.` : '',
+    notes?.renamed ? `Renamed because Windows can’t store the name: ${listed(notes.renamedExamples.map(([from, to]) => `${from} → ${to}`), notes.renamed)}.` : '',
   ].filter(Boolean).join(' ')
 
   // ── the one-line status under the title ──────────────────────────────────

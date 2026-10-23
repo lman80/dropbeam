@@ -519,6 +519,18 @@ async fn finish_transfer(c: &mut Client, a: &Args, t: Value, verb: &str) -> Resu
             "held" => println!("They're offline: a Transfer Server holds it until they're back."),
             _ => println!("Didn't finish ({}): {}", if state.is_empty() { "timed out" } else { state }, done["error"].as_str().unwrap_or("")),
         }
+        let notes = &done["uploadNotes"];
+        let more = |shown: usize, total: u64| if total > shown as u64 { format!("  … and {} more (all in the DropBeam log)", total - shown as u64) } else { String::new() };
+        if let Some(list) = notes["notCopiedExamples"].as_array().filter(|l| !l.is_empty()) {
+            println!("Not copied ({}): symlinks and other non-files", notes["notCopied"]);
+            for p in list { println!("  {}", p.as_str().unwrap_or("")); }
+            let m = more(list.len(), notes["notCopied"].as_u64().unwrap_or(0)); if !m.is_empty() { println!("{m}"); }
+        }
+        if let Some(list) = notes["renamedExamples"].as_array().filter(|l| !l.is_empty()) {
+            println!("Renamed ({}): Windows can't store these names", notes["renamed"]);
+            for p in list { println!("  {} → {}", p[0].as_str().unwrap_or(""), p[1].as_str().unwrap_or("")); }
+            let m = more(list.len(), notes["renamed"].as_u64().unwrap_or(0)); if !m.is_empty() { println!("{m}"); }
+        }
     }
     Ok(if ok { 0 } else { 1 })
 }

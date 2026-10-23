@@ -3145,7 +3145,7 @@ async fn serve_stream_inner(
                     let skipped = snapshot.skipped.clone();
                     if paths.is_empty() { return Ok(serde_json::json!({"transferId": null, "skipped": skipped})); }
                     let update = send_location_to_friend(app, shared, friend.name, who, paths,
-                        LocationSend { target: None, transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: Some(snapshot), replace_existing: false })
+                        LocationSend { target: None, transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: Some(snapshot), replace_existing: false, windows_names: false })
                         .map_err(anyhow::Error::msg)?;
                     return Ok(serde_json::json!({"transferId": update.id, "skipped": skipped}));
                 }
@@ -5657,6 +5657,10 @@ pub struct LocationSend {
     /// trash instead of landing beside it as "name (2)". Only a continuously
     /// synced folder sets this; an ordinary upload leaves it false.
     pub replace_existing: bool,
+    /// The host stores names under Windows' rules (it says so in
+    /// `locations.list`): rename what it can't hold before sending, instead of
+    /// the host refusing the whole upload over one name.
+    pub windows_names: bool,
 }
 pub fn send_location_to_friend(app: AppHandle, state: Arc<IrohState>, friend_name: String,
     endpoint_id: String, paths: Vec<String>, location: LocationSend) -> Result<TransferUpdate, String> {
@@ -5677,9 +5681,20 @@ fn send_friend_inner(
         .parse()
         .map_err(|_| "This friend's direct address is invalid.".to_string())?;
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let (items, directories, total) = if let Some(snapshot) = location.as_ref().and_then(|l| l.snapshot.as_ref()) {
+    let upload = location.as_ref().filter(|l| l.target.is_some());
+    // A manual upload is an exact copy (every file, or a clear refusal); a
+    // synced folder keeps leaving out OS bookkeeping the OS rewrites on view.
+    let mut not_copied = Vec::new();
+    let (mut items, mut directories, total) = if let Some(snapshot) = location.as_ref().and_then(|l| l.snapshot.as_ref()) {
         (snapshot.source.items.clone(), snapshot.source.dirs.clone(), snapshot.source.items.iter().map(|i| i.2).sum())
-    } else { gather_items_with(&pathbufs, location.as_ref().is_some_and(|l| l.target.is_some())).map_err(|e| e.to_string())? };
+    } else if upload.is_some_and(|l| !l.replace_existing) {
+        let (items, dirs, total, skipped) = gather_exact(&pathbufs).map_err(|e| e.to_string())?;
+        not_copied = skipped;
+        (items, dirs, total)
+    } else { gather_items_with(&pathbufs, upload.is_some()).map_err(|e| e.to_string())? };
+    let renamed = if upload.is_some_and(|l| l.windows_names) { map_names_for_windows(&mut items, &mut directories) } else { vec![] };
+    for (from, to) in &renamed { log::info!("upload: {from:?} lands as {to:?} (Windows can't store the original name)"); }
+    let notes = (!not_copied.is_empty() || !renamed.is_empty()).then(|| crate::models::UploadNotes::new(&not_copied, &renamed));
     let names = if items.is_empty() { directories.clone() } else { items.iter().map(|i| i.1.clone()).collect() };
     // One device's leg of a send to all of a person's devices reports to that
     // send's card (fanout), under the id it was given.
@@ -5729,6 +5744,7 @@ fn send_friend_inner(
     let cleanup = state.clone();
     let mut update = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
     update.friend_name = Some(friend_name.clone());
+    update.upload_notes = notes;
     update.state = TransferState::Connecting;
     update.bytes_total = total;
     emit(&app, &update);
@@ -8530,6 +8546,71 @@ fn fit_name(name: &str, suffix: &str) -> String {
     format!("{stem}{suffix}{ext}")
 }
 
+/// Rename a Location upload's manifest for a Windows host, which refuses (and
+/// used to fail the WHOLE upload over) a single `Report 7:3.pdf`, `CON.txt` or
+/// `trail.`. Each component becomes `windows_safe_component`, clamped to the
+/// name limit, and is made unique case-insensitively within its folder (NTFS
+/// can't hold `A.txt` beside `a.txt`) with " (2)", " (3)"… A folder maps the
+/// same way for every file under it. Returns every (original, landed) rel that
+/// changed, so the card can list them; names Windows takes are untouched.
+pub(crate) fn map_names_for_windows(items: &mut [(PathBuf, String, u64, u64)], dirs: &mut [String]) -> Vec<(String, String)> {
+    use std::collections::{HashMap, HashSet};
+    // (mapped parent, original component) → mapped component; mapped parent → taken (lowercased).
+    let mut chosen: HashMap<(String, String), String> = HashMap::new();
+    let mut taken: HashMap<String, HashSet<String>> = HashMap::new();
+    // Names Windows already takes keep them: claim every unchanged leading
+    // component first, so a renamed `Report 7:3.pdf` can never push the real
+    // `Report 7-3.pdf` aside. Only a case twin of a claimed name yields.
+    for rel in items.iter().map(|i| i.1.as_str()).chain(dirs.iter().map(String::as_str)) {
+        let mut parent = String::new();
+        for comp in rel.split('/').filter(|c| !c.is_empty()) {
+            if fit_name(&windows_safe_component(comp), "") != comp { break; }
+            let key = (parent.clone(), comp.to_owned());
+            if !chosen.contains_key(&key) {
+                if !taken.entry(parent.clone()).or_default().insert(comp.to_lowercase()) { break; }
+                chosen.insert(key, comp.to_owned());
+            }
+            parent = if parent.is_empty() { comp.to_owned() } else { format!("{parent}/{comp}") };
+        }
+    }
+    let mut map = |rel: &str| -> String {
+        let mut parent = String::new();
+        for comp in rel.split('/').filter(|c| !c.is_empty()) {
+            let key = (parent.clone(), comp.to_owned());
+            let mapped = match chosen.get(&key) {
+                Some(m) => m.clone(),
+                None => {
+                    let base = fit_name(&windows_safe_component(comp), "");
+                    let used = taken.entry(parent.clone()).or_default();
+                    let mut candidate = base.clone();
+                    let mut n = 2;
+                    while used.contains(&candidate.to_lowercase()) {
+                        candidate = windows_safe_component(&fit_name(&base, &format!(" ({n})")));
+                        n += 1;
+                    }
+                    used.insert(candidate.to_lowercase());
+                    chosen.insert(key, candidate.clone());
+                    candidate
+                }
+            };
+            parent = if parent.is_empty() { mapped } else { format!("{parent}/{mapped}") };
+        }
+        parent
+    };
+    let mut renamed = Vec::new();
+    // Then the rest, files first in manifest order, so the same tree always maps
+    // the same way on a retry; empty folders take their (maybe already chosen) names.
+    for item in items.iter_mut() {
+        let landed = map(&item.1);
+        if landed != item.1 { renamed.push((std::mem::replace(&mut item.1, landed.clone()), landed)); }
+    }
+    for dir in dirs.iter_mut() {
+        let landed = map(dir);
+        if landed != *dir { renamed.push((std::mem::replace(dir, landed.clone()), landed)); }
+    }
+    renamed
+}
+
 /// True if a shared-folder rel names one of DropBeam's OWN control/bookkeeping
 /// paths, which must NEVER travel over the wire in either direction. This covers
 /// the hidden `.dropbeam-history` recovery archive + its previously-LEAKED
@@ -10142,10 +10223,43 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, 
     gather_items_with(paths, false)
 }
 
-/// `include_hidden` copies dot-files and dot-directories too (Location uploads:
+/// `include_hidden` copies dot-files and dot-directories too (a synced folder:
 /// the NAS copy must be a complete backup). DropBeam's own `.dropbeam-*` names
 /// are always left out, and symlinks are still never followed.
 fn gather_items_with(paths: &[PathBuf], include_hidden: bool) -> Result<(Vec<(PathBuf, String, u64, u64)>, Vec<String>, u64)> {
+    let walk = if include_hidden { Walk::Hidden } else { Walk::Visible };
+    gather_walk(paths, walk, &mut WalkReport::default())
+}
+
+/// Which entries a folder walk takes. `Exact` is a manual Location upload: the
+/// copy must be byte-for-byte the folder, so OS bookkeeping (`.DS_Store`,
+/// `._*`, `Thumbs.db`…) goes too and an entry that can't be read stops the
+/// upload instead of quietly going missing. Only `.dropbeam-*` is ever left out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Walk { Visible, Hidden, Exact }
+
+/// What an `Exact` walk could not take: symlinks (never followed; the host
+/// refuses links), FIFOs and device nodes, and entries it could not read or name.
+#[derive(Default, Debug)]
+pub(crate) struct WalkReport { pub not_copied: Vec<String>, pub unreadable: Vec<String> }
+
+/// A manual Location upload's manifest: every file and folder, or an error
+/// naming what can't be read. The symlinks left out come back for the card.
+pub(crate) fn gather_exact(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, Vec<String>, u64, Vec<String>)> {
+    let mut report = WalkReport::default();
+    let (items, dirs, total) = gather_walk(paths, Walk::Exact, &mut report)?;
+    if !report.unreadable.is_empty() {
+        for p in &report.unreadable { log::warn!("exact upload: can't read {p}"); }
+        let n = report.unreadable.len();
+        let shown: Vec<_> = report.unreadable.iter().take(5).cloned().collect();
+        anyhow::bail!("Can't read {n} {} — the copy wouldn't be complete, so nothing was sent: {}{}. Fix the permissions (or give DropBeam Full Disk Access) and try again.",
+            if n == 1 { "item" } else { "items" }, shown.join(", "), if n > 5 { format!(" and {} more", n - 5) } else { String::new() });
+    }
+    for p in &report.not_copied { log::warn!("exact upload: symlink not copied: {p}"); }
+    Ok((items, dirs, total, report.not_copied))
+}
+
+fn gather_walk(paths: &[PathBuf], walk: Walk, report: &mut WalkReport) -> Result<(Vec<(PathBuf, String, u64, u64)>, Vec<String>, u64)> {
     let mut items = Vec::new();
     // Relative paths of EMPTY directories under any dropped folder — carried in the
     // manifest's optional `dirs` field so the receiver recreates them too (GitHub
@@ -10167,6 +10281,7 @@ fn gather_items_with(paths: &[PathBuf], include_hidden: bool) -> Result<(Vec<(Pa
             Ok(m) => m,
             Err(e) => {
                 log::warn!("send pre-filter: skipping {} — {e}", p.display());
+                if walk == Walk::Exact { report.unreadable.push(format!("{} ({e})", p.display())); }
                 continue;
             }
         };
@@ -10182,7 +10297,7 @@ fn gather_items_with(paths: &[PathBuf], include_hidden: bool) -> Result<(Vec<(Pa
             // If the dropped folder (and everything under it) holds no files, record
             // the folder itself as empty so the peer still recreates it — otherwise a
             // user sending a brand-new empty folder would send literally nothing.
-            let had_file = collect_dir_items(p, &base, &mut items, &mut dirs, include_hidden);
+            let had_file = collect_dir_items(p, &base, &mut items, &mut dirs, walk, report);
             if !had_file {
                 dirs.push(base);
             }
@@ -10191,6 +10306,9 @@ fn gather_items_with(paths: &[PathBuf], include_hidden: bool) -> Result<(Vec<(Pa
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .ok_or_else(|| anyhow::anyhow!("missing file name for {}", p.display()))?;
+            if walk == Walk::Exact {
+                if let Err(e) = std::fs::File::open(p) { report.unreadable.push(format!("{} ({e})", p.display())); continue; }
+            }
             items.push((p.clone(), name, meta.len(), mtime_secs(&meta)));
         }
     }
@@ -10222,23 +10340,47 @@ fn collect_dir_items(
     prefix: &str,
     out: &mut Vec<(PathBuf, String, u64, u64)>,
     empty_out: &mut Vec<String>,
-    include_hidden: bool,
+    walk: Walk,
+    report: &mut WalkReport,
 ) -> bool {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        // Unreadable dir: never fail the whole send — treat as "no files here". The
-        // dir is still recorded as empty by the caller so its existence survives.
-        return false;
+    let exact = walk == Walk::Exact;
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            // Unreadable dir: an ordinary send never fails over it — treat as "no
+            // files here" (the caller still records the dir as empty). An exact
+            // copy can't skip it: it would silently be missing on the far side.
+            if exact { report.unreadable.push(format!("{} ({e})", dir.display())); }
+            return false;
+        }
     };
     let mut had_file = false;
-    let mut entries: Vec<_> = rd.flatten().collect();
+    let mut entries = Vec::new();
+    for entry in rd {
+        match entry {
+            Ok(entry) => entries.push(entry),
+            Err(e) => if exact { report.unreadable.push(format!("{} ({e})", dir.display())); },
+        }
+    }
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.to_ascii_lowercase().starts_with(".dropbeam-") || os_junk_name(&name) || (!include_hidden && name.starts_with('.')) {
+        if exact && entry.file_name().to_str().is_none() {
+            // A name that isn't valid Unicode can't be carried unchanged.
+            report.unreadable.push(format!("{} (name isn't valid text)", entry.path().display()));
             continue;
         }
-        let Ok(ft) = entry.file_type() else { continue };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.to_ascii_lowercase().starts_with(".dropbeam-")
+            || (!exact && os_junk_name(&name))
+            || (walk == Walk::Visible && name.starts_with('.')) {
+            continue;
+        }
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => { if exact { report.unreadable.push(format!("{} ({e})", entry.path().display())); } continue; }
+        };
         if ft.is_symlink() {
+            if exact { report.not_copied.push(format!("{prefix}/{name}")); }
             // Symlinks/aliases inside a dropped folder are not followed (a link
             // to a huge tree or an absolute path outside the folder would send
             // surprising data). But NEVER silently: the sender believes the whole
@@ -10256,17 +10398,26 @@ fn collect_dir_items(
             // Recurse; if the subtree held no files, record the subfolder itself as
             // empty so the peer recreates it. A subtree WITH files needs no entry —
             // its files already imply every ancestor directory.
-            let sub_had_file = collect_dir_items(&path, &rel, out, empty_out, include_hidden);
+            let sub_had_file = collect_dir_items(&path, &rel, out, empty_out, walk, report);
             if sub_had_file {
                 had_file = true;
             } else {
                 empty_out.push(rel);
             }
         } else if ft.is_file() {
-            if let Ok(meta) = entry.metadata() {
-                out.push((path, rel, meta.len(), mtime_secs(&meta)));
-                had_file = true;
+            match entry.metadata() {
+                // An exact copy opens each file up front: one it can't read would
+                // otherwise fail the upload hours in, or (elsewhere) go missing.
+                Ok(meta) if exact => match std::fs::File::open(&path) {
+                    Ok(_) => { out.push((path, rel, meta.len(), mtime_secs(&meta))); had_file = true; }
+                    Err(e) => report.unreadable.push(format!("{} ({e})", path.display())),
+                },
+                Ok(meta) => { out.push((path, rel, meta.len(), mtime_secs(&meta))); had_file = true; }
+                Err(e) => if exact { report.unreadable.push(format!("{} ({e})", path.display())); },
             }
+        } else if exact {
+            // A FIFO, socket or device node has no bytes to copy.
+            report.not_copied.push(format!("{prefix}/{name} (not a regular file)"));
         }
     }
     had_file
@@ -13406,16 +13557,85 @@ mod hidden_items_tests {
         std::fs::write(root.join(".trash/rec/old.mov"), b"m").unwrap();
         std::fs::write(root.join(".dropbeam-staging-x"), b"x").unwrap();
         let mut items = vec![]; let mut dirs = vec![];
-        collect_dir_items(&root, "Lib", &mut items, &mut dirs, false);
+        collect_dir_items(&root, "Lib", &mut items, &mut dirs, super::Walk::Visible, &mut Default::default());
         let names: Vec<_> = items.iter().map(|i| i.1.clone()).collect();
         assert_eq!(names, vec!["Lib/a.txt"]);
         assert!(dirs.is_empty());
         let mut items = vec![]; let mut dirs = vec![];
-        collect_dir_items(&root, "Lib", &mut items, &mut dirs, true);
+        collect_dir_items(&root, "Lib", &mut items, &mut dirs, super::Walk::Hidden, &mut Default::default());
         let mut names: Vec<_> = items.iter().map(|i| i.1.clone()).collect(); names.sort();
         assert_eq!(names, vec!["Lib/.trash/rec/old.mov", "Lib/a.txt"], "OS junk like .DS_Store is never copied");
         assert_eq!(dirs, vec!["Lib/.empty-hidden"]);
         assert!(super::os_junk_name("._photo.jpg") && super::os_junk_name("Thumbs.db") && !super::os_junk_name(".hidden.txt"));
+    }
+}
+
+#[cfg(test)]
+mod exact_upload_tests {
+    use super::{gather_exact, map_names_for_windows};
+    use std::path::PathBuf;
+    fn tree() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("dropbeam-exact-{}", uuid::Uuid::new_v4())).join("Disk");
+        for d in [".git/objects", "sub/.hidden-dir", "empty", ".empty-hidden"] { std::fs::create_dir_all(root.join(d)).unwrap(); }
+        for f in [".env", ".git/config", ".git/objects/blob", ".DS_Store", "._photo.jpg", "photo.jpg", "Thumbs.db",
+                  "desktop.ini", ".localized", "sub/.hidden-dir/inner.txt", ".dropbeam-staging-x"] {
+            std::fs::write(root.join(f), f.as_bytes()).unwrap();
+        }
+        root
+    }
+    #[test]
+    fn exact_takes_every_file_and_folder_but_dropbeams_own() {
+        let root = tree();
+        let (items, dirs, total, not_copied) = gather_exact(std::slice::from_ref(&root)).unwrap();
+        let mut names: Vec<_> = items.iter().map(|i| i.1.as_str()).collect(); names.sort();
+        assert_eq!(names, ["Disk/.DS_Store", "Disk/._photo.jpg", "Disk/.env", "Disk/.git/config", "Disk/.git/objects/blob",
+            "Disk/.localized", "Disk/Thumbs.db", "Disk/desktop.ini", "Disk/photo.jpg", "Disk/sub/.hidden-dir/inner.txt"]);
+        let mut dirs = dirs; dirs.sort();
+        assert_eq!(dirs, ["Disk/.empty-hidden", "Disk/empty"]);
+        assert_eq!(total, items.iter().map(|i| i.2).sum::<u64>());
+        assert!(not_copied.is_empty());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn exact_lists_symlinks_and_refuses_what_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tree();
+        std::os::unix::fs::symlink("photo.jpg", root.join("link")).unwrap();
+        let (_, _, _, not_copied) = gather_exact(std::slice::from_ref(&root)).unwrap();
+        assert_eq!(not_copied, ["Disk/link"]);
+        // Root ignores permissions, so these checks only mean something as a user.
+        if unsafe { libc::geteuid() } == 0 { return; }
+        std::fs::write(root.join("noread.txt"), b"x").unwrap();
+        std::fs::set_permissions(root.join("noread.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = gather_exact(std::slice::from_ref(&root)).unwrap_err().to_string();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.contains("Can't read 2 items") && err.contains("noread.txt") && err.contains("locked"), "{err}");
+        // An ordinary send still never fails over them.
+        assert!(super::gather_items_with(std::slice::from_ref(&root), true).is_ok());
+    }
+    #[test]
+    fn windows_names_rename_only_what_windows_refuses_and_stay_unique() {
+        let item = |rel: &str| (PathBuf::from(rel), rel.to_owned(), 1u64, 0u64);
+        let mut items = vec![item("Disk/Report 7:3.pdf"), item("Disk/Report 7-3.pdf"), item("Disk/CON.txt"), item("Disk/trail."),
+            item("Disk/A.txt"), item("Disk/a.txt"), item("Disk/why?/x.txt"), item("Disk/why?/y.txt"), item("Disk/.env"), item("Disk/ok.txt")];
+        let mut dirs = vec!["Disk/why?/empty".to_owned(), "Disk/sp ".to_owned()];
+        let renamed = map_names_for_windows(&mut items, &mut dirs);
+        let landed: Vec<_> = items.iter().map(|i| i.1.as_str()).collect();
+        assert_eq!(landed, ["Disk/Report 7-3 (2).pdf", "Disk/Report 7-3.pdf", "Disk/_CON.txt", "Disk/trail",
+            "Disk/A.txt", "Disk/a (2).txt", "Disk/why-/x.txt", "Disk/why-/y.txt", "Disk/.env", "Disk/ok.txt"]);
+        assert_eq!(dirs, ["Disk/why-/empty", "Disk/sp"]);
+        assert_eq!(renamed.len(), 8, "{renamed:?}");
+        assert!(!renamed.iter().any(|(from, _)| from == "Disk/Report 7-3.pdf"), "a name Windows takes is never moved");
+        assert!(renamed.contains(&("Disk/a.txt".into(), "Disk/a (2).txt".into())));
+        // Every landed name is one a Windows host accepts.
+        #[cfg(windows)]
+        for i in &items { crate::locations::relative(&i.1).unwrap(); }
+        // The same tree always maps the same way (a retry resumes the same names).
+        let mut again = vec![item("Disk/Report 7:3.pdf"), item("Disk/Report 7-3.pdf")];
+        map_names_for_windows(&mut again, &mut []);
+        assert_eq!((again[0].1.as_str(), again[1].1.as_str()), ("Disk/Report 7-3 (2).pdf", "Disk/Report 7-3.pdf"));
     }
 }
 
@@ -16464,7 +16684,7 @@ mod location_loopback_tests {
             let mut batch = LocationBatch { items, dirs, next_file:0, dirs_pending:true };
             let options = LocationSend { target:Some(crate::locations::Target {
                 location_id:"nas".into(), rel_path:"".into() }),
-                transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None, replace_existing:false };
+                transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None, replace_existing:false, windows_names: false };
             let recovery = std::sync::Mutex::new(RelayRecovery {
                 forced_locality:Some(crate::models::Locality::Internet), ..Default::default()
             });
@@ -16540,7 +16760,7 @@ mod location_loopback_tests {
         let mut batch = LocationBatch { items, dirs, next_file: 0, dirs_pending: true };
         let options = LocationSend { target: Some(crate::locations::Target {
             location_id: "family".into(), rel_path: "".into() }),
-            transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing: false };
+            transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing: false, windows_names: false };
         let sent = tokio::time::timeout(Duration::from_secs(60), batch.send_attempt(
             &conn, &options, &AtomicBool::new(false), "Mac", &AtomicBool::new(false),
             &AtomicU64::new(0), None, |_, _| {}, |_| {}, |_| {}, |_| {}, || Ok(()))).await.unwrap().unwrap();
@@ -16755,7 +16975,7 @@ mod location_loopback_tests {
                 // The same verified Locations upload the app uses (send_location_to_friend → send_files_linked).
                 let (conn, file) = (self.0.clone(), file.to_path_buf());
                 let options = LocationSend { target: Some(crate::locations::Target { location_id: location_id.into(), rel_path: rel_dir.into() }),
-                    transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing: replace };
+                    transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing: replace, windows_names: false };
                 tokio::spawn(async move {
                     let t = Instant::now();
                     match send_files_linked(&conn, &[file.clone()], &AtomicBool::new(false), |_, _| {}, "Mac", &AtomicBool::new(false), &AtomicU64::new(0), None, None, Some(&options)).await {
@@ -16817,7 +17037,7 @@ mod location_loopback_tests {
         let list = rpc(&conn, serde_json::json!({"kind":"locations.list","locations_v":1})).await;
         assert_eq!(list["data"][0]["name"], "Family NAS"); assert!(list["data"][0].get("path").is_none());
         let source = base.join("旅行.txt"); std::fs::write(&source, b"loopback NAS bytes").unwrap();
-        let options = LocationSend { target:Some(crate::locations::Target { location_id:"family".into(), rel_path:"".into() }), transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None, replace_existing:false };
+        let options = LocationSend { target:Some(crate::locations::Target { location_id:"family".into(), rel_path:"".into() }), transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None, replace_existing:false, windows_names: false };
         let total = send_files_linked(&conn, &[source.clone()], &AtomicBool::new(false), |_, _| {}, "Mac", &AtomicBool::new(false), &AtomicU64::new(0), None, None, Some(&options)).await.unwrap();
         assert_eq!(total, 18); assert_eq!(std::fs::read(nas.join("旅行.txt")).unwrap(), b"loopback NAS bytes");
         let ls = rpc(&conn, serde_json::json!({"kind":"locations.ls","locations_v":1,"id":"family","rel_path":"","page":0})).await;

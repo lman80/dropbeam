@@ -98,6 +98,12 @@ pub struct TransferUpdate {
     /// Only that first snapshot carries it; the view remembers it per transfer id.
     #[serde(default)]
     pub location_id: Option<String>,
+    /// A manual Location upload's exact-copy report: what couldn't be copied
+    /// (symlinks, FIFOs) and what was renamed because the host's Windows can't
+    /// store the name. Set when the upload starts; `None` when everything
+    /// travels exactly as it is.
+    #[serde(default)]
+    pub upload_notes: Option<UploadNotes>,
     /// The last "Verify copy" run for this card: a full SHA-256 comparison of
     /// every file in the send against the copy that landed on the peer. `None`
     /// until the user asks for one.
@@ -167,6 +173,29 @@ pub struct ChatTransferLink {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatFile { pub name: String, pub size: u64 }
 
+/// Counts plus the first few examples (the full lists are in the log), so a
+/// 10 000-link `node_modules` can't bloat every progress update.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadNotes {
+    pub not_copied: u64,
+    pub not_copied_examples: Vec<String>,
+    pub renamed: u64,
+    /// `[original, landed]` rels.
+    pub renamed_examples: Vec<[String; 2]>,
+}
+impl UploadNotes {
+    const EXAMPLES: usize = 50;
+    pub fn new(not_copied: &[String], renamed: &[(String, String)]) -> Self {
+        UploadNotes {
+            not_copied: not_copied.len() as u64,
+            not_copied_examples: not_copied.iter().take(Self::EXAMPLES).cloned().collect(),
+            renamed: renamed.len() as u64,
+            renamed_examples: renamed.iter().take(Self::EXAMPLES).map(|(a, b)| [a.clone(), b.clone()]).collect(),
+        }
+    }
+}
+
 impl TransferUpdate {
     pub fn new(id: String, direction: Direction, file_names: Vec<String>) -> Self {
         let file_count = file_names.len();
@@ -176,6 +205,7 @@ impl TransferUpdate {
             location_conflicts: None,
             location_replaced: None,
             location_id: None,
+            upload_notes: None,
             verify: None,
             chat_transfer: None,
             id,

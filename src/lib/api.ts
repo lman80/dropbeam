@@ -85,6 +85,14 @@ export interface Delivery {
   note?: string | null
 }
 
+export interface UploadNotes {
+  notCopied: number
+  notCopiedExamples: string[]
+  renamed: number
+  /** [original, landed] */
+  renamedExamples: [string, string][]
+}
+
 export interface TransferUpdate {
   locationSkipped?: number | null
   locationConflicts?: number | null
@@ -94,6 +102,9 @@ export interface TransferUpdate {
   /** On the FIRST update of an incoming Location upload: which hosted folder it
    *  is landing in. Later progress updates omit it, so consumers remember it. */
   locationId?: string | null
+  /** A manual Location upload's exact-copy report: what couldn't be copied
+   *  (symlinks…) and what was renamed for a Windows host. Absent = exact. */
+  uploadNotes?: UploadNotes | null
   /** Result (or live progress) of "Verify copy" on this card. */
   verify?: VerifyReport | null
   integrity?: FileIntegrity[]

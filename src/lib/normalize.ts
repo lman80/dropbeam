@@ -65,6 +65,7 @@ export function normalizeTransfer(u: TransferUpdate, prev?: TransferUpdate): Tra
     locationSkipped: u.locationSkipped ?? prev?.locationSkipped,
     locationConflicts: u.locationConflicts ?? prev?.locationConflicts,
     locationReplaced: u.locationReplaced ?? prev?.locationReplaced,
+    uploadNotes: u.uploadNotes ?? prev?.uploadNotes,
     // A verify report outlives the update that carried it: later progress ticks
     // (and any other emit on this card) must not blank the verdict.
     verify: u.verify ?? prev?.verify,

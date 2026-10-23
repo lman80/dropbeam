@@ -2381,9 +2381,11 @@ pub async fn start_location_upload_replacing(app: AppHandle, state: Arc<AppState
     // Confirm current access before starting. Host repeats this check on header
     // receipt and again at publication, including after a resumed transfer.
     let shared = crate::iroh_net::location_request(&iroh, &endpoint, serde_json::json!({"kind":"locations.list"})).await.map_err(|e| e.to_string())?;
-    if !shared.as_array().into_iter().flatten().any(|l| l["id"] == target.location_id && l["rights"]["upload"] == true) {
+    let Some(location) = shared.as_array().into_iter().flatten().find(|l| l["id"] == target.location_id && l["rights"]["upload"] == true) else {
         return Err("This location is not shared with upload permission".into());
-    }
+    };
+    // A Windows host says so; an older one doesn't, and keeps today's behavior.
+    let windows_names = location["names"] == "windows";
     crate::iroh_net::send_location_to_friend(app, iroh, friend.name, endpoint, paths,
-        crate::iroh_net::LocationSend { target: Some(target), transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing })
+        crate::iroh_net::LocationSend { target: Some(target), transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing, windows_names })
 }
