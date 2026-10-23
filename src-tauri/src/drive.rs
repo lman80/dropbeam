@@ -494,6 +494,14 @@ impl Tree {
     }
 }
 
+/// Owner-only modes for the NFS view: the macOS client checks mode bits
+/// locally (only access(2) asks the server), so with our uid as owner other
+/// users on this Mac can't open or list anything through the mount.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn nfs_mode(is_dir: bool, writable: bool) -> u32 {
+    match (is_dir, writable) { (true, true) => 0o700, (true, false) => 0o500, (false, true) => 0o600, (false, false) => 0o400 }
+}
+
 // ── macOS: NFSv3 ────────────────────────────────────────────────────────────
 #[cfg(target_os = "macos")]
 mod nfs {
@@ -512,7 +520,7 @@ mod nfs {
     fn name(f: &filename3) -> Result<String, nfsstat3> { String::from_utf8(f.0.clone()).map_err(|_| nfsstat3::NFS3ERR_INVAL) }
     impl Nfs {
         fn fattr(&self, n: &Node) -> fattr3 {
-            let mode = match (n.is_dir, n.writable) { (true, true) => 0o755, (true, false) => 0o555, (false, true) => 0o644, (false, false) => 0o444 };
+            let mode = nfs_mode(n.is_dir, n.writable);
             fattr3 { ftype: if n.is_dir { ftype3::NF3DIR } else { ftype3::NF3REG }, mode, nlink: if n.is_dir { 2 } else { 1 },
                 uid: self.uid, gid: self.gid, size: n.size, used: n.size, rdev: specdata3::default(), fsid: 0x44_42, fileid: n.id,
                 atime: time(n.modified), mtime: time(n.modified), ctime: time(n.modified) }
@@ -857,6 +865,23 @@ impl Drive {
     async fn mount_inner(&self) -> Result<Mounted> { anyhow::bail!("Showing Locations as a drive isn't available on this device") }
 }
 
+/// Make `path` a real folder only its owner can enter (0700), tightening one
+/// left by an older build (0755).
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn owner_only_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        r => r?,
+    }
+    let meta = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(meta.is_dir(), "{} isn't a folder, so the drive can't appear there.", path.display());
+    if meta.permissions().mode() & 0o777 != 0o700 { std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?; }
+    Ok(())
+}
+
 /// `~/DropBeam Drives` (`DROPBEAM_DRIVE_DIR` overrides it, for testing).
 #[cfg(target_os = "macos")]
 fn mount_point() -> Result<PathBuf> {
@@ -868,7 +893,7 @@ fn mount_point() -> Result<PathBuf> {
 #[cfg(target_os = "macos")]
 pub(crate) async fn mount_nfs_at(tree: Arc<Tree>, path: &Path) -> Result<tokio::task::JoinHandle<()>> {
     use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-    std::fs::create_dir_all(path)?;
+    owner_only_dir(path)?;
     let leftovers: Vec<_> = std::fs::read_dir(path)?.flatten().filter(|e| e.file_name() != ".DS_Store").collect();
     anyhow::ensure!(leftovers.is_empty(), "The folder {} isn't empty, so the drive can't appear there. Move its contents and try again.", path.display());
     let listener = NFSTcpListener::bind("127.0.0.1:0", nfs::Nfs::new(tree)).await?;
@@ -1078,6 +1103,29 @@ mod tests {
     use super::*;
     use crate::stream::{Remote, Stat};
     use tokio::sync::mpsc;
+
+    /// Other users on the Mac can't enter the drive: owner-only modes, and the
+    /// mount folder is created 0700 (an older 0755 one is tightened).
+    #[test]
+    fn drive_is_owner_only() {
+        for d in [true, false] { for w in [true, false] { assert_eq!(nfs_mode(d, w) & 0o077, 0, "dir={d} writable={w}"); } }
+        assert_eq!(nfs_mode(true, true), 0o700);
+        assert_eq!(nfs_mode(false, true), 0o600);
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            let base = std::env::temp_dir().join(format!("dropbeam-drive-mode-{}", uuid::Uuid::new_v4()));
+            let fresh = base.join("DropBeam Drives");
+            owner_only_dir(&fresh).unwrap();
+            assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o700);
+            std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            owner_only_dir(&fresh).unwrap();
+            assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o700);
+            let link = base.join("link");
+            std::os::unix::fs::symlink(&fresh, &link).unwrap();
+            assert!(owner_only_dir(&link).is_err(), "a symlink isn't used as the mount folder");
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
 
     /// A friend device with one Location held in memory.
     struct Host { files: Mutex<HashMap<String, Vec<u8>>>, dirs: Mutex<Vec<String>>, uploads: Mutex<Vec<(String, bool)>>, manage: bool }

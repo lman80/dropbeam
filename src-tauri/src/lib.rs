@@ -1181,7 +1181,7 @@ pub fn run() {
         .run(|_app, _event| {
             // Take the drive away cleanly on quit (a crash is cleaned up at launch).
             #[cfg(desktop)]
-            if let tauri::RunEvent::Exit = &_event { drive::shutdown_blocking(); }
+            if let tauri::RunEvent::Exit = &_event { drive::shutdown_blocking(); agent_ctl::shutdown(); }
             // A `dropbeam:` link (invite link, Camera-scanned friend QR): queue it
             // for the UI and tell a running one right away.
             #[cfg(target_os = "ios")]

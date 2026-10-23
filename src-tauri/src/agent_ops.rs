@@ -314,22 +314,12 @@ fn catalog() -> Vec<OpSpec> {
             .out("{endpointId, name, accountPub, devices:[{endpointId, name, deviceKind, thisDevice, needsApproval}]}").cmds(&["my_device_info"]).build(),
         op("devices.activity", Read, "What your other devices are sending or receiving right now.").cmds(&["other_device_activity"]).build(),
         op("devices.syncNow", Write, "Bring friends and chats in step with your other devices now.").cmds(&["account_sync_now"]).build(),
-        op("devices.linkBegin", Write, "Show a 'link me' code on THIS device: another device that has your account enters it with devices.join.")
-            .out("code").cmds(&["link_device_begin"]).build(),
-        op("devices.linkCancel", Write, "Cancel the code from devices.linkBegin.").cmds(&["link_device_cancel"]).build(),
-        op("devices.hostBegin", Write, "Show a 'join me' code on THIS device: a new device enters it with devices.join to join your account.")
-            .out("code").cmds(&["link_host_begin"]).build(),
-        op("devices.hostCancel", Write, "Cancel the code from devices.hostBegin.").cmds(&["link_host_cancel"]).build(),
-        op("devices.linkPreview", Read, "Check a device code before linking: who it belongs to and the safety code both screens show.")
+        op("devices.linkCancel", Write, "Cancel a 'link me' code shown on THIS device (linking itself happens in the window).").cmds(&["link_device_cancel"]).build(),
+        op("devices.hostCancel", Write, "Cancel a 'join me' code shown on THIS device (linking itself happens in the window).").cmds(&["link_host_cancel"]).build(),
+        op("devices.linkPreview", Read, "Check a device code before linking: who it belongs to and the safety code both screens show. (Linking itself happens in the window.)")
             .req("code", S, "dropbeamlink1:… or dropbeamjoin1:…").cmds(&["link_device_prepare"]).build(),
-        op("devices.join", Destructive, "Link this device and the one whose code you have into one account (friends and chats come along). Both must be online.")
-            .req("code", S, "dropbeamlink1:… or dropbeamjoin1:…").opt("confirmToken", S, "confirmToken from devices.linkPreview, once the person has seen that both screens show the same safety code.")
-            .out("the linked device").cmds(&["link_device_join", "link_device_send"]).build(),
-        op("devices.linkPending", Read, "The 'do the safety codes match?' question waiting on this device during a link, if any (also sent as a `link` event).")
+        op("devices.linkPending", Read, "The 'do the safety codes match?' question waiting on this device during a link, if any (also sent as a `link` event). Only the person answers it, in the window.")
             .out("{endpointId, name, safety, joining} or null").build(),
-        op("devices.confirmLink", Write, "Answer 'do the safety codes match?' on this device during a link.")
-            .req("endpointId", S, "The other device.").req("accept", B, "true = they match.").cmds(&["link_confirm"]).build(),
-        op("devices.approve", Write, "Approve a device that shows 'Needs approval'.").req("endpointId", S, "Device id.").cmds(&["account_approve_device"]).build(),
         op("devices.remove", Destructive, "Remove one of your devices from your account (on every device).").req("endpointId", S, "Device id.").cmds(&["account_remove_device"]).build(),
         op("devices.leaveAccount", Destructive, "Take THIS device out of your account (it keeps its own friends).").cmds(&["account_leave"]).build(),
         op("exec.run", Destructive, "Run a command on one of YOUR OWN linked devices (not friends'), if that device has 'Let my other devices run commands here' turned on. Output streams back; the device shows a notification and logs it.")
@@ -428,6 +418,15 @@ pub const EXCLUDED: &[(&str, &str)] = &[
     ("location_open", "opens a file in an app on screen (agents use locations.readUrl or locations.cacheFile)"),
     ("drive_open", "opens Finder/File Explorer/Files on screen"),
     ("drive_fix_windows", "asks for administrator permission on screen"),
+    // Adding a device to the account hands it the account's friends, chats and
+    // `exec`: a person decides that in the window (scan the code, compare the
+    // safety code). Agents keep the read-only list/preview/pending ops.
+    ("link_device_begin", "Settings → Devices: linking a device to your account is the person's decision"),
+    ("link_host_begin", "Settings → Devices: linking a device to your account is the person's decision"),
+    ("link_device_join", "Settings → Devices: linking a device to your account is the person's decision"),
+    ("link_device_send", "Settings → Devices: linking a device to your account is the person's decision"),
+    ("link_confirm", "Settings → Devices: only the person compares the safety codes"),
+    ("account_approve_device", "Settings → Devices: approving a device into your account is the person's decision"),
     ("agent_settings", "Settings → Agents: an agent can't change its own access"),
     ("agent_set_access", "Settings → Agents: an agent can't change its own access"),
     ("agent_set_exec", "Settings → Agents: an agent can't let itself run commands"),
@@ -887,14 +886,9 @@ pub async fn run(app: &AppHandle, name: &str, i: &Value, ctx: &Ctx) -> R {
         "devices.list" => ok(crate::link::my_device_info(app.state(), app.state()).map_err(failed)?),
         "devices.activity" => ok(crate::device_activity::other_device_activity()),
         "devices.syncNow" => { crate::account::account_sync_now(); done() }
-        "devices.linkBegin" => ok(crate::link::link_device_begin(app.state(), app.state()).map_err(failed)?),
         "devices.linkCancel" => { crate::link::link_device_cancel(app.state()); done() }
-        "devices.hostBegin" => ok(crate::link::link_host_begin(app.state(), app.state()).map_err(failed)?),
         "devices.hostCancel" => { crate::link::link_host_cancel(app.state()); done() }
         "devices.linkPreview" => ok(crate::link::link_device_prepare(app.state(), app.state(), s(i, "code")?).await.map_err(failed)?),
-        "devices.join" => ok(crate::link::link_device_join(app.clone(), app.state(), app.state(), s(i, "code")?, os(i, "confirmToken")).await.map_err(failed)?),
-        "devices.confirmLink" => { crate::link::link_confirm(app.clone(), app.state(), s(i, "endpointId")?, bv(i, "accept")?); done() }
-        "devices.approve" => { crate::account::account_approve_device(app.clone(), app.state(), s(i, "endpointId")?).map_err(failed)?; done() }
         "devices.remove" => { crate::account::account_remove_device(app.clone(), app.state(), s(i, "endpointId")?).map_err(failed)?; done() }
         "devices.leaveAccount" => { crate::account::account_leave(app.clone(), app.state(), app.state()).await.map_err(failed)?; done() }
         "devices.linkPending" => Ok(crate::agent_ctl::link_pending()),
@@ -998,6 +992,18 @@ mod tests {
         assert!(stale.is_empty(), "decisions for commands lib.rs doesn't register: {stale:?}");
         let both: Vec<&&str> = excluded.iter().filter(|c| covered.contains(c)).collect();
         assert!(both.is_empty(), "both covered and excluded: {both:?}");
+    }
+
+    /// Adding a device to the account (it gets friends, chats and `exec`) is the
+    /// person's decision in the window: no op links, joins, confirms or approves.
+    #[test]
+    fn device_linking_is_window_only() {
+        for name in ["devices.linkBegin", "devices.hostBegin", "devices.join", "devices.confirmLink", "devices.approve"] { assert!(find(name).is_none(), "{name}"); }
+        for c in ["link_device_begin", "link_host_begin", "link_device_join", "link_device_send", "link_confirm", "account_approve_device"] {
+            assert!(EXCLUDED.iter().any(|e| e.0 == c), "{c}");
+            assert!(!CATALOG.iter().any(|o| o.commands.contains(&c)), "{c}");
+        }
+        for name in ["devices.list", "devices.linkPreview", "devices.linkPending"] { assert_eq!(find(name).unwrap().risk, Risk::Read, "{name}"); }
     }
 
     #[test]

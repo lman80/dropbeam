@@ -119,12 +119,16 @@ missed. Files go the same way: `files_send`, then `transfers_wait`.
 
 For #86 ("every time I get a new computer…"), on the NEW computer:
 
-1. Install DropBeam and link it to your account (Settings → Devices → scan the code shown on
-   your other device, or the other way round).
+1. Install DropBeam and link it to your account **yourself, in the window** (Settings → Devices
+   → scan the code shown on your other device, or the other way round, and check that both
+   screens show the same safety code). Agents can't link, join or approve devices: a device in
+   your account gets your friends, your chats and — with the switch below — your commands, so
+   adding one is always a person's decision. Agents can still list devices, preview a code and
+   see a pending safety-code question.
 2. Settings → Agents → **Let my other devices run commands here** → **For 1 Hour** (or
    **Until I Turn It Off**).
 
-Your agent on your usual computer can now run commands there:
+From here your agent on your usual computer takes over and can run commands there:
 
 ```
 dropbeam exec linux-box -- 'mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys' < ~/.ssh/id_ed25519.pub
@@ -149,9 +153,19 @@ The **target** decides, every time, from facts it holds itself:
 | any | — on iOS, or in the windowless `--server` mode | refused: not supported |
 | an older DropBeam (no `exec`) | — | it ignores the request; the caller says "update DropBeam on that device" |
 
-Every command, run or refused, shows a notification on the target ("DropBeam ran a
-command") and is written to the target's activity log with the device, agent, command and
-exit code. The switch lives in `agents.json`, can only be changed in the window (there is
+The target keeps checking while a command runs: every 2 seconds it asks the same question
+again, and if the switch was turned off or expired, or the calling device was removed from
+the account, it stops the command (its whole process group / tree), writes "DropBeam stopped
+this command: …" to its stderr and ends with `"stopped": "<reason>"`. A caller that goes
+away (Ctrl-C, closed connection, crashed) stops its command too — nothing keeps running
+unseen. At most 4 commands from one device run at once (more are refused with `busy`).
+
+Every command run here, and every refusal of one of your own devices, shows up in the
+target's activity log with the device, agent, command and exit code (runs also show a
+notification, "DropBeam ran a command"). Refusals of devices outside the account are
+recorded without anything the caller sent (no command text, no agent name), at most once a
+minute per device (with how many were refused) and 20 times a minute in all; a device
+outside the account gets at most 10 answers a minute. The switch lives in `agents.json`, can only be changed in the window (there is
 deliberately no op for it), is off by default and isn't offered on iOS.
 
 What turning it on means: any device in your account — and any agent you let use one — can
@@ -167,7 +181,11 @@ Turn it on while you set a computer up. A lost device: remove it from your accou
     socket `0600`, and every connection's peer uid is checked against ours.
   - Windows: a named pipe with a random name, kept in `<config>\agent\pipe` (readable only
     by you); created first-instance-only, refusing remote clients, with a security
-    descriptor that grants access to your user SID alone.
+    descriptor that grants access to your user SID alone. The name file is removed on quit.
+  - The `dropbeam` command checks the other way too before it sends anything: on macOS /
+    Linux the socket folder must be a real folder owned by you with mode `0700` and the
+    program answering must run as your uid; on Windows the pipe's server process must run
+    as your user SID. Otherwise it refuses ("Refusing to talk to that DropBeam").
   - No TCP port; nothing is reachable from the network. `<config>` is
     `~/Library/Application Support/com.dropbeam.app`, `%APPDATA%\com.dropbeam.app` or
     `~/.config/com.dropbeam.app`.
@@ -313,15 +331,10 @@ Bold arguments are required. 141 ops.
 | `devices.list` | read |  | This device and every device linked to your account, with which one is this. |
 | `devices.activity` | read |  | What your other devices are sending or receiving right now. |
 | `devices.syncNow` | write |  | Bring friends and chats in step with your other devices now. |
-| `devices.linkBegin` | write |  | Show a 'link me' code on THIS device: another device that has your account enters it with devices.join. |
-| `devices.linkCancel` | write |  | Cancel the code from devices.linkBegin. |
-| `devices.hostBegin` | write |  | Show a 'join me' code on THIS device: a new device enters it with devices.join to join your account. |
-| `devices.hostCancel` | write |  | Cancel the code from devices.hostBegin. |
-| `devices.linkPreview` | read | **code** | Check a device code before linking: who it belongs to and the safety code both screens show. |
-| `devices.join` | destructive (confirm) | **code**, confirmToken | Link this device and the one whose code you have into one account (friends and chats come along). Both must be online. |
-| `devices.linkPending` | read |  | The 'do the safety codes match?' question waiting on this device during a link, if any (also sent as a `link` event). |
-| `devices.confirmLink` | write | **accept**, **endpointId** | Answer 'do the safety codes match?' on this device during a link. |
-| `devices.approve` | write | **endpointId** | Approve a device that shows 'Needs approval'. |
+| `devices.linkCancel` | write |  | Cancel a 'link me' code shown on THIS device (linking itself happens in the window). |
+| `devices.hostCancel` | write |  | Cancel a 'join me' code shown on THIS device (linking itself happens in the window). |
+| `devices.linkPreview` | read | **code** | Check a device code before linking: who it belongs to and the safety code both screens show. (Linking itself happens in the window.) |
+| `devices.linkPending` | read |  | The 'do the safety codes match?' question waiting on this device during a link, if any (also sent as a `link` event). Only the person answers it, in the window. |
 | `devices.remove` | destructive (confirm) | **endpointId** | Remove one of your devices from your account (on every device). |
 | `devices.leaveAccount` | destructive (confirm) |  | Take THIS device out of your account (it keeps its own friends). |
 | `exec.run` | destructive (confirm, dryRun, streams) | **command**, cwd, **device**, shell, stdin, timeoutSecs | Run a command on one of YOUR OWN linked devices (not friends'), if that device has 'Let my other devices run commands here' turned on. Output streams back; the device shows a notification and logs it. |
@@ -373,3 +386,4 @@ Tauri commands no op covers (`ops.describe` also lists them as `humanOnly`):
 | `location_thumb`, `location_open`, `drive_open` | picture previews for the browser grid; open a file or the drive on screen (agents use `locations.readUrl` / `locations.cacheFile`) |
 | `drive_fix_windows` | asks for administrator permission on screen |
 | `agent_settings`, `agent_set_access`, `agent_set_exec`, `agent_log`, `agent_clear_log`, `agent_install_cli` | Settings → Agents: an agent can't widen its own access or erase its trace |
+| `link_device_begin`, `link_host_begin`, `link_device_join`, `link_device_send`, `link_confirm`, `account_approve_device` | Settings → Devices: adding a device to your account (it gets your friends, chats and commands) is the person's decision, made by scanning the code and comparing the safety code in the window |
