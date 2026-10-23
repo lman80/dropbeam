@@ -17,7 +17,7 @@ DropBeam sends files, photos and messages **directly between your devices and yo
 3. [Receiving files](#3-receiving-files)
 4. [Transfers: progress, pause, retry, verify](#4-transfers-progress-pause-retry-verify)
 5. [Friends](#5-friends)
-6. [Chat](#6-chat)
+6. [Chat](#6-chat) (including [audio and video calls](#audio-and-video-calls))
 7. [Shared Folders](#7-shared-folders)
 8. [Locations (share a NAS or folder with friends)](#8-locations-share-a-nas-or-folder-with-friends)
 9. [History and Recoverable files](#9-history-and-recoverable-files)
@@ -332,6 +332,15 @@ A system notification arrives for new messages when you're not looking at that c
 - **Desktop:** a **Shared folder** button in the conversation header opens the folder you share with that friend, and shared-folder activity (*"You added the folder Vases (3 items)"*, *"Alex moved X → Y"*) appears in the conversation.
 
 > **Available:** pins — iOS only · shared-folder button/activity — macOS · Windows · Linux
+
+### Audio and video calls
+Call a friend or one of your own devices from the conversation: **Audio call** or **Video call** in the header (iOS: the "…" menu). Every device of theirs rings; the first to answer takes the call and the others stop. An incoming call brings DropBeam up even from the menu bar / tray, with **Answer** and **Decline**. During a call: **Mute**, **Camera** on/off (also mid-call in an audio call), **Switch** camera, the **speaker** to play through, **End**, and a small badge saying how you're connected (*Same network*, *Direct* or *Relay*) with the round trip — hover it for loss, bitrate and video size. Make the call small to keep using DropBeam. Each call leaves a line in the conversation (*"Video call · 12:31"*, *"Missed audio call"*); click it to call back.
+
+Calls go straight between the two devices over DropBeam's own connection — no call server — and are end-to-end encrypted. Only friends and your own devices can call you; blocked people can't.
+
+**Recording** happens only on your device and only if the other person says yes: **Record** asks them, they see *"… wants to record this call"* with **Allow** / **Don't allow**, and both of you see a red *Recording* badge while it runs. You get your voice, their voice and the mixed call as separate files plus a small description in *Downloads → DropBeam Calls*. While recording you can offer to **swap clean voice tracks**: when both agree, after the call each of you sends the other your own track, so both have both sides (handy for AI notes).
+
+> **Available:** macOS · Windows · iOS (iOS: no recording on the iPhone yet; ringing while DropBeam is in the background needs the push relay — docs/CALLS.md). **Linux:** Ubuntu's system web view has no WebRTC, so Linux can't take calls yet; friends calling it see *"…'s device can't take calls yet"*.
 
 ---
 

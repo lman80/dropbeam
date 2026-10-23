@@ -78,6 +78,9 @@ Source of truth: the code on branch `ios` as of v0.52.2 (Rust engine `src-tauri/
 | Reactions | ✅ | ✅ | ✅ | ✅ | different emoji sets: desktop 7 quick; iOS 6 tapbacks + 24 more |
 | Reply / edit / unsend / copy | ✅ | ✅ | ✅ | ✅ | |
 | Typing + read receipts | ✅ | ✅ | ✅ | ✅ | |
+| Audio/video calls (docs/CALLS.md) | ✅ | ⚠️ | ❌ | ⚠️ | Windows: WebView2 has WebRTC, builds in CI, not call-tested. Linux: Ubuntu's WebKitGTK has no `RTCPeerConnection` → "can't take calls yet". iOS: native WebRTC + CallKit, builds/launches in the simulator, not call-tested on a device |
+| Call recording with consent | ✅ | ⚠️ | ❌ | ⚠️ | iOS: allow/decline + badge only, no recording on the phone |
+| Ring while backgrounded | ✅ (tray) | ✅ (tray) | — | ⚠️ | iOS: PushKit VoIP via the push relay; owner setup + device test pending |
 | Attach files/photos (staged) | ✅ | ✅ | ✅ | ✅ | |
 | Drag files into conversation | ✅ | ✅ | ✅ | N/A | |
 | Paste image | ✅ | ✅ | ✅ | ❌ | Linux via native clipboard fallback |
