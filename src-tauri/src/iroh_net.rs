@@ -104,6 +104,9 @@ pub struct IrohState {
     pub test_inbox: OnceCell<PathBuf>,
     chat_batches: Mutex<HashMap<String, ChatBatch>>,
     chat_links: Mutex<HashMap<String, crate::models::ChatTransferLink>>,
+    /// A manual upload's exact-copy report, attached to every update of its
+    /// card (most are built fresh) until the upload ends.
+    upload_notes: Mutex<HashMap<String, crate::models::UploadNotes>>,
     pub endpoint: OnceCell<Endpoint>,
     /// Set at startup so the accept loop can emit `transfer://update` events.
     pub app: OnceCell<AppHandle>,
@@ -827,6 +830,11 @@ fn emit(app: &AppHandle, u: &TransferUpdate) {
     u.integrity = integrity::reports();
     if let Some(state) = app.try_state::<Arc<IrohState>>() {
         u.chat_transfer = state.chat_links.lock().unwrap().get(&u.id).cloned();
+        if u.upload_notes.is_none() {
+            let mut notes = state.upload_notes.lock().unwrap();
+            u.upload_notes = notes.get(&u.id).cloned();
+            if matches!(u.state, TransferState::Completed | TransferState::Failed | TransferState::Canceled) { notes.remove(&u.id); }
+        }
         if u.direction == Direction::Receive {
             if let Some(link) = u.chat_transfer.take() {
                 let mut batches = state.chat_batches.lock().unwrap();
@@ -5744,7 +5752,7 @@ fn send_friend_inner(
     let cleanup = state.clone();
     let mut update = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
     update.friend_name = Some(friend_name.clone());
-    update.upload_notes = notes;
+    if let Some(notes) = notes { state.upload_notes.lock().unwrap().insert(id.clone(), notes); }
     update.state = TransferState::Connecting;
     update.bytes_total = total;
     emit(&app, &update);
