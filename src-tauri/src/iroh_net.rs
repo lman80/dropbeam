@@ -2511,15 +2511,8 @@ pub(crate) fn bbr_config(stock: bool) -> noq_proto::congestion::Bbr3Config {
     let mut c = noq_proto::congestion::Bbr3Config::default();
     c.initial_window(iw);
     c.dropbeam_fixes(!stock);
-    let rlt = match std::env::var("DROPBEAM_BBR_RLT").as_deref() {
-        Ok("1") => true,
-        Ok("0") => false,
-        _ => RANDOM_LOSS_TOLERANCE,
-    };
-    c.random_loss_tolerance(!stock && rlt);
     c
 }
-const RANDOM_LOSS_TOLERANCE: bool = false;
 const INITIAL_WINDOW: u64 = 128 * 1024;
 
 /// Ask the peer to ACK every 11th packet (QUIC ack-frequency extension; the
