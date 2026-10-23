@@ -13411,7 +13411,8 @@ mod locality_evidence_tests {
 
 #[cfg(test)]
 mod path_preference_tests {
-    use super::{is_overlay_routed, path_preference_key, should_switch_path, PATH_SWITCH_MIN_DWELL};
+    use super::{is_overlay_routed, lab_hides, path_preference_key, should_switch_path, LAB_PATH_FILTER, PATH_SWITCH_MIN_DWELL};
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     const SETTLED: Duration = Duration::from_secs(3600);
