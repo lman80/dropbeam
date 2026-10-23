@@ -82,7 +82,7 @@ fn real_name(f: &fs::File) -> Option<OsString> {
     }
     None
 }
-/// "DROPBE~1", "DROPBE~12.JSO": the shape of an 8.3 short name (only used when
+/// "DROPBE~1", "DROPB~12.JSO": the shape of an 8.3 short name (only used when
 /// the real name can't be read).
 pub(super) fn short_alias(name: &str) -> bool {
     let (base, ext) = name.rsplit_once('.').unwrap_or((name, ""));

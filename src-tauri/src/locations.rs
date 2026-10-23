@@ -3183,7 +3183,7 @@ mod tests {
     #[test]
     fn windows_short_names_never_reach_control_data() {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
-        for (name, alias) in [("DROPBE~1", true), ("DROPBE~12.JSO", true), ("a~1.txt", true), ("PROGRA~", false), ("report~v2.txt", false), ("averylongname~1", false)] {
+        for (name, alias) in [("DROPBE~1", true), ("DROPB~12.JSO", true), ("DROPBE~12.JSO", false), ("a~1.txt", true), ("PROGRA~", false), ("report~v2.txt", false), ("averylongname~1", false)] {
             assert_eq!(win::short_alias(name), alias, "{name}");
         }
         let f = Fixture::new(); let root = Root::open(&f.root).unwrap();
