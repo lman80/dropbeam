@@ -153,3 +153,11 @@ and recorded (an agent that acts without a trace is a bug).
   `dropbeam wait-for message` is `dropbeam wait`; sending to a person with several devices
   follows the window (every device, online ones first) instead of "the online one" — `--device`
   picks one.
+- **No PowerShell on Windows (branch `pwsh-free`):** on a real Windows 10 PC, AVG's behaviour
+  shield flagged DropBeam's elevated `powershell -EncodedCommand` (background task) as
+  `IDP.HELU.PSE95` and deleted DropBeam.exe. Replaced with native APIs: Task Scheduler COM
+  (task XML, S4U) for the startup task, registry + Service Control Manager for the WebDAV fix,
+  `HKCU\Environment` + `WM_SETTINGCHANGE` for the CLI PATH, WNet for drive letters, and Win32
+  calls instead of `taskkill`/`reg`/`attrib`. Admin steps re-launch DropBeam.exe itself with
+  "runas" and one strictly-checked internal argument (`--background-task …`, `--fix-webdav`;
+  elevate.rs); a unit test fails if a script host or system tool reappears in that code.

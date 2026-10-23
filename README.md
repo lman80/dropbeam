@@ -56,7 +56,7 @@ After that, **updates install themselves** from inside the app.
 
 **Headless Transfer Server (Linux):** the `.deb` installs a systemd unit. Enable it with `sudo systemctl enable --now dropbeam-server@$USER` to run `DropBeam --server` without a window.
 
-**Keep running when no one is signed in (Windows):** Settings → Transfer Server → Advanced (or under your hosted Locations) → *Keep running when no one is signed in*. After one Windows permission prompt it registers a Scheduled Task, *DropBeam Background*, that starts `DropBeam.exe --server --config <your settings folder>` at boot as you (S4U — no password stored), so Locations and the Transfer Server stay reachable before anyone signs in. The app takes over while it's open and hands back when it closes. Log: `%APPDATA%\com.dropbeam.app\background-server.log`.
+**Keep running when no one is signed in (Windows):** Settings → Transfer Server → Advanced (or under your hosted Locations) → *Keep running when no one is signed in*. After one Windows permission prompt it registers a Scheduled Task, *DropBeam Background*, that starts `DropBeam.exe --server --config <your settings folder>` at boot as you (S4U — no password stored). DropBeam makes the task itself through the Task Scheduler API — for the one admin step it re-launches its own exe elevated; it never runs PowerShell or `schtasks`, which antivirus (e.g. AVG) treats as malware, so Locations and the Transfer Server stay reachable before anyone signs in. The app takes over while it's open and hands back when it closes. Log: `%APPDATA%\com.dropbeam.app\background-server.log`.
 
 ## Privacy
 

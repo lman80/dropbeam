@@ -797,9 +797,72 @@ fn install_cli() -> Result<String, String> {
         else { format!("Installed: {}. Add ~/.local/bin to your PATH (or type the full path).", local.display()) })
 }
 
+/// The user PATH with `dir` added at the end, or None when it's already there
+/// (case-insensitive, a trailing `\` doesn't matter, empty entries are kept).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn path_with(current: &str, dir: &str) -> Option<String> {
+    let norm = |p: &str| p.trim().trim_end_matches('\\').to_lowercase();
+    if current.split(';').any(|p| norm(p) == norm(dir)) { return None; }
+    let base = current.trim_end_matches(';');
+    Some(if base.is_empty() { dir.to_owned() } else { format!("{base};{dir}") })
+}
+
+/// HKCU\Environment through the registry API (no PowerShell: see elevate.rs).
+#[cfg(windows)]
+mod user_env {
+    use crate::elevate::win::wide;
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, LPARAM, WPARAM};
+    use windows::Win32::System::Registry::*;
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE};
+
+    struct Key(HKEY);
+    impl Drop for Key {
+        fn drop(&mut self) { let _ = unsafe { RegCloseKey(self.0) }; }
+    }
+    fn open() -> windows::core::Result<Key> {
+        let mut k = HKEY::default();
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, w!("Environment"), None, KEY_QUERY_VALUE | KEY_SET_VALUE, &mut k) }.ok()?;
+        Ok(Key(k))
+    }
+    /// The raw (unexpanded) value and its type, None when it isn't set.
+    pub fn get(name: &str) -> windows::core::Result<Option<(String, REG_VALUE_TYPE)>> {
+        let (key, n) = (open()?, wide(name));
+        let (mut kind, mut size) = (REG_VALUE_TYPE::default(), 0u32);
+        let r = unsafe { RegQueryValueExW(key.0, PCWSTR(n.as_ptr()), None, Some(&mut kind), None, Some(&mut size)) };
+        if r == ERROR_FILE_NOT_FOUND { return Ok(None); }
+        r.ok()?;
+        let mut buf = vec![0u16; size as usize / 2 + 1];
+        unsafe { RegQueryValueExW(key.0, PCWSTR(n.as_ptr()), None, Some(&mut kind), Some(buf.as_mut_ptr() as *mut u8), Some(&mut size)) }.ok()?;
+        buf.truncate(size as usize / 2);
+        while buf.last() == Some(&0) { buf.pop(); }
+        Ok(Some((String::from_utf16_lossy(&buf), kind)))
+    }
+    pub fn set(name: &str, value: &str, kind: REG_VALUE_TYPE) -> windows::core::Result<()> {
+        let (key, n) = (open()?, wide(name));
+        let bytes: Vec<u8> = value.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        unsafe { RegSetValueExW(key.0, PCWSTR(n.as_ptr()), None, kind, Some(&bytes)) }.ok()
+    }
+    #[cfg(test)]
+    pub fn delete(name: &str) -> windows::core::Result<()> {
+        let (key, n) = (open()?, wide(name));
+        unsafe { RegDeleteValueW(key.0, PCWSTR(n.as_ptr())) }.ok()
+    }
+    /// Add `dir` to the user PATH (keeping its type: usually REG_EXPAND_SZ, so
+    /// `%USERPROFILE%`-style entries stay unexpanded) and tell running programs.
+    pub fn add_to_path(name: &str, dir: &str) -> windows::core::Result<()> {
+        let (current, kind) = get(name)?.unwrap_or_default();
+        let kind = if kind == REG_SZ { REG_SZ } else { REG_EXPAND_SZ };
+        if let Some(next) = super::path_with(&current, dir) {
+            set(name, &next, kind)?;
+            unsafe { SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, WPARAM(0), LPARAM(w!("Environment").as_ptr() as isize), SMTO_ABORTIFHUNG, 5000, None) };
+        }
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 fn install_cli() -> Result<String, String> {
-    use std::os::windows::process::CommandExt;
     let exe = app_binary().ok_or("Couldn't find DropBeam's own program file.")?;
     let dir = windows_bin_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -807,12 +870,7 @@ fn install_cli() -> Result<String, String> {
     // app attaches to this console in command-line mode (main.rs).
     let shim = format!("@echo off\r\n\"{}\" cli %*\r\nexit /b %ERRORLEVEL%\r\n", exe.to_string_lossy());
     std::fs::write(dir.join("dropbeam.cmd"), shim).map_err(|e| e.to_string())?;
-    let d = dir.to_string_lossy().replace('\'', "''");
-    let ps = format!("$d='{d}'; $p=[Environment]::GetEnvironmentVariable('Path','User'); if (-not $p) {{ $p='' }}; \
-        if (-not (($p -split ';') -contains $d)) {{ [Environment]::SetEnvironmentVariable('Path', (($p.TrimEnd(';') + ';' + $d).TrimStart(';')), 'User') }}");
-    let ok = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .creation_flags(0x0800_0000).status().is_ok_and(|s| s.success());
-    if !ok { return Err(format!("Saved {} but couldn't add it to PATH. Add that folder to PATH yourself.", dir.join("dropbeam.cmd").display())); }
+    if user_env::add_to_path("Path", &dir.to_string_lossy()).is_err() { return Err(format!("Saved {} but couldn't add it to PATH. Add that folder to PATH yourself.", dir.join("dropbeam.cmd").display())); }
     Ok(format!("Installed: {}. Open a new terminal and type dropbeam.", dir.join("dropbeam.cmd").display()))
 }
 
@@ -840,6 +898,37 @@ mod tests {
         save_settings(&d, &AgentSettings { access: true, exec_until: crate::chat::now_ms() - 1 }).unwrap();
         assert!(!exec_allowed_now(&d).0, "an expired hour is off");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn user_path_gets_the_folder_once() {
+        let d = r"C:\Users\Ann Lee\AppData\Local\DropBeam\bin";
+        assert_eq!(path_with("", d).as_deref(), Some(d));
+        assert_eq!(path_with(";", d).as_deref(), Some(d));
+        assert_eq!(path_with(r"%USERPROFILE%\bin;C:\x", d), Some(format!(r"%USERPROFILE%\bin;C:\x;{d}")));
+        assert_eq!(path_with(r"C:\x;;C:\y;", d), Some(format!(r"C:\x;;C:\y;{d}")));
+        assert_eq!(path_with(&format!(r"C:\x;{}\", d.to_uppercase()), d), None);
+        assert_eq!(path_with(&format!(" {d} ;C:\\x"), d), None);
+        assert!(path_with(r"C:\Users\Ann Lee\AppData\Local\DropBeam\bin2", d).is_some());
+    }
+
+    /// CI only: the registry round trip under a scratch value (never the real PATH).
+    #[cfg(windows)]
+    #[test]
+    fn ci_user_environment_round_trip() {
+        if std::env::var("DROPBEAM_CI_TASK_TEST").as_deref() != Ok("1") { return; }
+        use windows::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ};
+        let name = "DROPBEAM_CI_PATH_TEST";
+        let _ = user_env::delete(name);
+        assert_eq!(user_env::get(name).unwrap(), None);
+        user_env::set(name, r"%USERPROFILE%\x;C:\Ä b", REG_SZ).unwrap();
+        user_env::add_to_path(name, r"C:\DropBeam bin").unwrap();
+        user_env::add_to_path(name, r"c:\dropbeam bin\").unwrap();
+        assert_eq!(user_env::get(name).unwrap(), Some((r"%USERPROFILE%\x;C:\Ä b;C:\DropBeam bin".to_owned(), REG_SZ)));
+        user_env::delete(name).unwrap();
+        user_env::add_to_path(name, r"C:\d").unwrap();
+        assert_eq!(user_env::get(name).unwrap(), Some((r"C:\d".to_owned(), REG_EXPAND_SZ)));
+        user_env::delete(name).unwrap();
     }
 
     #[test]

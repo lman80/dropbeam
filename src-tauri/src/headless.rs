@@ -123,9 +123,14 @@ fn stop_server(config: &Path, pid: i32, force: bool) {
         if force {
             // Last resort; may be refused across sessions — the app then
             // starts anyway after TAKEOVER_GIVE_UP_AFTER.
-            use std::os::windows::process::CommandExt;
-            let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()])
-                .creation_flags(0x0800_0000).output();
+            use windows::Win32::Foundation::CloseHandle;
+            use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+            if let Ok(h) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid as u32) } {
+                unsafe {
+                    let _ = TerminateProcess(h, 1);
+                    let _ = CloseHandle(h);
+                }
+            }
         }
     }
 }

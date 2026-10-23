@@ -19,6 +19,7 @@ mod stream;
 mod drive;
 mod mailbox;
 mod background_host;
+mod elevate;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod headless;
 mod chat;
@@ -362,6 +363,13 @@ mod cli_launch_tests {
             assert_eq!(super::cli_args(&v(&gui)), None, "{gui:?}");
         }
     }
+}
+
+/// `DropBeam.exe --background-task …` / `--fix-webdav`: the one administrator
+/// step DropBeam re-launched itself for (elevate.rs). Returns the exit code.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub fn elevated_job(args: &[String]) -> Option<i32> {
+    elevate::main_job(args)
 }
 
 /// `DropBeam --server`: the Transfer Server without a window (see headless.rs).

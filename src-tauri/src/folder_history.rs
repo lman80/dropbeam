@@ -163,13 +163,14 @@ fn load_for_write(folder: &str) -> Option<Vec<HistoryItem>> {
 fn hide_root(folder: &str) {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("attrib")
-            .arg("+h")
-            .arg(root(folder))
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES};
+        let path: Vec<u16> = root(folder).as_os_str().encode_wide().chain([0]).collect();
+        let attrs = unsafe { GetFileAttributesW(PCWSTR(path.as_ptr())) };
+        if attrs != INVALID_FILE_ATTRIBUTES {
+            let _ = unsafe { SetFileAttributesW(PCWSTR(path.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(attrs | FILE_ATTRIBUTE_HIDDEN.0)) };
+        }
     }
     #[cfg(not(windows))]
     let _ = folder;

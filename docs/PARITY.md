@@ -121,7 +121,7 @@ Source of truth: the code on branch `ios` as of v0.52.2 (Rust engine `src-tauri/
 | Path badge + live speed while streaming | ✅ | ✅ | ✅ | ✅ | `stream_status` |
 | Thumbnails for pictures | ✅ | ✅ | ✅ | ✅ | Host-made JPEG (`locations.thumb`); images only, no video posters |
 | Open with default app | ✅ | ✅ | ✅ | N/A | Through the drive when mounted, else a cached copy |
-| Locations as a drive | ✅ | ⚠️ | ⚠️ | ❌ | macOS: NFSv3 at `~/DropBeam Drives`, verified end to end. Linux: WebDAV + `gio mount` (compiled/tested in CI, not live-mounted). Windows: WebDAV + `net use`, WebClient/50 MB fix (compiled in CI, not live-mapped). iOS needs a File Provider extension (follow-up) |
+| Locations as a drive | ✅ | ⚠️ | ⚠️ | ❌ | macOS: NFSv3 at `~/DropBeam Drives`, verified end to end. Linux: WebDAV + `gio mount` (compiled/tested in CI, not live-mounted). Windows: WebDAV mapped with WNetAddConnection2W, WebClient/50 MB fix via registry + Service Control Manager (DropBeam re-launched elevated, `--fix-webdav`) (compiled in CI, not live-mapped). iOS needs a File Provider extension (follow-up) |
 | Settings → Drives (on/off, start with app, cache size) | ✅ | ✅ | ✅ | ❌ | |
 
 ### History & recovery
@@ -158,12 +158,12 @@ Source of truth: the code on branch `ios` as of v0.52.2 (Rust engine `src-tauri/
 |---|---|---|---|---|---|
 | Settings → Agents (access switch, activity log, setup lines) | ✅ | ✅ | ✅ | ❌ | iOS has no local agents (no socket, no CLI) |
 | Local control API | ✅ | ✅ | ✅ | ❌ | Unix socket (0600, peer uid checked) / named pipe (user-SID-only ACL) |
-| `dropbeam` command + MCP server | ✅ | ✅ | ✅ | N/A | macOS: Settings button links `/usr/local/bin/dropbeam`; Windows: `dropbeam.cmd` on user PATH; Linux: `/usr/bin/dropbeam` in `.deb`/`.rpm`, button for AppImage |
+| `dropbeam` command + MCP server | ✅ | ✅ | ✅ | N/A | macOS: Settings button links `/usr/local/bin/dropbeam`; Windows: `dropbeam.cmd` on user PATH (registry API); Linux: `/usr/bin/dropbeam` in `.deb`/`.rpm`, button for AppImage |
 | "via <agent>" on chat messages | ✅ | ✅ | ✅ | ⚠️ | stored and synced on iOS; the native chat bubble doesn't show it yet |
 | Run commands from your other devices (target) | ✅ | ✅ | ✅ | ❌ | off by default; desktop-only switch |
 | Run commands on your other devices (caller) | ✅ | ✅ | ✅ | ❌ | through the CLI/MCP on a desktop |
 | Headless Linux (no desktop session) | N/A | N/A | ⚠️ | N/A | run the app under `xvfb-run`; `--server` mode has no control API |
-| Keep running when no one is signed in (Locations + Transfer Server at boot) | ❌ | ✅ | ✅ | N/A | Windows: switch → Scheduled Task "DropBeam Background" (at startup, S4U, no password stored, one UAC prompt; `background_host.rs`), supervisor + engine child, app takeover via `engine.stop`; Linux: systemd unit `dropbeam-server@$USER` (Copy Command); macOS: not built |
+| Keep running when no one is signed in (Locations + Transfer Server at boot) | ❌ | ✅ | ✅ | N/A | Windows: switch → Scheduled Task "DropBeam Background" (at startup, S4U, no password stored, one UAC prompt; Task Scheduler COM from DropBeam itself re-launched elevated, no PowerShell — `background_host.rs`, `elevate.rs`), supervisor + engine child, app takeover via `engine.stop`; Linux: systemd unit `dropbeam-server@$USER` (Copy Command); macOS: not built |
 
 ---
 
