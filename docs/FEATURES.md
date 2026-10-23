@@ -412,9 +412,10 @@ On save DropBeam writes a tiny marker file so it can tell that exact drive from 
 The Locations page's **Shared from this device** section shows each hosted folder as a *Gateway* card: reachable or not, free space, who has access, the last thing a friend did, and a live *"Receiving from Alex · 12 files"* line.
 
 - The host device must be **awake with DropBeam running** for friends to reach it.
-- Hosting is available on **macOS and Linux**. Windows can browse and use friends' Locations but can't host one yet. iPhone is a client only.
+- **Keep running when no one is signed in** (Windows: a switch under the hosted Locations list and in Settings → Transfer Server → Advanced; Linux: *Copy Command* for the systemd unit). After a restart DropBeam keeps sharing your Locations and holding messages even before anyone signs in; the app takes over while it's open and hands back when it closes. On Windows it's a Scheduled Task named *DropBeam Background* that runs as you without storing your password — turning it on or off shows one Windows permission prompt. Its log is `background-server.log` in DropBeam's settings folder.
+- Hosting is available on **macOS, Linux and Windows**. iPhone is a client only.
 
-> **Available (hosting):** macOS · Linux · Windows ✗ · iOS ✗
+> **Available (hosting):** macOS · Linux · Windows · iOS ✗
 
 ### Browse a friend's Location
 - **Desktop:** **Locations** → a friend's folder card (shows free space and your rights) → a file browser with breadcrumbs, filter, sort (name / size / date), pages of 500.

@@ -18,6 +18,7 @@ mod locations;
 mod stream;
 mod drive;
 mod mailbox;
+mod background_host;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod headless;
 mod chat;
@@ -789,7 +790,12 @@ pub fn run() {
                 std::thread::spawn(move || {
                     let lock = headless::lock_for_app(&dir);
                     std::mem::forget(lock);
-                    iroh_net::spawn(dir, st, handle);
+                    iroh_net::spawn(dir.clone(), st, handle);
+                    // Windows: if "Keep running when no one is signed in" is on
+                    // but its task isn't running (an update ended it), start it
+                    // so it takes over when this window closes.
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    background_host::ensure_started(&dir);
                 });
             }
             #[cfg(any(target_os = "ios", target_os = "android"))]
@@ -1125,6 +1131,8 @@ pub fn run() {
             mailbox::cmds::server_wipe,
             mailbox::cmds::server_disable,
             mailbox::cmds::server_set_owner,
+            background_host::background_host_status,
+            background_host::background_host_set,
             mailbox::cmds::mailbox_servers,
             mailbox::cmds::mailbox_server_prefs,
             mailbox::cmds::mailbox_forget_server,

@@ -359,6 +359,11 @@ fn catalog() -> Vec<OpSpec> {
         op("server.wipe", Destructive, "Delete everything this Transfer Server holds.").cmds(&["server_wipe"]).build(),
         op("server.disable", Destructive, "Turn this device's Transfer Server off.").opt("deleteItems", B, "Also delete what it holds.").cmds(&["server_disable"]).build(),
         op("server.setOwner", Write, "Set which account owns this Transfer Server.").req("account", S, "Account key.").cmds(&["server_set_owner"]).build(),
+        op("background.status", Read, "Whether DropBeam keeps running when no one is signed in (starts with the computer and keeps sharing Locations and holding messages; the app takes over while it's open). Windows: a switch; Linux: a command to run (command); macOS: not available.")
+            .out("{supported, enabled, running, current, command}").cmds(&["background_host_status"]).build(),
+        op("background.set", Write, "Turn \"Keep running when no one is signed in\" on or off (Windows). Windows shows a permission (UAC) prompt on this computer's screen, so a person must be there to approve it; without that it fails and nothing changes.")
+            .req("enabled", B, "true = on, false = off.").out("the new status (see background.status)").cmds(&["background_host_set"])
+            .promise("Changes nothing unless the person at this computer approves the Windows permission prompt. Recorded in the agent activity log.").build(),
         op("servers.list", Read, "Transfer Servers your friends offer you.").cmds(&["mailbox_servers"]).build(),
         op("servers.prefs", Write, "Choose whether and how to use a friend's Transfer Server.")
             .req("eid", S, "Server device id.").opt("useIt", B, "").opt("holdForMe", B, "").opt("offer", S, "").opt("shareFriends", B, "").cmds(&["mailbox_server_prefs"]).build(),
@@ -930,6 +935,8 @@ pub async fn run(app: &AppHandle, name: &str, i: &Value, ctx: &Ctx) -> R {
         "server.wipe" => ok(crate::mailbox::cmds::server_wipe(app.clone(), app.state()).await.map_err(failed)?),
         "server.disable" => ok(crate::mailbox::cmds::server_disable(app.clone(), app.state(), app.state(), ob(i, "deleteItems").unwrap_or(false)).await.map_err(failed)?),
         "server.setOwner" => ok(crate::mailbox::cmds::server_set_owner(app.clone(), app.state(), app.state(), s(i, "account")?).await.map_err(failed)?),
+        "background.status" => ok(crate::background_host::background_host_status(app.state()).await.map_err(failed)?),
+        "background.set" => ok(crate::background_host::background_host_set(app.state(), bv(i, "enabled")?).await.map_err(failed)?),
         "servers.list" => ok(crate::mailbox::cmds::mailbox_servers(app.state())),
         "servers.prefs" => ok(crate::mailbox::cmds::mailbox_server_prefs(app.clone(), app.state(), app.state(), s(i, "eid")?, ob(i, "useIt"), ob(i, "holdForMe"), os(i, "offer"), ob(i, "shareFriends")).map_err(failed)?),
         "servers.forget" => ok(crate::mailbox::cmds::mailbox_forget_server(app.clone(), app.state(), app.state(), s(i, "eid")?)),
